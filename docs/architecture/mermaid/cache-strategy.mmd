@@ -1,0 +1,43 @@
+flowchart TD
+    subgraph keys["Valkey Key Namespace (§4.1) — every key is tenant-scoped by construction"]
+        k1["ae:ctx:{tenant}:{user} → MembershipContext (roles, departments, delegations)\nsoft TTL 60s ± 6s jitter · physical TTL = soft + 5m grace"]
+        k2["ae:tenant:{tenant} → TenantContext (plan, feature_flags, subscription_status, read_only)\nsplit from ae:ctx so a tenant-wide event is ALWAYS a single-key eviction, never a SCAN\nsame soft-TTL/grace envelope as ae:ctx"]
+        k3["ae:tender_acl:{tenant}:{tender}:{user} → TenderACL{has_access, access_level}\nflat 15s TTL — half the sibling's own 30s TTL — no stale-if-error branch"]
+        k4["ae:neg:{tenant}:{user} → sentinel — subject rebuild returned 404\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
+        k5["ae:processed:{event_id} → SET NX sentinel, 7-day TTL\nconsumer idempotency — the SET-NX equivalent of ON CONFLICT DO NOTHING"]
+        k6["mfa_freshness_seconds  →  NEVER CACHED, no key exists (§4.4)\nfetched fresh per approver-gated request from I-14 ONLY —\nfolding it into ae:ctx would delay a tightened MFA window by up to 60s"]
+    end
+
+    subgraph envelope["ae:ctx / ae:tenant envelope — one key serves two purposes"]
+        e1["entry{ Value, FetchedAt, SoftTTL }"]
+        e2{"now − FetchedAt ≤ SoftTTL ?"}
+        e3["Fresh — serve directly, no sibling call"]
+        e4["Stale — past soft TTL, but the physical key\n(soft + 5m grace) still exists"]
+        e1 --> e2
+        e2 -- yes --> e3
+        e2 -- no --> e4
+    end
+
+    subgraph read["Read-through path (Checker.resolveContext)"]
+        r1(["GetMembershipContext + GetTenantContext"]) --> r2{"both Fresh?"}
+        r2 -- yes --> r3["use cached value — done"]
+        r2 -- no --> r4{"Valkey reachable\nAND ae:neg hit?"}
+        r4 -- yes --> r5["Deny DENY_UNRESOLVABLE_SUBJECT\n— no sibling call at all"]
+        r4 -- no --> r6["singleflight-coalesced\nGetMemberships call"]
+        r6 --> r7{"result?"}
+        r7 -- "404" --> r8["SetNegative (best-effort) → Deny"]
+        r7 -- "success" --> r9["SetMembershipContext + SetTenantContext\n(best-effort) → proceed"]
+        r7 -- "unavailable" --> r10{"Valkey reachable\nAND a Stale entry exists?"}
+        r10 -- yes --> r11["serve the Stale entry\n(§7 stale-if-error)"]
+        r10 -- no --> r12["Deny DENY_SERVICE_UNAVAILABLE\n(§7 fail-closed)"]
+    end
+
+    subgraph invalidate["Event-driven eviction (§5) — always single-key or tenant-scoped-slice"]
+        i1["DepartmentMembership* / TenantRole* → DEL ae:ctx + DEL ae:neg"]
+        i2["UserUpdated(email) / UserAvailabilityChanged → DEL ae:ctx + DEL ae:neg"]
+        i3["UserDeleted → DEL ae:ctx + DEL ae:neg + best-effort SCAN-DEL ae:tender_acl:*:{user}"]
+        i4["TenantPlanChanged / *SubscriptionCancelled / *Reactivated → DEL ae:tenant ONLY"]
+        i5["TenantConverted → DEL ae:tenant + refresh realm map"]
+        i6["TenantRealmReady → refresh realm map ONLY, no eviction"]
+        i7["TenderRestricted → flips an in-memory fact, NOT a cache eviction"]
+    end

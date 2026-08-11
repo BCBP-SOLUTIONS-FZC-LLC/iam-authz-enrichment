@@ -1,0 +1,30 @@
+flowchart TD
+    start(["Sibling call (GetMemberships) attempted\nafter a non-Fresh cache read"]) --> reachable{"Sibling\nreachable?"}
+
+    reachable -- "yes — 404" --> notfound["Authoritative answer, NOT an\navailability failure:\nnegative-cache + Deny\nDENY_UNRESOLVABLE_SUBJECT"]
+    reachable -- "yes — success" --> normal["OutcomeNormal\nuse the fresh result, write-through cache"]
+
+    reachable -- "no (ErrUnavailable)" --> valkeyup{"Valkey\nreachable?"}
+
+    valkeyup -- "no" --> row1["§7 row 1 variant:\nboth dependencies down\n→ OutcomeFailClosed\nDENY_SERVICE_UNAVAILABLE (503)"]
+
+    valkeyup -- "yes" --> stale{"Stale ae:ctx\n+ ae:tenant entry\navailable?"}
+    stale -- "yes" --> row2a["§7 row 2:\nOutcomeServeStale\nserve the stale entry\nauthz_stale_if_error_served_total++"]
+    stale -- "no" --> row2b["§7 row 2 degenerate case\n(nothing was ever cached):\nOutcomeFailClosed\nDENY_SERVICE_UNAVAILABLE (503)"]
+
+    subgraph row1note["§7 row 1 (Valkey down, sibling healthy) — separate path"]
+        direction TD
+        bypass["Every request bypasses the cache and calls\nthe sibling directly. Accept degraded latency.\nDo NOT fail closed — the sibling is still\nauthoritative and reachable."]
+    end
+
+    subgraph tenderacl["Tender-ACL overlay (§3.1 step 4) — an INDEPENDENT rule"]
+        direction TD
+        t1(["I-12 call times out or errors"]) --> t2["Fails closed for THIS overlay ONLY:\nDENY_TENDER_ACL_INSUFFICIENT\n— never escalates to 503, never denies\nnon-tender-scoped aspects of the request"]
+    end
+
+    classDef allow fill:#1a7f37,color:#fff;
+    classDef deny fill:#b42318,color:#fff;
+    classDef degrade fill:#b54708,color:#fff;
+    class normal allow
+    class notfound,row1,row2b,t2 deny
+    class row2a,bypass degrade

@@ -1,0 +1,48 @@
+# https://golangci-lint.run/docs/configuration/
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - exhaustive
+    - nilerr
+    - noctx
+    - revive
+    - unconvert
+    - unparam
+
+  settings:
+    revive:
+      rules:
+        - name: var-naming
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+
+issues:
+  exclude-rules:
+    - path: '_test\.go'
+      linters:
+        - revive
+        - unparam
+        - noctx
+    - path: '^cmd/'
+      linters:
+        - revive
+    - path: '^test/'
+      linters:
+        - revive
+        - unparam
+        - noctx
+    - path: 'test/'
+      linters:
+        - unparam
+        - noctx
+    - path: '.*_test\.go'
+      linters:
+        - unparam
+        - noctx

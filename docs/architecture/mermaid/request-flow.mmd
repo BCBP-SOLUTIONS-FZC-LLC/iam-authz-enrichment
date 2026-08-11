@@ -1,0 +1,96 @@
+sequenceDiagram
+    participant Envoy
+    participant Server as grpc.Server
+    participant Checker
+    participant Cache as Valkey Cache
+    participant Org as Org & Membership
+    participant Policy as domain/policy
+
+    Envoy ->> Server: Check(CheckRequest)
+    Note over Envoy,Server: jwt_authn already validated the JWT — Server never<br/>re-validates it, and never reads request headers for identity (§8.2)
+
+    Server ->> Server: decodeClaims(MetadataContext)<br/>decodeRequestFacts(ContextExtensions)
+
+    alt claims.Subject is empty
+        Server -->> Envoy: Denied 401 DENY_MALFORMED_IDENTITY
+        Note over Server: short-circuits before Checker is ever called
+    else subject present
+        Server ->> Checker: Check(CheckInput)
+        Checker ->> Checker: ResolveTenant(claims, realmMap, sharedRealmIssuer)
+
+        alt iss matches neither a dedicated realm nor the shared realm
+            Checker -->> Server: Denied — DENY_MALFORMED_IDENTITY (401)
+        else tenant resolved
+            Checker ->> Cache: GetMembershipContext + GetTenantContext
+
+            alt both Fresh
+                Cache -->> Checker: cached MembershipContext + TenantContext
+            else miss, stale, or Valkey unreachable
+                Cache -->> Checker: Miss / Stale / connection error
+
+                alt Valkey reachable and ae:neg hit
+                    Checker -->> Server: Denied — DENY_UNRESOLVABLE_SUBJECT
+                    Note over Checker,Cache: §4.3 — collapses the repeat rebuild call<br/>without ever calling Org & Membership
+                else no negative-cache short-circuit
+                    Checker ->> Org: GetMemberships(tenant, user)
+                    Note over Checker,Org: singleflight-coalesced — concurrent callers<br/>for the same (tenant,user) share one call (§4.5)
+
+                    alt 404 (ErrNotFound)
+                        Org -->> Checker: not found
+                        Checker ->> Cache: SetNegative (best-effort)
+                        Checker -->> Server: Denied — DENY_UNRESOLVABLE_SUBJECT
+                    else success
+                        Org -->> Checker: MembershipContext + TenantContext
+                        Checker ->> Cache: SetMembershipContext + SetTenantContext (best-effort)
+                    else unreachable (ErrUnavailable)
+                        Org -->> Checker: unavailable
+                        Checker ->> Checker: DecideDependencyOutcome (§7)
+                        alt Valkey reachable and a Stale entry exists
+                            Checker ->> Checker: serve the Stale entry
+                            Note over Checker: authz_stale_if_error_served_total++ —<br/>nonzero rate should page (§10)
+                        else nothing to fall back on
+                            Checker -->> Server: Denied — DENY_SERVICE_UNAVAILABLE (503)
+                            Note over Checker,Server: 5xx, not 403 — distinguishes a degraded<br/>authz system from a genuine not-authorized answer (§9)
+                        end
+                    end
+                end
+            end
+
+            Note over Checker,Policy: §3.1 precedence — first failing check wins
+            Checker ->> Policy: ViolatesReadOnly(tenant.ReadOnly, mutation)
+            alt read-only tenant + mutation method
+                Checker -->> Server: Denied — DENY_TENANT_READ_ONLY
+            else
+                Checker ->> Policy: EvaluateBase(subject, membership, request)
+                alt base policy fails
+                    Checker -->> Server: Denied — DENY_ROLE_INSUFFICIENT
+                else base policy allows
+                    opt tender-scoped and flagged restricted
+                        Checker ->> Cache: GetTenderACL
+                        alt cache miss
+                            Checker ->> Org: GetTenderACL(tenant, tender, user)
+                            Org -->> Checker: grant or ErrUnavailable
+                            alt call fails
+                                Checker -->> Server: Denied — DENY_TENDER_ACL_INSUFFICIENT
+                                Note over Checker: §7 row 4 — fails closed for THIS<br/>overlay only, never 503
+                            end
+                            Checker ->> Cache: SetTenderACL (best-effort, 15s TTL)
+                        end
+                        alt grant insufficient for the required level
+                            Checker -->> Server: Denied — DENY_TENDER_ACL_INSUFFICIENT
+                        end
+                    end
+                    opt action requires approver level
+                        Checker ->> Org: GetMFAFreshness(tenant)
+                        Note over Checker,Org: I-14 — the ONLY caller of this endpoint —<br/>result is never written to any cache key (§4.4)
+                        Org -->> Checker: freshness window (or an error)
+                        alt call failed, or now − auth_time > window
+                            Checker -->> Server: Denied — DENY_MFA_STALE
+                        end
+                    end
+                    Checker -->> Server: Allowed + 6 trust-boundary headers
+                end
+            end
+        end
+        Server -->> Envoy: CheckResponse
+    end

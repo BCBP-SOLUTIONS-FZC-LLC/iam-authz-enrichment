@@ -1,0 +1,296 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"golang.org/x/sync/singleflight"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain/policy"
+)
+
+// tracer provides the §10 child spans (authz.lookup_cache/evaluate_policy/
+// i8_call/i12_call/mfa_freshness_call). The outer ext_authz span comes from
+// platform-gincommon's gRPC tracing interceptor via context propagation —
+// this package only ever adds children to whatever span is already on ctx.
+var tracer = otel.Tracer("github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/usecase")
+
+// CheckInput is everything the inbound gRPC adapter has decoded from a
+// CheckRequest before handing off to Checker.Check. Claims come from
+// Envoy-jwt_authn-validated attributes only (§8.1); Request comes from the
+// route's ContextExtensions plus the raw HTTP method/path.
+type CheckInput struct {
+	Claims  Claims
+	Request policy.RequestFacts
+}
+
+// CheckerConfig configures a Checker's tunables. TTLs/timeouts themselves
+// live in the outbound adapters (valkey.Config, orgmembership timeout) —
+// this only holds usecase-level policy knobs.
+type CheckerConfig struct {
+	SharedRealmIssuer string
+}
+
+// Checker orchestrates the full §3.1 precedence chain. It depends only on
+// the Cache/OrgMembershipClient/Logger/Recorder ports — never on a concrete
+// adapter.
+type Checker struct {
+	cache      Cache
+	org        OrgMembershipClient
+	realmMap   *RealmMap
+	restricted *RestrictedTenderSet
+	log        Logger
+	metrics    Recorder
+	cfg        CheckerConfig
+	sf         singleflight.Group
+	now        func() time.Time
+}
+
+// NewChecker builds a Checker. now defaults to time.Now — tests override it
+// to exercise MFA-freshness/stale-if-error boundaries deterministically.
+func NewChecker(cache Cache, org OrgMembershipClient, realmMap *RealmMap, restricted *RestrictedTenderSet, log Logger, metrics Recorder, cfg CheckerConfig) *Checker {
+	return &Checker{
+		cache:      cache,
+		org:        org,
+		realmMap:   realmMap,
+		restricted: restricted,
+		log:        log,
+		metrics:    metrics,
+		cfg:        cfg,
+		now:        time.Now,
+	}
+}
+
+// SetClock overrides the clock used for MFA-freshness comparisons. Test-only.
+func (c *Checker) SetClock(now func() time.Time) { c.now = now }
+
+// Check evaluates the §3.1 precedence chain and returns exactly one
+// Decision. The first failing check wins — evaluation order below matches
+// the doc's numbered list exactly; do not reorder these steps.
+func (c *Checker) Check(ctx context.Context, in CheckInput) domain.Decision {
+	start := c.now()
+	decision := c.check(ctx, in)
+	c.metrics.ObserveDecisionLatency(c.now().Sub(start))
+	c.metrics.ObserveDecision(decision.Reason, decision.Allow)
+	return decision
+}
+
+func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
+	// §2 point 3 / §9: tenant resolution. Malformed identity short-circuits
+	// everything — there is no tenant to scope any subsequent call to.
+	tenant, ok := ResolveTenant(in.Claims, c.realmMap, c.cfg.SharedRealmIssuer)
+	if !ok {
+		return domain.Denied(domain.DenyMalformedIdentity)
+	}
+	subject := in.Claims.Subject
+
+	reqFacts := in.Request
+	if reqFacts.TenderID != "" {
+		reqFacts.TenderRestricted = c.restricted.IsRestricted(tenant, reqFacts.TenderID)
+	}
+
+	// §3.1 step 1: subject resolution. Short-circuits everything else.
+	cacheCtx, cacheSpan := tracer.Start(ctx, "authz.lookup_cache")
+	membership, tenantCtx, reason, resolved := c.resolveContext(cacheCtx, tenant, subject)
+	cacheSpan.End()
+	if !resolved {
+		return domain.Denied(reason)
+	}
+
+	policyCtx, policySpan := tracer.Start(ctx, "authz.evaluate_policy")
+	defer policySpan.End()
+
+	// §3.1 step 2: subscription read-only enforcement. Blanket tenant-level
+	// gate; read methods are never affected.
+	if policy.ViolatesReadOnly(tenantCtx.ReadOnly, reqFacts.IsMutation()) {
+		return domain.Denied(domain.DenyTenantReadOnly)
+	}
+
+	// §3.1 step 3: base role/department policy — the four HLD-seed policies.
+	if !policy.EvaluateBase(policy.Input{Subject: subject, Membership: membership, Request: reqFacts}) {
+		return domain.Denied(domain.DenyRoleInsufficient)
+	}
+
+	// §3.1 step 4: tender-ACL overlay. Only evaluated because step 3 passed.
+	if reqFacts.RequiresTenderACL() {
+		acl, err := c.resolveTenderACL(policyCtx, tenant, reqFacts.TenderID, subject)
+		if err != nil {
+			// §7 row 4: fails closed for this overlay only — never escalates
+			// to DENY_SERVICE_UNAVAILABLE or denies non-tender-scoped aspects.
+			return domain.Denied(domain.DenyTenderACLInsufficient)
+		}
+		if !acl.Satisfies(reqFacts.RequiredAccessLevel) {
+			return domain.Denied(domain.DenyTenderACLInsufficient)
+		}
+	}
+
+	// §3.1 step 5: MFA freshness gate. Evaluated last, only for
+	// approver-gated actions — it's a live, uncached call (§4.4).
+	if reqFacts.RequiresApproverGate() {
+		if denied := c.checkMFAFreshness(policyCtx, tenant, in.Claims); denied {
+			return domain.Denied(domain.DenyMFAStale)
+		}
+	}
+
+	return domain.Allowed(buildHeaders(tenant, subject, membership, tenantCtx))
+}
+
+func buildHeaders(tenant, subject string, m domain.MembershipContext, t domain.TenantContext) map[string]string {
+	departments := make([]string, 0, len(m.Departments))
+	for _, d := range m.Departments {
+		departments = append(departments, d.DepartmentID+":"+d.Level)
+	}
+	return map[string]string{
+		domain.HeaderTenantID:     tenant,
+		domain.HeaderUserID:       subject,
+		domain.HeaderDepartments:  strings.Join(departments, ","),
+		domain.HeaderTenantRoles:  strings.Join(m.Roles, ","),
+		domain.HeaderPlan:         t.Plan,
+		domain.HeaderFeatureFlags: strings.Join(t.FeatureFlags, ","),
+	}
+}
+
+// sfResult is the value coalesced across concurrent singleflight callers.
+type sfResult struct {
+	membership domain.MembershipContext
+	tenant     domain.TenantContext
+}
+
+// resolveContext implements §3.1 step 1 together with the read-through
+// cache (§4) and the §7 failure-handling matrix. resolved=false means the
+// caller must return Denied(reason) immediately.
+func (c *Checker) resolveContext(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, domain.DenyReason, bool) {
+	ctxVal, ctxResult, ctxErr := c.cache.GetMembershipContext(ctx, tenant, user)
+	tenantVal, tenantResult, tenantErr := c.cache.GetTenantContext(ctx, tenant)
+	valkeyReachable := ctxErr == nil && tenantErr == nil
+
+	if valkeyReachable && ctxResult == domain.CacheFresh && tenantResult == domain.CacheFresh {
+		c.metrics.ObserveCacheHit(true)
+		return ctxVal, tenantVal, "", true
+	}
+	c.metrics.ObserveCacheHit(false)
+
+	if valkeyReachable {
+		neg, negErr := c.cache.GetNegative(ctx, tenant, user)
+		if negErr == nil {
+			c.metrics.ObserveNegativeCacheHit(neg)
+			if neg {
+				return domain.MembershipContext{}, domain.TenantContext{}, domain.DenyUnresolvableSubject, false
+			}
+		}
+	}
+
+	staleAvailable := valkeyReachable && ctxResult != domain.CacheMiss && tenantResult != domain.CacheMiss
+
+	key := tenant + ":" + user
+	v, err, shared := c.sf.Do(key, func() (any, error) {
+		i8Ctx, i8Span := tracer.Start(ctx, "authz.i8_call")
+		defer i8Span.End()
+		i8Start := c.now()
+		m, t, sfErr := c.org.GetMemberships(i8Ctx, tenant, user)
+		c.metrics.ObserveI8Latency(c.now().Sub(i8Start))
+		return sfResult{membership: m, tenant: t}, sfErr
+	})
+	if shared {
+		c.metrics.ObserveSingleflightCoalesced()
+	}
+
+	if err == nil {
+		res := v.(sfResult)
+		if valkeyReachable {
+			if setErr := c.cache.SetMembershipContext(ctx, tenant, user, res.membership); setErr != nil {
+				c.log.Warn("failed to write ae:ctx", map[string]interface{}{"error": setErr.Error()})
+			}
+			if setErr := c.cache.SetTenantContext(ctx, tenant, res.tenant); setErr != nil {
+				c.log.Warn("failed to write ae:tenant", map[string]interface{}{"error": setErr.Error()})
+			}
+		}
+		return res.membership, res.tenant, "", true
+	}
+
+	if errors.Is(err, domain.ErrNotFound) {
+		if valkeyReachable {
+			if setErr := c.cache.SetNegative(ctx, tenant, user); setErr != nil {
+				c.log.Warn("failed to write ae:neg", map[string]interface{}{"error": setErr.Error()})
+			}
+		}
+		return domain.MembershipContext{}, domain.TenantContext{}, domain.DenyUnresolvableSubject, false
+	}
+
+	// Sibling unreachable (§7). ErrNotFound handled above; anything else —
+	// including an unexpected/unclassified error — is treated as an
+	// availability failure so this defensively fails closed rather than
+	// risking an accidental Allow on a bug.
+	outcome := DecideDependencyOutcome(DependencyState{
+		ValkeyReachable:     valkeyReachable,
+		SiblingReachable:    false,
+		StaleEntryAvailable: staleAvailable,
+	})
+	switch outcome {
+	case OutcomeServeStale:
+		c.metrics.ObserveStaleIfErrorServed()
+		return ctxVal, tenantVal, "", true
+	case OutcomeNormal:
+		// Unreachable in practice: OutcomeNormal requires SiblingReachable,
+		// which is always false on this path (we're only here because the
+		// sibling call just failed). Handled explicitly so this switch stays
+		// exhaustive over DependencyOutcome's full value set.
+		fallthrough
+	case OutcomeFailClosed:
+		c.log.Error("membership rebuild failed, no stale entry available", map[string]interface{}{
+			"tenant": tenant, "error": err.Error(),
+		})
+		return domain.MembershipContext{}, domain.TenantContext{}, domain.DenyServiceUnavailable, false
+	}
+	// Unreachable given DependencyOutcome's three cases are all handled
+	// above — kept as a defensive fail-closed fallback, not a live path.
+	return domain.MembershipContext{}, domain.TenantContext{}, domain.DenyServiceUnavailable, false
+}
+
+// resolveTenderACL implements §6 point 2 / §4.1's 15s-TTL tender-ACL cache.
+// No stale-if-error branch — a cache miss always calls through, and a
+// sibling failure here is scoped to the overlay by the caller (§7 row 4).
+func (c *Checker) resolveTenderACL(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
+	if acl, hit, err := c.cache.GetTenderACL(ctx, tenant, tenderID, user); err == nil && hit {
+		return acl, nil
+	}
+	i12Ctx, i12Span := tracer.Start(ctx, "authz.i12_call")
+	i12Start := c.now()
+	acl, err := c.org.GetTenderACL(i12Ctx, tenant, tenderID, user)
+	c.metrics.ObserveI12Latency(c.now().Sub(i12Start))
+	i12Span.End()
+	if err != nil {
+		return domain.TenderACL{}, fmt.Errorf("tender acl rebuild: %w", err)
+	}
+	if setErr := c.cache.SetTenderACL(ctx, tenant, tenderID, user, acl); setErr != nil {
+		c.log.Warn("failed to write ae:tender_acl", map[string]interface{}{"error": setErr.Error()})
+	}
+	return acl, nil
+}
+
+// checkMFAFreshness implements §3.1 step 5 / §4.4. Returns true if the
+// request must be denied (stale MFA or an unreachable freshness call — see
+// the comment below on why a call failure also denies rather than allowing).
+func (c *Checker) checkMFAFreshness(ctx context.Context, tenant string, claims Claims) bool {
+	mfaCtx, mfaSpan := tracer.Start(ctx, "authz.mfa_freshness_call")
+	window, err := c.org.GetMFAFreshness(mfaCtx, tenant)
+	mfaSpan.End()
+	if err != nil {
+		// The doc gives tender-ACL its own explicit "fail closed for that
+		// overlay only" rule (§7 row 4) but is silent on this call failing.
+		// Approver-gated actions are exactly the security-sensitive case
+		// this service exists to protect, so on ambiguity this fails closed
+		// too, denying with DENY_MFA_STALE — the client's remedy (re-auth)
+		// is the same one it would already be told to take for a genuinely
+		// stale MFA assertion.
+		c.log.Error("mfa-freshness call failed", map[string]interface{}{"tenant": tenant, "error": err.Error()})
+		return true
+	}
+	authTime := time.Unix(claims.AuthTime, 0)
+	return c.now().Sub(authTime) > window
+}

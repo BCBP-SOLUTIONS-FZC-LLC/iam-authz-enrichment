@@ -1,0 +1,166 @@
+# CI for https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment
+#
+# Three parallel jobs: test (race + coverage gate ≥97%, unit + integration
+# against real Valkey/LocalStack service containers), quality (fmt/vet/lint/
+# arch-lint/vuln), and build-image (Dockerfile lint + build-only + a liveness
+# smoke test, using the GO_PRIVATE_TOKEN secret for platform-* module
+# resolution). Consolidated into one workflow file (unlike iam-user-profile's
+# validate-test.yml/validate-quality.yml split) — this service has no
+# Postgres tier, no AsyncAPI/Swagger jobs, and a single test tier, so the
+# extra reusable-workflow indirection isn't earning its keep here.
+#
+# pr-summary posts a single status comment on pull_request events, gated on
+# the three jobs above. No Trivy CVE-scan job — that needs GitHub Advanced
+# Security (SARIF upload) enabled on the repo, unconfirmed for this org, so
+# it isn't wired in silently; ask before adding it.
+name: CI
+
+"on":
+  push:
+    branches: [main, master]
+    paths-ignore: ["**.md"]
+  pull_request:
+    branches: [main, master]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+  GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+
+jobs:
+  test:
+    name: Test (unit + integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      pct: ${{ steps.coverage.outputs.pct }}
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      localstack:
+        image: localstack/localstack:4.4.0
+        ports: ["4566:4566"]
+        env:
+          SERVICES: sqs
+          AWS_DEFAULT_REGION: ap-south-1
+        options: >-
+          --health-cmd "awslocal sqs list-queues"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Configure private module access
+        run: git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Init LocalStack queues
+        run: |
+          chmod +x scripts/init-localstack.sh
+          AWS_ACCESS_KEY_ID=localstack AWS_SECRET_ACCESS_KEY=localstack AWS_DEFAULT_REGION=ap-south-1 \
+            ./scripts/init-localstack.sh
+        env:
+          AWS_ENDPOINT_URL: http://localhost:4566
+      - name: Unit tests (race + coverage)
+        run: make test-ci
+      - name: Coverage gate (≥97%)
+        id: coverage
+        run: bash .github/scripts/coverage-gate.sh
+        env:
+          COVERAGE_THRESHOLD: "97"
+      - name: Integration tests
+        run: make test-integration
+        env:
+          VALKEY_URL: localhost:6379
+          AWS_ENDPOINT_URL: http://localhost:4566
+          AWS_ACCESS_KEY_ID: localstack
+          AWS_SECRET_ACCESS_KEY: localstack
+          AWS_REGION: ap-south-1
+      - uses: codecov/codecov-action@v5
+        with:
+          files: coverage.out
+          fail_ci_if_error: false
+
+  quality:
+    name: Quality (fmt/vet/lint/arch-lint/vuln)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Configure private module access
+        run: git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - run: make fmt-check
+      - run: make vet
+      - run: make lint
+      - run: make arch-lint
+      - run: make mod-verify
+      - run: make vuln-check
+
+  build-image:
+    name: Build image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.3.0
+        with:
+          dockerfile: Dockerfile
+      - name: Check .dockerignore exists
+        run: test -f .dockerignore
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: iam-authz-enrichment-ci-test
+          secrets: |
+            go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+      - name: Smoke tests
+        run: bash .github/scripts/smoke-tests.sh
+
+  pr-summary:
+    name: PR summary
+    runs-on: ubuntu-latest
+    needs: [test, quality, build-image]
+    if: always() && github.event_name == 'pull_request'
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - name: Post or update summary comment
+        uses: actions/github-script@v9.0.0
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const fs = require('fs')
+            const code = fs.readFileSync('.github/scripts/pr-summary.js', 'utf8')
+            const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+            const run = new AsyncFunction('github', 'context', 'core', 'require', 'process', code)
+            await run(github, context, core, require, process)

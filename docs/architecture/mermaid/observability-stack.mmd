@@ -1,0 +1,44 @@
+graph LR
+    subgraph interceptors["gRPC interceptor chain (platform-gincommon)\nObservabilityUnaryInterceptors — NOT ProtectedUnaryInterceptors:\nEnvoy calls this service over mTLS, not as a JWT-bearing client"]
+        panic["panic recovery"]
+        reqid["request ID"]
+        tracing_i["tracing"]
+        metrics_i["metrics"]
+        logging_i["logging"]
+        panic --> reqid --> tracing_i --> metrics_i --> logging_i
+    end
+
+    subgraph spans["OTel spans (child of the outer ext_authz span)"]
+        s1["authz.lookup_cache\n(wraps the whole resolveContext call)"]
+        s2["authz.i8_call\n(nested — only on a cache miss)"]
+        s3["authz.evaluate_policy\n(wraps steps 2–5 of §3.1)"]
+        s4["authz.i12_call\n(nested — tender-ACL overlay only)"]
+        s5["authz.mfa_freshness_call\n(nested — approver-gated requests only)"]
+        s1 --> s2
+        s3 --> s4
+        s3 --> s5
+    end
+
+    subgraph prom["Prometheus  →  /metrics (§10)"]
+        p1["authz_decisions_total{decision}"]
+        p2["authz_deny_reason_total{reason}"]
+        p3["authz_decision_latency_seconds"]
+        p4["authz_cache_hits_total / authz_cache_lookups_total\n(hit ratio via PromQL rate() division —\nnever a server-computed ratio gauge)"]
+        p5["authz_negative_cache_hits_total / _lookups_total"]
+        p6["authz_stale_if_error_served_total\n— nonzero rate should page"]
+        p7["authz_singleflight_coalesced_total"]
+        p8["authz_i8_call_latency_seconds"]
+        p9["authz_i12_call_latency_seconds"]
+        p10["standard gRPC server metrics\n(from the interceptor chain)"]
+    end
+
+    subgraph logs["Structured logs (zap, JSON in non-dev)"]
+        l1["Only sub / iss from the JWT are ever logged (§8.5)"]
+        l2["auth_time and every other claim: NEVER logged in raw form"]
+        l3["Enforced by construction — no log call in this codebase\never receives those fields as an argument, not by a\nkey-based redaction filter after the fact"]
+    end
+
+    metrics_i --> p1 & p2 & p3 & p10
+    tracing_i --> s1
+    logging_i --> l1
+    l1 --- l2 --- l3

@@ -17,6 +17,10 @@ coverage.*
 *.coverprofile
 profile.cov
 
+# Build artefacts
+/bin/
+.coverage/
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
@@ -26,6 +30,9 @@ go.work.sum
 
 # env file
 .env
+
+# throwaway local mock Org & Membership server (see README §Exercising the gRPC API locally)
+mockorg*
 
 # Editor/IDE
 # .idea/

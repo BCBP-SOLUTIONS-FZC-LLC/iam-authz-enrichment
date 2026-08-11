@@ -1,0 +1,60 @@
+graph TD
+    subgraph cmd["Composition Root  —  cmd/"]
+        main["server/main.go\nwires config → logger → metrics → cache → org client\n→ realm map / restricted-tender set → Checker / Invalidator\n→ gRPC server (ext_authz) + HTTP server (health/metrics) + 5 SQS consumers\ngraceful shutdown order: gRPC → HTTP → consumers → cancel bg work → cache.Close"]
+    end
+
+    subgraph adapters_in["Inbound Adapters  —  internal/adapter/inbound/"]
+        grpc_a["grpc/\nServer — envoy.service.auth.v3.Authorization\nclaims.go — decodeClaims (Envoy jwt_authn dynamic metadata ONLY,\nnever request headers — §8.2)\nrequestfacts.go — decodeRequestFacts (route ContextExtensions)\nresponse.go — okResponse / deniedResponse (§9 status mapping)"]
+        http_a["http/\nrouter.go — /healthz · /readyz · /metrics only, no business logic\nReadinessProbe reports process-startup, NOT dependency health\n(§7 bypass/stale-if-error modes must stay in rotation)"]
+        consumer_a["consumer/\n5 SQS consumers: membership · user · billing · tenant · tender\ndedupingHandler — ae:processed SET NX, with EvictProcessed on\nhandler failure so a permanently-bad message still reaches the DLQ"]
+    end
+
+    subgraph usecase["Usecase  —  internal/usecase/"]
+        checker["check.go — Checker\n§3.1 precedence chain · singleflight coalescing\nnegative cache · stale-if-error · tender-ACL overlay\nMFA-freshness gate (never cached, §4.4)"]
+        invalidator["invalidate.go — Invalidator\none Handle* method per §5 event type"]
+        failure["failure.go — DecideDependencyOutcome\n§7 failure-handling matrix as a pure, directly-tested function"]
+        realmmap["tenant_resolve.go — RealmMap, ResolveTenant, Claims\nrestricted_tenders.go — RestrictedTenderSet"]
+        ports["ports.go — Cache · OrgMembershipClient · Recorder · Logger\ninterfaces this layer declares for itself — adapters satisfy them\nstructurally, without this layer ever importing an adapter package"]
+    end
+
+    subgraph domain["Domain  —  internal/domain/ + internal/domain/policy/"]
+        decision["decision.go — Decision, DenyReason\n(§9 HTTP-status mapping), the 6 InjectedHeaders names"]
+        context_v["context.go — MembershipContext, TenantContext,\nDepartment, Delegation, TenderACL"]
+        errs["errors.go — ErrNotFound, ErrUnavailable\n(shared vocabulary between adapters and usecase)"]
+        policy_p["policy/ — EvaluateBase, ViolatesReadOnly,\nMeetsDepartmentLevel, RequestFacts\n(pure predicates, zero I/O — §3)"]
+    end
+
+    subgraph adapters_out["Outbound Adapters  —  internal/adapter/outbound/"]
+        valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
+        org_a["orgmembership/\nClient — I-8 memberships · I-12 tender-acl · I-14 mfa-freshness\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
+        metrics_a["metrics/\nRecorder — Prometheus authz_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
+    end
+
+    subgraph config_g["Config  —  internal/config/"]
+        config_c["config.go — Load()\nplain os.Getenv + default fallback, no hot-reload (§11)"]
+    end
+
+    main --> grpc_a & http_a & consumer_a
+    main --> valkey_a & org_a & metrics_a & config_c
+    main --> checker & invalidator & realmmap
+
+    grpc_a --> checker
+    grpc_a --> decision & policy_p
+    consumer_a --> invalidator
+    consumer_a --> decision
+
+    checker --> ports
+    checker --> decision & context_v & errs & policy_p
+    checker --> failure
+    invalidator --> ports
+    invalidator --> decision & context_v
+
+    valkey_a --> decision & context_v
+    org_a --> decision & context_v & errs
+    metrics_a --> decision
+    ports --> decision
+    policy_p --> context_v
+
+    valkey_a -.->|"satisfies Cache\n(structurally — no import)"| ports
+    org_a -.->|"satisfies OrgMembershipClient\n(structurally — no import)"| ports
+    metrics_a -.->|"satisfies Recorder\n(structurally — no import)"| ports
