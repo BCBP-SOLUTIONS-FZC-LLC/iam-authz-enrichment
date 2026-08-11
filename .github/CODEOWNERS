@@ -25,3 +25,8 @@ internal/adapter/inbound/consumer/ @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTI
 # Cache key schema and TTLs — §4. A key-shape change without a coordinated
 # rollout can strand stale entries under the old key indefinitely.
 internal/adapter/outbound/valkey/ @BCBP-SOLUTIONS-FZC-LLC/iam-team
+
+# Deployment config — Helm chart, IAM policy, and alerting rules applied by
+# the platform CD pipeline. A NetworkPolicy or IAM-policy change here can
+# take the service (and everything behind Envoy's ext_authz filter) offline.
+deploy/ @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTIONS-FZC-LLC/platform-team

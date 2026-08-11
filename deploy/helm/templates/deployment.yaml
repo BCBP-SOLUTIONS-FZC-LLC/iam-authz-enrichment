@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "iam-authz-enrichment.fullname" . }}
+  labels:
+    {{- include "iam-authz-enrichment.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "iam-authz-enrichment.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxSurge: 0 is required with hard pod anti-affinity on a 3-node cluster.
+      # A surge pod cannot be scheduled when every node already holds a replica —
+      # the rollout would stall indefinitely. Use maxUnavailable: 1 instead.
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "iam-authz-enrichment.selectorLabels" . | nindent 8 }}
+      annotations:
+        {{- if .Values.existingSecret }}
+        # When using an external secret (ESO / CSI), bump rotationEpoch to force
+        # a rollout after secret rotation:
+        #   helm upgrade ... --set rotationEpoch=$(date +%s)
+        rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
+        {{- else }}
+        # Force rollout when the Secret changes (checksum triggers pod recycling).
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ if .Values.serviceAccount.create }}{{ include "iam-authz-enrichment.fullname" . }}{{ else }}default{{ end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532      # distroless nonroot UID
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ include "iam-authz-enrichment.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.grpcPort }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: BUILD_VERSION
+              value: {{ include "iam-authz-enrichment.imageTag" . | quote }}
+            {{- range $key, $val := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $val | quote }}
+            {{- end }}
+            {{- $secretName := default (printf "%s-secrets" (include "iam-authz-enrichment.fullname" .)) .Values.existingSecret }}
+            {{- range .Values.envFromSecret }}
+            - name: {{ . }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: {{ . }}
+            {{- end }}
+          startupProbe:
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      affinity:
+        # Hard anti-affinity: require pods to land on different nodes.
+        # preferred (soft) anti-affinity allows all replicas on one node —
+        # a single node failure would take the service to zero despite the PDB.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "iam-authz-enrichment.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname

@@ -1,0 +1,49 @@
+# Terraform snippet — attach the reference policy in deploy/iam/policy.json to
+# an IRSA role. This file is *illustrative*, not applied by the application.
+# Platform Terraform owns the authoritative version of this resource.
+
+# 1. Trust policy — the ServiceAccount `iam-authz-enrichment` in namespace `iam`
+#    assumes this role via IRSA.
+data "aws_iam_policy_document" "iam_authz_enrichment_trust" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:iam:iam-authz-enrichment"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "iam_authz_enrichment" {
+  name               = "iam-authz-enrichment"
+  assume_role_policy = data.aws_iam_policy_document.iam_authz_enrichment_trust.json
+}
+
+# 2. Permission policy — templated from deploy/iam/policy.json.
+resource "aws_iam_policy" "iam_authz_enrichment" {
+  name = "iam-authz-enrichment"
+  policy = templatefile("${path.module}/policy.json", {
+    membership_authz_queue_arn = aws_sqs_queue.membership_authz.arn
+    user_authz_queue_arn       = aws_sqs_queue.user_authz.arn
+    billing_authz_queue_arn    = aws_sqs_queue.billing_authz.arn
+    tenant_authz_queue_arn     = aws_sqs_queue.tenant_authz.arn
+    tender_authz_queue_arn     = aws_sqs_queue.tender_authz.arn
+    aws_region                 = data.aws_region.current.name
+    aws_account_id             = data.aws_caller_identity.current.account_id
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "iam_authz_enrichment" {
+  role       = aws_iam_role.iam_authz_enrichment.name
+  policy_arn = aws_iam_policy.iam_authz_enrichment.arn
+}

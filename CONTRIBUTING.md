@@ -102,6 +102,10 @@ For full layout and flow details see [ARCHITECTURE.md](ARCHITECTURE.md).
 4. Add one eviction test asserting the exact key touched and nothing else, plus update
    `scripts/init-localstack.sh` and the CI `test` job's queue list if the queue is new.
 5. Update the consumed-event table in `README.md § Testing events locally` and in `ARCHITECTURE.md`.
+6. If the queue is new (not a handler added to an existing queue), add its ARN to the
+   `ConsumeAuthzEvents` statement in `deploy/iam/policy.json` and the Terraform
+   `templatefile` call in `deploy/iam/policy.tf.example` — the IAM role must be updated
+   before the new consumer is deployed, or it fails on its first `ReceiveMessage` call.
 
 ### Adding a new environment variable
 
@@ -222,3 +226,10 @@ deliberately, matching the platform team's actual deployment target, rather than
 pipeline wholesale. Notify the platform team on Slack if a change here affects the Envoy
 `ext_authz` contract (response headers, `DenyReason` set, or the `CheckRequest` fields it
 reads) — every service behind this filter is a downstream consumer.
+
+The Helm chart in `deploy/helm/` (applied by the platform CD pipeline) has no
+Ingress/HTTPRoute template — Envoy reaches `Authorization.Check` directly via the chart's
+`grpc` Service port by cluster DNS, not through a Route resource. See `deploy/iam/README.md`
+for the IRSA role/policy this service's ServiceAccount needs, and `deploy/monitoring/` for
+the Prometheus alerting rules (thresholds match the SLOs in `ARCHITECTURE.md` §10) and the
+optional prometheus-adapter config for decision-rate HPA scaling.

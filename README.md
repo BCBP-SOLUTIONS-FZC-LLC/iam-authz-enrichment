@@ -127,6 +127,10 @@ iam-authz-enrichment/
 │   │       └── metrics/               # Prometheus authz_* series (§10)
 │   └── config/                        # Load() — env vars only, no hot-reload (§11)
 ├── docs/architecture/                 # Mermaid diagram sources — see ARCHITECTURE.md
+├── deploy/
+│   ├── helm/                          # Helm chart — no Ingress/HTTPRoute; Envoy reaches the grpc Service directly by cluster DNS
+│   ├── iam/                           # Reference IAM policy + Terraform snippet (SQS consume-only — see deploy/iam/README.md)
+│   └── monitoring/                    # Prometheus alerting rules + prometheus-adapter config for HPA decision-rate scaling
 ├── scripts/init-localstack.sh         # Creates the 5 queues + their -dlq, with the maxReceiveCount=5 redrive policy
 └── test/
     ├── integration/                   # Real Valkey + LocalStack SQS (build tag `integration`)
@@ -463,6 +467,7 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `REALM_TENANT_MAP_SEED` | `{}` | Startup-only JSON seed for dedicated realms; kept fresh at runtime by events, never re-read |
 | `JWT_METADATA_NAMESPACE` / `JWT_PAYLOAD_KEY` | `envoy.filters.http.jwt_authn` / `trial` | Must match the Envoy `jwt_authn` filter config |
 | `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `localstack` | AWS credentials (use IRSA in production — reference IAM policy + Terraform snippet under [`deploy/iam/`](deploy/iam/)) |
 
 ---
 

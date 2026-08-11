@@ -1,0 +1,134 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "iam-authz-enrichment.fullname" . }}
+  labels:
+    {{- include "iam-authz-enrichment.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: iam_authz_enrichment_availability
+      rules:
+        - alert: AuthzEnrichmentDown
+          expr: |
+            absent(up{job={{ include "iam-authz-enrichment.fullname" . | quote }}} == 1)
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: iam-authz-enrichment has no healthy instances
+            description: >-
+              No iam-authz-enrichment pods have been scraped as healthy for 2 minutes.
+              Every request behind Envoy's ext_authz filter depends on this service —
+              this is a platform-wide outage, not a degradation.
+              Check pod readiness: kubectl get pods -l app.kubernetes.io/name=iam-authz-enrichment
+
+        - alert: AuthzEnrichmentReplicasMissing
+          expr: |
+            sum(up{job={{ include "iam-authz-enrichment.fullname" . | quote }}}) < 2
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-authz-enrichment running below minimum replica count
+            description: >-
+              Fewer than 2 replicas are healthy. The PDB requires minAvailable=2;
+              a further disruption will block node drains.
+              Current healthy count: {{ "{{ $value }}" }}.
+
+        - alert: AuthzEnrichmentAvailabilitySLOBreach
+          expr: |
+            avg(avg_over_time(up{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[10m])) < 0.995
+          for: 10m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: iam-authz-enrichment availability below 99.5% SLO — SEV-1
+            description: >-
+              Fleet-wide scrape-success ratio over the last 10 minutes is
+              {{ "{{ $value | humanizePercentage }}" }}, below the documented 99.5%
+              SLO. This is a SEV-1 per ARCHITECTURE.md §10 — escalate immediately.
+
+    - name: iam_authz_enrichment_latency
+      rules:
+        - alert: AuthzEnrichmentDecisionLatencySLOBreach
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(authz_decision_latency_seconds_bucket{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[5m])
+              )
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-authz-enrichment p99 decision latency above 50ms SLO — SEV-2
+            description: >-
+              The p99 Check() decision latency is {{ "{{ $value | humanizeDuration }}" }},
+              exceeding the documented 50ms SLO. This is a SEV-2 per ARCHITECTURE.md
+              §10. Check authz_i8_call_latency_seconds / authz_i12_call_latency_seconds
+              for whether Org & Membership is the bottleneck, and Valkey round-trip
+              time if cache hit ratio has dropped.
+
+    - name: iam_authz_enrichment_dependency_health
+      rules:
+        - alert: AuthzEnrichmentStaleIfErrorServing
+          expr: |
+            rate(authz_stale_if_error_served_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[5m]) > 0
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: iam-authz-enrichment is serving stale cache entries — live dependency outage
+            description: >-
+              authz_stale_if_error_served_total is increasing, meaning §7's
+              stale-if-error path is active: a live outage of a dependency
+              (Valkey or Org & Membership) is in progress right now. Page
+              immediately rather than waiting for the latency/availability SLO
+              alerts above to trip — this metric is the earliest signal.
+
+        - alert: AuthzEnrichmentServiceUnavailableSpike
+          expr: |
+            rate(authz_deny_reason_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}, reason="DENY_SERVICE_UNAVAILABLE"}[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-authz-enrichment is denying requests due to a dependency failure
+            description: >-
+              A sustained rate of DENY_SERVICE_UNAVAILABLE means §7's failure-handling
+              matrix is fail-closing on a dependency outage outside the stale-if-error
+              grace window (or the tender-ACL overlay's independent fail-closed rule
+              is firing on I-12 failures). Check Org & Membership and Valkey health.
+              Rate: {{ "{{ $value | humanize }}" }}/s.
+
+    - name: iam_authz_enrichment_cache
+      rules:
+        - alert: AuthzEnrichmentCacheHitRatioLow
+          expr: |
+            sum(rate(authz_cache_hits_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[15m]))
+              /
+            sum(rate(authz_cache_lookups_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[15m]))
+            < 0.5
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-authz-enrichment ae:ctx cache hit ratio below 50%
+            description: >-
+              The ae:ctx/ae:tenant cache hit ratio over the last 15 minutes is
+              {{ "{{ $value | humanizePercentage }}" }}. A sustained low ratio
+              increases Org & Membership (I-8) call volume and decision latency —
+              check for a recent mass cache eviction (bulk membership/tenant
+              event), a TTL misconfiguration, or Valkey eviction pressure.
+{{- end }}
