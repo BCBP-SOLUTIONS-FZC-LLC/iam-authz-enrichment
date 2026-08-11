@@ -12,10 +12,12 @@ function icon(r) {
 const coveragePct = needs['test']?.outputs?.pct;
 
 const rows = [
-  ['Tests & race detector',        'test'],
-  ['Coverage ≥ 97%',               'test'],
-  ['Image build + Dockerfile lint + smoke', 'build-image'],
-  ['Code quality',                 'quality'],
+  ['Tests & race detector',         'test'],
+  ['Coverage ≥ 97%',                'test'],
+  ['Image build + Dockerfile lint', 'build-image'],
+  ['Trivy CVE scan',                'trivy'],
+  ['Smoke tests',                   'smoke'],
+  ['Code quality',                  'quality'],
 ];
 
 const table = rows

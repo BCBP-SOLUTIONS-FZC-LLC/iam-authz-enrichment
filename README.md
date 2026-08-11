@@ -480,16 +480,24 @@ Hard invariants — see [`ARCHITECTURE.md` §Threat model](ARCHITECTURE.md#threa
 
 ## CI
 
-`.github/workflows/ci.yml` — three parallel jobs, plus a PR summary comment:
+`.github/workflows/ci.yml`:
 
 - **test** — unit (`-race`, coverage) + integration against real Valkey/LocalStack service containers, gated by `.github/scripts/coverage-gate.sh` (fails below 97%).
 - **quality** — `fmt-check`, `vet`, `lint`, `arch-lint`, `mod-verify`, `vuln-check`.
-- **build-image** — Hadolint + Docker build-only (no push), using the `GO_PRIVATE_TOKEN` secret for `platform-*` module resolution, plus a liveness smoke test (`.github/scripts/smoke-tests.sh`) against the built image.
-- **pr-summary** — posts/updates one status comment on pull requests once the three jobs above finish.
+- **build-image** — Hadolint + Docker build-to-cache (no local load), using the `GO_PRIVATE_TOKEN` secret for `platform-*` module resolution. `trivy` and `smoke` each restore their own copy from the GHA/registry cache rather than sharing a loaded image across jobs.
+- **trivy** — CVE scan (fails on CRITICAL/HIGH/UNKNOWN), SARIF upload to the Security tab (best-effort — doesn't fail if GitHub Advanced Security isn't enabled), and a CycloneDX SBOM artifact.
+- **smoke** — the liveness smoke test (`.github/scripts/smoke-tests.sh`) against the built image.
+- **pr-summary** — posts/updates one status comment on pull requests once `test`/`quality`/`build-image`/`trivy`/`smoke` finish.
+- **push** — on push to `main`/`master` only: builds (with SBOM + provenance attestations), pushes to `ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment`, and signs the image with Cosign (keyless, via Sigstore OIDC — no signing key to manage). Verify a published image with:
+  ```sh
+  cosign verify --certificate-identity-regexp "^https://github\.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/.github/workflows/.*@refs/heads/(main|master)$" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment@<digest>
+  ```
 
 `.github/workflows/changelog-check.yml` separately fails a PR that touches `internal/` or `cmd/` without a `CHANGELOG.md` `[Unreleased]` entry.
 
-There is no tag-triggered release/publish workflow yet (no GHCR push, signing, or SBOM) — see [`CONTRIBUTING.md` § Deployment](CONTRIBUTING.md#deployment).
+There is no *tag-triggered* release workflow (versioned binaries, GitHub Releases, checksums) — pushes to `main` publish a `sha-<short-sha>`-tagged image, but nothing reacts to a `v*` tag yet. See [`CONTRIBUTING.md` § Deployment](CONTRIBUTING.md#deployment).
 
 ---
 

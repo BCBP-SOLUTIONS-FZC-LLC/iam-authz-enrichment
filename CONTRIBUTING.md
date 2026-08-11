@@ -200,17 +200,25 @@ chore(deps): bump platform-events to v1.4.0
 ## Deployment
 
 This service is deployed as a containerised microservice behind Envoy as its `ext_authz`
-sidecar/filter target. On push to `main` or on a pull request, `.github/workflows/ci.yml`
-runs three jobs in parallel: `test` (race + coverage gate ≥97%, unit + integration against
-real Valkey/LocalStack service containers), `quality` (`fmt-check`/`vet`/`lint`/`arch-lint`/
-`mod-verify`/`vuln-check`), and `build-image` (Hadolint + Docker build-only, no push, plus a
-liveness smoke test against the built image). `changelog-check.yml` additionally requires a
-`CHANGELOG.md` `[Unreleased]` entry on any PR touching `internal/` or `cmd/`. A `pr-summary`
-job posts a single status comment on pull requests once the three CI jobs finish.
+sidecar/filter target. On push to `main` or on a pull request, `.github/workflows/ci.yml` runs
+`test` (race + coverage gate ≥97%, unit + integration against real Valkey/LocalStack service
+containers), `quality` (`fmt-check`/`vet`/`lint`/`arch-lint`/`mod-verify`/`vuln-check`), and
+`build-image` (Hadolint + Docker build-to-cache) in parallel, then `trivy` (CVE scan + SBOM)
+and `smoke` (liveness check against the built image) once `build-image` finishes.
+`changelog-check.yml` additionally requires a `CHANGELOG.md` `[Unreleased]` entry on any PR
+touching `internal/` or `cmd/`. A `pr-summary` job posts a single status comment on pull
+requests once those jobs finish.
 
-There is currently no tag-triggered release workflow, image push, or signing step in this
-repo (unlike `iam-user-profile`'s `release.yml`) — add one deliberately, matching the
-platform team's actual deployment target, rather than copying that pipeline wholesale.
-Notify the platform team on Slack if a change here affects the Envoy `ext_authz` contract
-(response headers, `DenyReason` set, or the `CheckRequest` fields it reads) — every service
-behind this filter is a downstream consumer.
+On push to `main`/`master` specifically, a `push` job builds and publishes the image to
+`ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment` (tagged by branch and short SHA, with
+SBOM + provenance attestations), then signs it with Cosign using keyless Sigstore OIDC
+signing — no long-lived signing key to rotate or leak, no secret beyond the default
+`GITHUB_TOKEN`. This requires repo Settings → Actions → Workflow permissions set to "Read and
+write"; without it, the GHCR login/push step fails.
+
+There is currently no *tag-triggered* release workflow (versioned binaries, GitHub Releases,
+checksums, SLSA provenance export — unlike `iam-user-profile`'s `release.yml`) — add one
+deliberately, matching the platform team's actual deployment target, rather than copying that
+pipeline wholesale. Notify the platform team on Slack if a change here affects the Envoy
+`ext_authz` contract (response headers, `DenyReason` set, or the `CheckRequest` fields it
+reads) — every service behind this filter is a downstream consumer.

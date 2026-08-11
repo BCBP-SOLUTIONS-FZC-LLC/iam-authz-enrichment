@@ -1,27 +1,36 @@
 # CI for https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment
 #
-# Three parallel jobs: test (race + coverage gate ≥97%, unit + integration
-# against real Valkey/LocalStack service containers), quality (fmt/vet/lint/
-# arch-lint/vuln), and build-image (Dockerfile lint + build-only + a liveness
-# smoke test, using the GO_PRIVATE_TOKEN secret for platform-* module
-# resolution). Consolidated into one workflow file (unlike iam-user-profile's
-# validate-test.yml/validate-quality.yml split) — this service has no
-# Postgres tier, no AsyncAPI/Swagger jobs, and a single test tier, so the
-# extra reusable-workflow indirection isn't earning its keep here.
+# Parallel flow:
 #
-# pr-summary posts a single status comment on pull_request events, gated on
-# the three jobs above. No Trivy CVE-scan job — that needs GitHub Advanced
-# Security (SARIF upload) enabled on the repo, unconfirmed for this org, so
-# it isn't wired in silently; ask before adding it.
+#   test ───────────┐
+#   build-image ────┤──► trivy ──────┐
+#                   │   smoke ───────┤──► pr-summary (PR events only)
+#                   └────────────────┤──► push       (push events only, needs quality too)
+#   quality ───────────────────────┘
+#
+# test: race + coverage gate ≥97%, unit + integration against real
+# Valkey/LocalStack service containers. quality: fmt/vet/lint/arch-lint/
+# mod-verify/vuln-check. build-image: Dockerfile lint + build-to-cache (no
+# local load — trivy/smoke each restore their own copy from the GHA cache).
+# Consolidated into one workflow file (unlike iam-user-profile's
+# validate-test.yml/validate-quality.yml split) — this service has no
+# Postgres tier and a single test tier, so the extra reusable-workflow
+# indirection isn't earning its keep here.
+#
+# pr-summary posts a single status comment on pull_request events. push
+# publishes to GHCR on push to main, with SBOM/provenance attestations and
+# Cosign keyless signing — no long-lived signing key, no secret beyond the
+# default GITHUB_TOKEN. Requires repo Settings → Actions → Workflow
+# permissions set to "Read and write", or the GHCR login/push step fails.
 name: CI
 
 "on":
   push:
     branches: [main, master]
-    paths-ignore: ["**.md"]
+    paths-ignore: ["**.md", "docs/architecture/**"]
   pull_request:
     branches: [main, master]
-    paths-ignore: ["**.md"]
+    paths-ignore: ["**.md", "docs/architecture/**"]
   workflow_dispatch:
 
 permissions:
@@ -35,8 +44,12 @@ concurrency:
 env:
   GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
   GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  IMAGE_NAME: ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment
+  BUILDKIT_PROGRESS: plain
 
 jobs:
+  # ── runs in parallel with quality + build-image ───────────────────────────
   test:
     name: Test (unit + integration)
     runs-on: ubuntu-latest
@@ -97,6 +110,7 @@ jobs:
           files: coverage.out
           fail_ci_if_error: false
 
+  # ── runs in parallel with test + build-image ──────────────────────────────
   quality:
     name: Quality (fmt/vet/lint/arch-lint/vuln)
     runs-on: ubuntu-latest
@@ -115,10 +129,14 @@ jobs:
       - run: make mod-verify
       - run: make vuln-check
 
+  # ── runs in parallel with test + quality; feeds trivy + smoke + push ─────
   build-image:
-    name: Build image
+    name: Build image (cache)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v7.0.0
       - name: Hadolint
@@ -127,25 +145,157 @@ jobs:
           dockerfile: Dockerfile
       - name: Check .dockerignore exists
         run: test -f .dockerignore
+
+      # SOURCE_DATE_EPOCH + buildx cache targets (grouped in docker-build-prep.sh).
+      - name: Prepare Docker build
+        id: cache
+        env:
+          REGISTRY_REF: ${{ env.IMAGE_NAME }}:buildcache
+          CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        run: bash .github/scripts/docker-build-prep.sh
+
+      # Log in so registry cache reads (and writes on non-fork runs) are authenticated.
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/setup-buildx-action@v3
-      - name: Build (no push)
+
+      # Build and write all layers to GHA + registry cache (no local load needed here).
+      - name: Build image → cache
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ./Dockerfile
+          # This cache job only feeds downstream trivy/smoke, which load amd64 images.
+          platforms: linux/amd64
+          push: false
+          load: false
+          cache-from: ${{ steps.cache.outputs.from }}
+          cache-to: ${{ steps.cache.outputs.to }}
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ steps.cache.outputs.SOURCE_DATE_EPOCH }}
+          secrets: |
+            go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
+
+  # ── gates on test + build-image, runs in parallel with trivy ─────────────
+  smoke:
+    name: Smoke tests
+    runs-on: ubuntu-latest
+    needs: [test, build-image]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: docker/setup-buildx-action@v3
+      # Restore from GHA cache (all layers cached → near-instant rebuild).
+      - name: Load image from cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
           push: false
           load: true
           tags: iam-authz-enrichment-ci-test
+          cache-from: type=gha
+          build-args: BUILD_VERSION=${{ github.sha }}
           secrets: |
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
-          build-args: |
-            BUILD_VERSION=${{ github.sha }}
       - name: Smoke tests
         run: bash .github/scripts/smoke-tests.sh
 
+  # ── gates on test + build-image, runs in parallel with smoke ────────────
+  trivy:
+    name: Trivy CVE scan
+    runs-on: ubuntu-latest
+    needs: [test, build-image]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: docker/setup-buildx-action@v3
+      # Restore from GHA cache (all layers cached → near-instant rebuild).
+      - name: Load image from cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: iam-authz-enrichment-ci-test
+          cache-from: type=gha
+          build-args: BUILD_VERSION=${{ github.sha }}
+          secrets: |
+            go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v6.1.0
+        with:
+          path: /tmp/trivy-cache
+          key: trivy-db-${{ runner.os }}
+          restore-keys: |
+            trivy-db-${{ runner.os }}-
+
+      # Table format: human-readable in CI logs; fails on CRITICAL/HIGH/UNKNOWN.
+      - name: Trivy scan — CRITICAL / HIGH / UNKNOWN
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: iam-authz-enrichment-ci-test
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH,UNKNOWN
+          ignore-unfixed: true
+          cache-dir: /tmp/trivy-cache
+
+      # SARIF format: uploads to GitHub Security tab.
+      - name: Trivy scan — SARIF upload
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: iam-authz-enrichment-ci-test
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "0"
+          ignore-unfixed: true
+          cache-dir: /tmp/trivy-cache
+
+      # continue-on-error: GitHub Advanced Security (required for SARIF upload
+      # on a private repo) may not be enabled — that shouldn't fail the scan.
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4.37.0
+        continue-on-error: true
+        with:
+          sarif_file: trivy-results.sarif
+
+      # CycloneDX SBOM — full component inventory for compliance / audit.
+      - name: Trivy SBOM — CycloneDX
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: iam-authz-enrichment-ci-test
+          format: cyclonedx
+          output: sbom.cyclonedx.json
+          exit-code: "0"
+          cache-dir: /tmp/trivy-cache
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.cyclonedx.json
+          retention-days: 90
+
+  # ── posts or updates a single comment on every PR push ───────────────────
   pr-summary:
     name: PR summary
     runs-on: ubuntu-latest
-    needs: [test, quality, build-image]
+    needs: [test, quality, build-image, trivy, smoke]
     if: always() && github.event_name == 'pull_request'
     timeout-minutes: 5
     permissions:
@@ -164,3 +314,93 @@ jobs:
             const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
             const run = new AsyncFunction('github', 'context', 'core', 'require', 'process', code)
             await run(github, context, core, require, process)
+
+  # ── push to GHCR on merge to main ────────────────────────────────────────
+  push:
+    name: Push image → GHCR
+    runs-on: ubuntu-latest
+    needs: [test, trivy, smoke, quality]
+    if: github.event_name == 'push'
+    # amd64-only publish with provenance/SBOM attestations can exceed 10 minutes.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - name: Set SOURCE_DATE_EPOCH
+        id: sde
+        run: bash .github/scripts/set-source-date-epoch.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: pushed
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # amd64-only by design — no platforms fan-out until there's a real
+          # arm64 deploy target.
+          platforms: linux/amd64
+          pull: true
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ steps.sde.outputs.SOURCE_DATE_EPOCH }}
+          secrets: |
+            go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: |
+            type=gha,mode=max
+            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      # Keyless signing via Sigstore OIDC — no long-lived key to rotate or leak.
+      # Verifiable with: cosign verify --certificate-identity-regexp ACTOR \
+      #   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #   ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment@DIGEST
+      - name: Sign image with Cosign
+        run: |
+          cosign sign --yes \
+            "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github\.com/${{ github.repository }}/.github/workflows/.*@refs/heads/(main|master)$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
+
+      - name: Log image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.pushed.outputs.digest }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: bash .github/scripts/log-image-digest.sh
