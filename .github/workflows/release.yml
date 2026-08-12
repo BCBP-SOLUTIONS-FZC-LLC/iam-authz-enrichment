@@ -18,17 +18,26 @@
 # deployment is broken — a dependency outage unrelated to the rollout could
 # otherwise trigger a false-positive rollback).
 #
-# This job requires real infrastructure this repo did not have configured
-# as of the previous revision of this file: a KUBECONFIG_B64 secret for a
-# production cluster, K8S_NAMESPACE/PROMETHEUS_URL vars (optional, default
-# 'default' namespace / skip the Prometheus check if unset), and a
-# pre-provisioned Kubernetes Secret named iam-authz-enrichment-secrets in
-# the target namespace (this chart's secret.yaml template hard-fails
-# `helm upgrade` via existingSecret otherwise — see deploy/helm/values.yaml).
-# Its own first step fails clearly if KUBECONFIG_B64 is unset, so an
-# unconfigured cluster blocks `publish` with an actionable error rather
-# than a confusing one — but it DOES block every release until that secret
-# exists. Configure it before tagging the next release.
+# This job requires real infrastructure this repo does not have configured
+# yet: a KUBECONFIG_B64 secret for a production cluster, K8S_NAMESPACE/
+# PROMETHEUS_URL vars (optional, default 'default' namespace / skip the
+# Prometheus check if unset), and a pre-provisioned Kubernetes Secret named
+# iam-authz-enrichment-secrets in the target namespace (this chart's
+# secret.yaml template hard-fails `helm upgrade` via existingSecret
+# otherwise — see deploy/helm/values.yaml).
+#
+# Gated on the vars.DEPLOY_GATE_ENABLED repository/environment variable
+# (default unset → skipped, not run) rather than iam-user-profile's
+# unconditional job, which hard-fails if KUBECONFIG_B64 is unset (verified
+# against their actual current file — there's no skip logic there either;
+# it presumably just never fails for them because that secret is already
+# configured for that repo). Blocking every release on infrastructure that
+# doesn't exist yet is the wrong default for a brand-new service. `secrets`
+# can't be read in a job-level `if:` (GitHub Actions restriction), which is
+# why this uses a `vars` toggle instead of checking KUBECONFIG_B64 directly
+# at that level — the in-job check below is a second, real safety net for
+# the case where DEPLOY_GATE_ENABLED is set but the secret was forgotten.
+# Set vars.DEPLOY_GATE_ENABLED=true once the cluster and secret both exist.
 name: Release
 
 "on":
@@ -264,16 +273,18 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
 
-  # Post-deploy health gate — always runs; requires KUBECONFIG_B64 secret to be set.
-  # Deploys the image with Helm, waits for rollout, verifies the deployed digest
-  # matches what was pushed, then checks the error rate for 2 minutes.
-  # On failure, automatically rolls back and fails the release.
+  # Post-deploy health gate — skipped unless vars.DEPLOY_GATE_ENABLED is
+  # "true" (see this file's header comment for why that's the default,
+  # rather than always running and failing on a missing KUBECONFIG_B64).
+  # When enabled: deploys the image with Helm, waits for rollout, verifies
+  # the deployed digest matches what was pushed, then checks the error rate
+  # for 2 minutes. On failure, automatically rolls back and fails the release.
   # Requires: KUBECONFIG_B64 secret, K8S_NAMESPACE var (optional), PROMETHEUS_URL var (optional).
-  # If KUBECONFIG_B64 is not configured this job fails immediately — set it before tagging releases.
   deploy-gate:
     name: Post-deploy health gate
     runs-on: ubuntu-latest
     needs: [build, docker]
+    if: vars.DEPLOY_GATE_ENABLED == 'true'
     environment: production
     steps:
       - name: Checkout
@@ -374,10 +385,12 @@ jobs:
   publish:
     name: GitHub Release
     runs-on: ubuntu-latest
-    # deploy-gate must succeed — a skipped gate means the release was never
-    # deployed to production and downstream consumers must not pin the tag.
+    # deploy-gate must succeed OR be legitimately skipped (vars.DEPLOY_GATE_ENABLED
+    # unset — no cluster configured yet). A *failed* gate (it ran and the
+    # health check or digest verification tripped) still blocks publish —
+    # only skip vs. fail are treated differently here.
     needs: [build, docker, deploy-gate]
-    if: needs.build.result == 'success' && needs.docker.result == 'success' && needs.deploy-gate.result == 'success'
+    if: needs.build.result == 'success' && needs.docker.result == 'success' && (needs.deploy-gate.result == 'success' || needs.deploy-gate.result == 'skipped')
     permissions:
       contents: write
     steps:
@@ -392,6 +405,18 @@ jobs:
           IMAGE_VERSION: ${{ needs.docker.outputs.version }}
           IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
         run: bash .github/scripts/extract-release-notes.sh
+
+      # Makes the skip visible on the Release page itself, not just in this
+      # ephemeral workflow run's logs — someone reading the release later
+      # has no other way to know this wasn't verified against a live deploy.
+      - name: Note skipped deploy-gate in release notes
+        if: needs.deploy-gate.result == 'skipped'
+        run: |
+          {
+            echo ""
+            echo "---"
+            echo "⚠️ **Not deployed/health-checked** — \`deploy-gate\` was skipped (\`vars.DEPLOY_GATE_ENABLED\` unset). This release was not verified against a live deployment."
+          } >> release-notes.md
 
       - name: Download SBOM
         uses: actions/download-artifact@v8.0.1

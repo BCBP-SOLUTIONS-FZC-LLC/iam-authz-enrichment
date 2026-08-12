@@ -242,11 +242,18 @@ production + health check, with automatic rollback) → `publish` (creates the G
 the CHANGELOG section as notes, plus the binaries/checksums/SBOM/provenance attached).
 Cut the `CHANGELOG.md` entry *before* tagging — `build` fails the release otherwise.
 
-`deploy-gate` requires a `KUBECONFIG_B64` secret for a production cluster (its own first step
-fails clearly if that's unset — every release is blocked until it's configured), optional
-`K8S_NAMESPACE`/`PROMETHEUS_URL` vars, and a pre-provisioned Kubernetes Secret named
-`iam-authz-enrichment-secrets` in the target namespace (the chart's `secret.yaml` hard-fails the
-Helm render via `existingSecret` otherwise). Its health query uses
+`deploy-gate` is **skipped by default** — it only runs when the `vars.DEPLOY_GATE_ENABLED`
+repository/environment variable is `true`. `secrets` can't be read in a job-level `if:`
+(a GitHub Actions restriction), which is why this is a `vars` toggle rather than checking
+`KUBECONFIG_B64` directly; `publish` treats a skipped gate as acceptable but a *failed* one
+(it ran and something tripped) as blocking, and the eventual GitHub Release notes get an
+explicit "not deployed/health-checked" note when the gate was skipped, so that's visible on
+the Release page itself, not just in the workflow run's logs. Set `DEPLOY_GATE_ENABLED=true`
+once there's a real cluster, a `KUBECONFIG_B64` secret (the job's own first step fails clearly
+if that's missing — a real safety net for the case where the toggle was flipped on before the
+secret was set), optional `K8S_NAMESPACE`/`PROMETHEUS_URL` vars, and a pre-provisioned
+Kubernetes Secret named `iam-authz-enrichment-secrets` in the target namespace (the chart's
+`secret.yaml` hard-fails the Helm render via `existingSecret` otherwise). Its health query uses
 `grpc_server_handled_total{status_class="5xx"}` (from `platform-gincommon`'s gRPC interceptor
 chain) rather than `iam-user-profile`'s `http_requests_total` — this service has no HTTP
 business traffic, and `status_class="5xx"` only fires on a genuine transport-level RPC failure
