@@ -178,8 +178,16 @@ jobs:
             SOURCE_DATE_EPOCH=${{ steps.sde.outputs.SOURCE_DATE_EPOCH }}
           secrets: |
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # No cache-from/cache-to here — combining the GHA cache backend
+          # with provenance/SBOM attestations on the same build silently
+          # drops the attestation entirely (moby/buildkit#4501, "gha cache
+          # breaks provenance"). Caught this because export-image-provenance.sh
+          # kept reporting zero attestations even after fixing the
+          # predicate-type filter (v0.2, not v1) below — that fix was
+          # correct but not sufficient, since no attestation of any type
+          # was actually being attached. Release builds are infrequent, so
+          # losing this cache is an acceptable trade for a supply-chain
+          # artifact that's actually present.
 
       - name: Cache Trivy DB
         uses: actions/cache@v6.1.0

@@ -305,12 +305,16 @@ jobs:
             SOURCE_DATE_EPOCH=${{ steps.sde.outputs.SOURCE_DATE_EPOCH }}
           secrets: |
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
-          cache-from: |
-            type=gha
-            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
-          cache-to: |
-            type=gha,mode=max
-            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+          # type=gha dropped from both — combining the GHA cache backend
+          # with provenance/SBOM attestations on the same build silently
+          # drops the attestation entirely (moby/buildkit#4501, "gha cache
+          # breaks provenance"; caught via release.yml's docker job, which
+          # actually tries to download the attestation afterward). Nothing
+          # here currently verifies this job's own attestation the same
+          # way, so this had been silently broken too. Registry cache
+          # (type=registry) isn't implicated in that issue and is kept.
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.2
