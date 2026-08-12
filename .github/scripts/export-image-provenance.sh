@@ -1,32 +1,31 @@
 #!/usr/bin/env bash
-# Downloads SLSA provenance attestation from GHCR and writes provenance.slsa.json.
+# Extracts the BuildKit-native SLSA provenance attestation from a pushed
+# image and writes provenance.slsa.json.
+#
+# Uses `docker buildx imagetools inspect`, NOT `cosign download attestation`.
+# docker/build-push-action's `provenance`/`sbom` inputs create BuildKit-
+# native attestations (manifests attached to the image's own index /
+# referrers), a different format from what cosign's `download attestation`
+# expects — that command targets attestations cosign itself created via
+# `cosign attest`. cosign cannot see BuildKit-native attestations at all,
+# regardless of --predicate-type filtering or build caching — confirmed
+# after two earlier fix attempts (matching the v0.2 predicate, then
+# dropping the GHA cache backend per moby/buildkit#4501) both left "found
+# no attestations" completely unchanged. `imagetools inspect` works for
+# both single- and multi-platform pushed images.
 set -euo pipefail
-set -o pipefail
 
 : "${IMAGE_NAME:?IMAGE_NAME is required}"
 : "${IMAGE_DIGEST:?IMAGE_DIGEST is required}"
 
 IMAGE_REF="${IMAGE_NAME}@${IMAGE_DIGEST}"
 
-# provenance/v0.2, not v1: docker/build-push-action's `provenance: mode=max`
-# shorthand maps to buildx's default --provenance flag, which emits SLSA
-# schema v0.2 (https://docs.docker.com/build/metadata/attestations/slsa-provenance/)
-# unless the build step explicitly opts into version=v1 via the longer
-# `--attest type=provenance,mode=max,version=v1` form, which release.yml
-# does not use. Filtering by predicate-type (rather than fetching
-# unfiltered) matters here: this image also carries a separate SBOM
-# attestation (from `sbom: true` on the same build step) — an unfiltered
-# `cosign download attestation` would return both, and `.[0]` could just as
-# easily grab the SBOM payload instead of the provenance one.
-if ! cosign download attestation \
-  --predicate-type=https://slsa.dev/provenance/v0.2 \
-  "${IMAGE_REF}" \
-  | jq -er 'if type == "array" then .[0].payload else .payload end' \
-  | base64 -d \
-  | jq . \
-  | tee provenance.slsa.json >/dev/null; then
+PROVENANCE=$(docker buildx imagetools inspect "${IMAGE_REF}" --format '{{ json .Provenance.SLSA }}')
+
+if [ -z "${PROVENANCE}" ] || [ "${PROVENANCE}" = "null" ]; then
   echo "::error title=Provenance export::SLSA provenance attestation not found on ${IMAGE_REF}"
   exit 1
 fi
 
+echo "${PROVENANCE}" | jq . > provenance.slsa.json
 echo "  ✔  exported SLSA provenance to provenance.slsa.json"
