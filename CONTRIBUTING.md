@@ -237,16 +237,23 @@ Pushing a `v*` tag (e.g. `v0.1.0`, `v1.0.0-rc.1`) triggers `.github/workflows/re
 `validate-test`/`validate-quality` (the same reusable gates `ci.yml` uses) → `build` (verifies
 the tag matches HEAD, verifies `CHANGELOG.md` has a matching `## [x.y.z]` entry, cross-compiles
 binaries for 5 platforms) → `docker` (builds, pushes a semver-tagged image, CVE-scans it,
-generates an SBOM + SLSA provenance, signs with Cosign) → `publish` (creates the GitHub Release
-with the CHANGELOG section as notes, plus the binaries/checksums/SBOM/provenance attached).
+generates an SBOM + SLSA provenance, signs with Cosign) → `deploy-gate` (live Helm deploy to
+production + health check, with automatic rollback) → `publish` (creates the GitHub Release with
+the CHANGELOG section as notes, plus the binaries/checksums/SBOM/provenance attached).
 Cut the `CHANGELOG.md` entry *before* tagging — `build` fails the release otherwise.
 
-Deliberately **not** included: `iam-user-profile`'s `release.yml` `deploy-gate` job, which does
-a live `helm upgrade` against a production cluster (gated on a `KUBECONFIG_B64` secret) with an
-automatic rollback on a Prometheus-measured error-rate spike. This repo has no production
-cluster credentials configured — copying that job verbatim would fail on every release (its own
-first step exits 1 if the secret is unset) and permanently block `publish`. Wire it up
-deliberately, with real secrets, once there's an actual cluster to deploy to.
+`deploy-gate` requires a `KUBECONFIG_B64` secret for a production cluster (its own first step
+fails clearly if that's unset — every release is blocked until it's configured), optional
+`K8S_NAMESPACE`/`PROMETHEUS_URL` vars, and a pre-provisioned Kubernetes Secret named
+`iam-authz-enrichment-secrets` in the target namespace (the chart's `secret.yaml` hard-fails the
+Helm render via `existingSecret` otherwise). Its health query uses
+`grpc_server_handled_total{status_class="5xx"}` (from `platform-gincommon`'s gRPC interceptor
+chain) rather than `iam-user-profile`'s `http_requests_total` — this service has no HTTP
+business traffic, and `status_class="5xx"` only fires on a genuine transport-level RPC failure
+(`internal/adapter/inbound/grpc/server.go`'s `Check()` always returns a nil error for every
+Allow/Deny outcome), so it's a clean deployment-health signal distinct from
+`authz_deny_reason_total{reason="DENY_SERVICE_UNAVAILABLE"}` (dependency health, not deployment
+health — an unrelated dependency outage at deploy time shouldn't trigger a rollback).
 
 Notify the platform team on Slack if a change here affects the Envoy `ext_authz` contract
 (response headers, `DenyReason` set, or the `CheckRequest` fields it reads) — every service

@@ -7,8 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
-- `.github/workflows/release.yml`, triggered by `v*` tags: validate → build (CHANGELOG gate + 5-platform binaries) → docker (semver-tagged image, CVE scan, SBOM, SLSA provenance, Cosign sign) → publish (GitHub Release with everything attached). Deliberately omits `iam-user-profile`'s `deploy-gate` job (a live `helm upgrade` against a production cluster) — no `KUBECONFIG_B64` secret is configured here, so a copy-pasted gate would fail every release.
+- `.github/workflows/release.yml`, triggered by `v*` tags: validate → build (CHANGELOG gate + 5-platform binaries) → docker (semver-tagged image, CVE scan, SBOM, SLSA provenance, Cosign sign) → deploy-gate (live Helm deploy to production + health check, auto-rollback) → publish (GitHub Release with everything attached).
 - `.github/workflows/validate-test.yml` / `validate-quality.yml`, extracted from `ci.yml` as reusable workflows so `release.yml` shares the exact same test/quality gates instead of duplicating them.
+
+### Changed
+- `deploy-gate`'s health query uses `grpc_server_handled_total{status_class="5xx"}` (`platform-gincommon`'s gRPC interceptor chain), not `iam-user-profile`'s `http_requests_total` — this service has no HTTP business traffic. Requires a `KUBECONFIG_B64` secret, optional `K8S_NAMESPACE`/`PROMETHEUS_URL` vars, and a pre-provisioned `iam-authz-enrichment-secrets` Kubernetes Secret in the target namespace; every release is blocked at this job until those exist.
 
 ### Fixed
 - `hadolint`'s `DL3064` false-flagged `ENV GOPRIVATE` purely because "PRIVATE" is in the name (the value is a public Go import-path glob, not a credential) — introduced by a Dependabot bump of `hadolint-action` 3.3.0 → 3.4.0. Suppressed with `# hadolint ignore=DL3064` immediately above the instruction (hadolint's ignore directive must be the line directly before the instruction it applies to — an explanatory comment sitting between the two breaks the association).

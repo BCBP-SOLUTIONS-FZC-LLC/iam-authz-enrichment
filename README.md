@@ -502,7 +502,7 @@ Hard invariants — see [`ARCHITECTURE.md` §Threat model](ARCHITECTURE.md#threa
 
 `.github/workflows/changelog-check.yml` separately fails a PR that touches `internal/` or `cmd/` without a `CHANGELOG.md` `[Unreleased]` entry.
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml` — validate → build (CHANGELOG gate + 5-platform binaries) → docker (semver-tagged image, CVE scan, SBOM, SLSA provenance, Cosign sign) → publish (GitHub Release with everything attached). See [`CONTRIBUTING.md` § Deployment](CONTRIBUTING.md#deployment) for the full pipeline and what was deliberately left out.
+Pushing a `v*` tag triggers `.github/workflows/release.yml` — validate → build (CHANGELOG gate + 5-platform binaries) → docker (semver-tagged image, CVE scan, SBOM, SLSA provenance, Cosign sign) → deploy-gate (live Helm deploy + health check, auto-rollback) → publish (GitHub Release with everything attached). See [`CONTRIBUTING.md` § Deployment](CONTRIBUTING.md#deployment) for the full pipeline, required secrets, and the gRPC-specific health query.
 
 `test`/`quality` live in `.github/workflows/validate-test.yml`/`validate-quality.yml` (reusable workflows) so `ci.yml` and `release.yml` share exactly one definition of each gate.
 

@@ -1,16 +1,34 @@
 # Triggered by version tags (e.g. v1.0.0 or v1.1.0-rc.1).
 # Pipeline: validate -> build (CHANGELOG gate + binaries) -> docker (CVE scan
-# + SBOM + sign) -> publish (GitHub Release).
+# + SBOM + sign) -> deploy-gate (live Helm deploy + health check) -> publish
+# (GitHub Release).
 #
-# Deliberately omits iam-user-profile's release.yml `deploy-gate` job (a live
-# `helm upgrade` against a production cluster, gated on a KUBECONFIG_B64
-# secret, with an automatic rollback on a Prometheus-measured error-rate
-# spike). This repo has no production cluster credentials configured — a
-# copy-pasted deploy-gate would fail on every single release (its own first
-# step exits 1 if KUBECONFIG_B64 is unset) and block `publish` forever.
-# Wire that up deliberately, with real secrets, when there's an actual
-# cluster to deploy to — don't re-add this job just to match the sibling
-# repo's shape.
+# deploy-gate mirrors iam-user-profile's job of the same name, adapted for
+# this service having no HTTP business traffic: the health query uses
+# grpc_server_handled_total{status_class="5xx"} (emitted by
+# platform-gincommon's gRPC interceptor chain) rather than
+# http_requests_total{status_class="5xx"}, which doesn't exist here.
+# status_class="5xx" only fires on a genuine transport-level RPC failure
+# (panic, internal error) — internal/adapter/inbound/grpc/server.go's
+# Check() always returns a nil error for every Allow/Deny outcome (the
+# ext_authz convention: Deny is a successful RPC with a PERMISSION_DENIED
+# payload, not a failed one), so this metric is a clean deployment-health
+# signal, distinct from authz_deny_reason_total{reason="DENY_SERVICE_UNAVAILABLE"}
+# (which reflects dependency health at that moment, not whether THIS
+# deployment is broken — a dependency outage unrelated to the rollout could
+# otherwise trigger a false-positive rollback).
+#
+# This job requires real infrastructure this repo did not have configured
+# as of the previous revision of this file: a KUBECONFIG_B64 secret for a
+# production cluster, K8S_NAMESPACE/PROMETHEUS_URL vars (optional, default
+# 'default' namespace / skip the Prometheus check if unset), and a
+# pre-provisioned Kubernetes Secret named iam-authz-enrichment-secrets in
+# the target namespace (this chart's secret.yaml template hard-fails
+# `helm upgrade` via existingSecret otherwise — see deploy/helm/values.yaml).
+# Its own first step fails clearly if KUBECONFIG_B64 is unset, so an
+# unconfigured cluster blocks `publish` with an actionable error rather
+# than a confusing one — but it DOES block every release until that secret
+# exists. Configure it before tagging the next release.
 name: Release
 
 "on":
@@ -238,13 +256,120 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
 
+  # Post-deploy health gate — always runs; requires KUBECONFIG_B64 secret to be set.
+  # Deploys the image with Helm, waits for rollout, verifies the deployed digest
+  # matches what was pushed, then checks the error rate for 2 minutes.
+  # On failure, automatically rolls back and fails the release.
+  # Requires: KUBECONFIG_B64 secret, K8S_NAMESPACE var (optional), PROMETHEUS_URL var (optional).
+  # If KUBECONFIG_B64 is not configured this job fails immediately — set it before tagging releases.
+  deploy-gate:
+    name: Post-deploy health gate
+    runs-on: ubuntu-latest
+    needs: [build, docker]
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Verify KUBECONFIG_B64 is configured
+        run: |
+          if [ -z "${{ secrets.KUBECONFIG_B64 }}" ]; then
+            echo "::error::KUBECONFIG_B64 secret is not set. Configure the kubeconfig for the production cluster before tagging releases. See CONTRIBUTING.md § Deployment."
+            exit 1
+          fi
+
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5.0.1
+
+      # Deploy the just-published image via Helm so the gate is never a no-op,
+      # regardless of whether a GitOps controller is configured. existingSecret
+      # assumes a Kubernetes Secret named iam-authz-enrichment-secrets already
+      # exists in the target namespace — this chart's secret.yaml template
+      # hard-fails the render otherwise (see deploy/helm/values.yaml).
+      - name: Deploy with Helm
+        run: |
+          helm upgrade iam-authz-enrichment ./deploy/helm \
+            --install \
+            --wait \
+            --timeout=5m \
+            --namespace="${{ vars.K8S_NAMESPACE || 'default' }}" \
+            --set image.tag="${{ needs.docker.outputs.version }}" \
+            --set existingSecret=iam-authz-enrichment-secrets \
+            --atomic
+
+      # Verify the running image digest matches what was signed and published.
+      # Guards against a GitOps controller or deployment process substituting a
+      # different image after the Helm upgrade.
+      - name: Verify deployed image digest
+        run: |
+          EXPECTED_DIGEST="${{ needs.docker.outputs.digest }}"
+          ACTUAL=$(kubectl get deployment iam-authz-enrichment \
+            --namespace="${{ vars.K8S_NAMESPACE || 'default' }}" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "Expected digest: ${EXPECTED_DIGEST}"
+          echo "Deployed image:  ${ACTUAL}"
+          if [[ "$ACTUAL" == *"@sha256:"* ]]; then
+            ACTUAL_DIGEST="${ACTUAL#*@}"
+            if [ "$ACTUAL_DIGEST" != "$EXPECTED_DIGEST" ]; then
+              echo "::error::Deployed image digest ${ACTUAL_DIGEST} does not match published digest ${EXPECTED_DIGEST} — potential supply-chain substitution."
+              exit 1
+            fi
+            echo "Digest verified: deployed image matches published artifact."
+          else
+            echo "::warning::Deployed image is not digest-pinned — cannot verify supply-chain integrity. Pin image digests in the Helm values."
+          fi
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/iam-authz-enrichment \
+            --namespace="${{ vars.K8S_NAMESPACE || 'default' }}" \
+            --timeout=5m
+
+      # status_class="5xx" only fires on a genuine gRPC transport-level
+      # failure (panic, internal error) — Check() always returns a nil
+      # error for every Allow/Deny outcome, so this is a clean
+      # deployment-health signal (see this file's header comment for why
+      # it's deliberately not authz_deny_reason_total).
+      - name: Health gate — error rate < 1% for 2 minutes
+        run: |
+          PROM_URL="${{ vars.PROMETHEUS_URL }}"
+          if [ -z "$PROM_URL" ]; then
+            echo "PROMETHEUS_URL not set — skipping error-rate check"
+            exit 0
+          fi
+          QUERY='sum(rate(grpc_server_handled_total{job=~".*iam-authz-enrichment.*",status_class="5xx"}[2m]))/sum(rate(grpc_server_handled_total{job=~".*iam-authz-enrichment.*"}[2m]))'
+          # Sleep AFTER confirming Prometheus is configured so the 2-minute window
+          # only runs when there is actually something to measure.
+          sleep 120
+          RATE=$(curl -sf "${PROM_URL}/api/v1/query" \
+            --data-urlencode "query=${QUERY}" | jq -r '.data.result[0].value[1] // "0"')
+          echo "5xx rate: ${RATE}"
+          if awk "BEGIN{exit !($RATE > 0.01)}"; then
+            echo "ERROR: 5xx rate ${RATE} exceeds 1% threshold — rolling back"
+            # Use helm rollback so Helm's release history stays consistent.
+            # kubectl rollout undo bypasses the Helm state machine and leaves
+            # subsequent helm upgrade calls working from the wrong baseline.
+            helm rollback iam-authz-enrichment \
+              --namespace="${{ vars.K8S_NAMESPACE || 'default' }}" \
+              --wait
+            exit 1
+          fi
+          echo "Health gate passed — 5xx rate ${RATE} is below 1%"
+
   publish:
     name: GitHub Release
     runs-on: ubuntu-latest
-    # No deploy-gate to depend on here (see the header comment) — build and
-    # docker succeeding is the full bar for cutting the release.
-    needs: [build, docker]
-    if: needs.build.result == 'success' && needs.docker.result == 'success'
+    # deploy-gate must succeed — a skipped gate means the release was never
+    # deployed to production and downstream consumers must not pin the tag.
+    needs: [build, docker, deploy-gate]
+    if: needs.build.result == 'success' && needs.docker.result == 'success' && needs.deploy-gate.result == 'success'
     permissions:
       contents: write
     steps:
