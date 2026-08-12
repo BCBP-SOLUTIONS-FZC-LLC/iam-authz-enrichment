@@ -133,10 +133,23 @@ make race
 
 ### Coverage gate
 
-Target is **≥ 97% statement coverage on `internal/...`**, measured via `make test-ci`
+Target is **100% statement coverage on `internal/...`**, measured via `make test-ci`
 (`-race`, `-coverpkg` spanning every domain/usecase/adapter package) and enforced in CI by
-`.github/scripts/coverage-gate.sh` — a PR that drops below 97% fails the `test` job.
+`.github/scripts/coverage-gate.sh` — a PR that drops below 100% fails the `test` job.
 `codecov` also receives `coverage.out` for trend visibility.
+
+Two things worth knowing before you chase the last few tenths of a percent:
+- **`NoopRecorder`'s empty-bodied methods** (`internal/usecase/ports.go`) always show `0.0%`
+  individually, no matter how many tests call them — Go's coverage tool can't instrument a
+  function with zero statements. They contribute 0/0 and don't drag down the total; don't
+  add dummy statements to "fix" this.
+- **Don't add a `default:`-avoiding, per-value `switch` case just to defensively fail closed
+  on values that can't occur at that call site** (see the fix to `resolveContext`'s outcome
+  switch in `internal/usecase/check.go` for the pattern) — it produces an unreachable trailing
+  statement Go's compiler forces you to write, which never reaches 100%. Use `default:` instead
+  (same fail-closed defensive behavior, reachable, and add `//nolint:exhaustive` with a comment
+  explaining which values are actually possible there — don't loosen the `exhaustive` linter
+  setting repo-wide for one switch).
 
 ```bash
 make cover-func   # per-function summary in terminal
@@ -205,7 +218,7 @@ chore(deps): bump platform-events to v1.4.0
 
 This service is deployed as a containerised microservice behind Envoy as its `ext_authz`
 sidecar/filter target. On push to `main` or on a pull request, `.github/workflows/ci.yml` runs
-`test` (race + coverage gate ≥97%, unit + integration against real Valkey/LocalStack service
+`test` (race + coverage gate at 100%, unit + integration against real Valkey/LocalStack service
 containers), `quality` (`fmt-check`/`vet`/`lint`/`arch-lint`/`mod-verify`/`vuln-check`), and
 `build-image` (Hadolint + Docker build-to-cache) in parallel, then `trivy` (CVE scan + SBOM)
 and `smoke` (liveness check against the built image) once `build-image` finishes.

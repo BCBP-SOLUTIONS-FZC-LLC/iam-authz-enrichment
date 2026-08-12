@@ -2,6 +2,7 @@ package valkey
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -12,6 +13,27 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
+
+// failDelHook makes DEL commands fail while leaving every other command
+// (SCAN, GET, SET, ...) untouched — used to reach the branch where a SCAN
+// succeeds but the subsequent DEL fails, which mr.Close() alone can't
+// isolate since that fails every command from the very first one.
+type failDelHook struct{}
+
+func (failDelHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (failDelHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "del" {
+			return errors.New("simulated DEL failure")
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (failDelHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
 
 func newTestCache(t *testing.T, jitter time.Duration) (*Cache, *miniredis.Miniredis) {
 	t.Helper()
@@ -188,6 +210,19 @@ func TestSetTenderACL_MarshalIsAlwaysValid_ConnectionErrorSurfaces(t *testing.T)
 	assert.Error(t, err)
 }
 
+// TestSetTenderACL_MarshalError exercises the json.Marshal error return
+// directly — time.Time.MarshalJSON genuinely errors for a year outside
+// [0,9999], the one realistic way TenderACL fails to marshal.
+func TestSetTenderACL_MarshalError(t *testing.T) {
+	t.Parallel()
+	c, _ := newTestCache(t, 0)
+
+	err := c.SetTenderACL(context.Background(), "t1", "tender-1", "u1", domain.TenderACL{
+		ExpiresAt: time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+	})
+	assert.Error(t, err)
+}
+
 func TestEvictTenderACLForUser_ScansAllMatchingKeysAcrossPages(t *testing.T) {
 	t.Parallel()
 	c, _ := newTestCache(t, 0)
@@ -212,6 +247,24 @@ func TestEvictTenderACLForUser_ConnectionError(t *testing.T) {
 	t.Parallel()
 	c, mr := newTestCache(t, 0)
 	mr.Close()
+
+	err := c.EvictTenderACLForUser(context.Background(), "t1", "u1")
+	assert.Error(t, err)
+}
+
+// TestEvictTenderACLForUser_DelFails reaches the branch where SCAN succeeds
+// (there's a matching key) but the subsequent DEL fails — distinct from
+// ConnectionError above, which fails at the first command (SCAN) and never
+// reaches DEL at all.
+func TestEvictTenderACLForUser_DelFails(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	client.AddHook(failDelHook{})
+	t.Cleanup(func() { _ = client.Close() })
+
+	c := &Cache{client: client, tenderACLTTL: time.Hour}
+	require.NoError(t, mr.Set(tenderACLKey("t1", "tender-1", "u1"), `{"has_access":true}`))
 
 	err := c.EvictTenderACLForUser(context.Background(), "t1", "u1")
 	assert.Error(t, err)

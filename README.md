@@ -447,7 +447,7 @@ make docker-up && make test-integration
 make load-test         # manual — see test/load
 ```
 
-Coverage target: ≥97% statements on `internal/...`, enforced via `make test-ci` (`-race`, `-coverpkg` spanning every adapter/usecase/domain package).
+Coverage target: 100% statements on `internal/...`, enforced via `make test-ci` (`-race`, `-coverpkg` spanning every adapter/usecase/domain package). `NoopRecorder`'s empty-bodied methods (`internal/usecase/ports.go`) always show 0.0% individually — Go's coverage tool can't instrument a function with zero statements — but they contribute 0/0 and don't affect the total.
 
 ---
 
@@ -487,7 +487,7 @@ Hard invariants — see [`ARCHITECTURE.md` §Threat model](ARCHITECTURE.md#threa
 
 `.github/workflows/ci.yml`:
 
-- **test** — unit (`-race`, coverage) + integration against real Valkey/LocalStack service containers, gated by `.github/scripts/coverage-gate.sh` (fails below 97%).
+- **test** — unit (`-race`, coverage) + integration against real Valkey/LocalStack service containers, gated by `.github/scripts/coverage-gate.sh` (fails below 100%).
 - **quality** — `fmt-check`, `vet`, `lint`, `arch-lint`, `mod-verify`, `vuln-check`.
 - **build-image** — Hadolint + Docker build-to-cache (no local load), using the `GO_PRIVATE_TOKEN` secret for `platform-*` module resolution. `trivy` and `smoke` each restore their own copy from the GHA/registry cache rather than sharing a loaded image across jobs.
 - **trivy** — CVE scan (fails on CRITICAL/HIGH/UNKNOWN), SARIF upload to the Security tab (best-effort — doesn't fail if GitHub Advanced Security isn't enabled), and a CycloneDX SBOM artifact.

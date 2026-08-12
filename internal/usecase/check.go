@@ -231,25 +231,22 @@ func (c *Checker) resolveContext(ctx context.Context, tenant, user string) (doma
 		SiblingReachable:    false,
 		StaleEntryAvailable: staleAvailable,
 	})
+	//nolint:exhaustive // default deliberately covers OutcomeFailClosed AND
+	// OutcomeNormal: this call site hardcodes SiblingReachable: false above
+	// (we're only in this branch because the sibling call just failed), so
+	// DecideDependencyOutcome can never actually return OutcomeNormal — but
+	// default also means any future DependencyOutcome value fails closed
+	// here by default, rather than risking an accidental Allow on a bug.
 	switch outcome {
 	case OutcomeServeStale:
 		c.metrics.ObserveStaleIfErrorServed()
 		return ctxVal, tenantVal, "", true
-	case OutcomeNormal:
-		// Unreachable in practice: OutcomeNormal requires SiblingReachable,
-		// which is always false on this path (we're only here because the
-		// sibling call just failed). Handled explicitly so this switch stays
-		// exhaustive over DependencyOutcome's full value set.
-		fallthrough
-	case OutcomeFailClosed:
+	default:
 		c.log.Error("membership rebuild failed, no stale entry available", map[string]interface{}{
 			"tenant": tenant, "error": err.Error(),
 		})
 		return domain.MembershipContext{}, domain.TenantContext{}, domain.DenyServiceUnavailable, false
 	}
-	// Unreachable given DependencyOutcome's three cases are all handled
-	// above — kept as a defensive fail-closed fallback, not a live path.
-	return domain.MembershipContext{}, domain.TenantContext{}, domain.DenyServiceUnavailable, false
 }
 
 // resolveTenderACL implements §6 point 2 / §4.1's 15s-TTL tender-ACL cache.

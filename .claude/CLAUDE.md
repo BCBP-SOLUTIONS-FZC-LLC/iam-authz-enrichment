@@ -28,7 +28,7 @@ make arch-lint       # enforce .go-arch-lint.yml component boundaries
 make mod-verify      # go mod verify
 make vuln-check      # govulncheck ./internal/...
 make test            # unit tests (no Docker required)
-make test-ci         # unit tests with -race + coverage (used in CI; gated at ≥97% by .github/scripts/coverage-gate.sh)
+make test-ci         # unit tests with -race + coverage (used in CI; gated at 100% by .github/scripts/coverage-gate.sh)
 make test-integration # real Valkey + LocalStack SQS integration tests (build tag `integration`, requires Docker)
 make race            # unit tests with -race flag
 make run             # run the server locally (:8080 HTTP, :9091 gRPC)
@@ -137,7 +137,7 @@ require (
 ## Key Files to Know
 
 - **`cmd/server/main.go`** — wiring; gRPC server gets `reflection.Register(grpcServer)` when `cfg.AppEnv != "production"` (lets `grpcurl`/`grpcui` discover `Check` without a local `.proto` copy). Background workers: 5 SQS consumers via `startConsumers`, each idle (no-op) if its queue URL env var is blank. Shutdown order: gRPC `GracefulStop` → HTTP `Shutdown` → consumers `Stop()` → `cancelBackgroundWork` → `cache.Close()`.
-- **`internal/usecase/check.go`** — `check()` implements the full §3.1 chain; **judgment call**: MFA-freshness call failure maps to `DenyMFAStale`, not `DenyServiceUnavailable` (documented inline — a sibling outage on this specific check is treated as "can't confirm freshness" rather than "service down").
+- **`internal/usecase/check.go`** — `check()` implements the full §3.1 chain; **judgment call**: MFA-freshness call failure maps to `DenyMFAStale`, not `DenyServiceUnavailable` (documented inline — a sibling outage on this specific check is treated as "can't confirm freshness" rather than "service down"). `resolveContext`'s outcome switch uses `default:` + `//nolint:exhaustive` rather than an explicit `case OutcomeNormal` — `SiblingReachable: false` is hardcoded at that call site, so `OutcomeNormal` can never actually occur there; an explicit per-value case would compile only with a trailing statement Go's compiler can't prove unreachable, which permanently blocks 100% coverage. Don't "fix" this by re-enumerating the case.
 - **`internal/usecase/failure.go`** — `DecideDependencyOutcome()` is the §7 table as a pure function, deliberately its own package-level function (not scattered in adapter code) so the test suite can exercise every row directly. The tender-ACL overlay's fail-closed rule is independent of this table — checked separately in `check.go`.
 - **`internal/adapter/outbound/valkey/cache.go`** — `mfa_freshness_seconds` is **never** written here — hard invariant, has a dedicated regression test. Any change that folds MFA freshness into the `ae:ctx` envelope is a security regression, not a refactor.
 - **`internal/adapter/inbound/consumer/consumer.go`** — `dedupingHandler()` marks-then-handles; on handler failure it calls `Cache.EvictProcessed()` to undo the mark, or a failed message would be falsely treated as already-processed on redelivery and silently skipped instead of retried (this was a real bug, caught by `TestSQS_DLQ_MessageMovesAfterMaxReceiveCount` timing out — see `TestDedupingHandler_RetriesAfterHandlerFailure`).

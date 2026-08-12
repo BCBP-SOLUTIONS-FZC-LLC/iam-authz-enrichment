@@ -8,7 +8,7 @@
 #                   └────────────────┤──► push       (push events only, needs quality too)
 #   quality ───────────────────────┘
 #
-# test: race + coverage gate ≥97%, unit + integration against real
+# test: race + coverage gate at 100%, unit + integration against real
 # Valkey/LocalStack service containers. quality: fmt/vet/lint/arch-lint/
 # mod-verify/vuln-check. build-image: Dockerfile lint + build-to-cache (no
 # local load — trivy/smoke each restore their own copy from the GHA cache).
@@ -98,11 +98,11 @@ jobs:
           AWS_ENDPOINT_URL: http://localhost:4566
       - name: Unit tests (race + coverage)
         run: make test-ci
-      - name: Coverage gate (≥97%)
+      - name: Coverage gate (100%)
         id: coverage
         run: bash .github/scripts/coverage-gate.sh
         env:
-          COVERAGE_THRESHOLD: "97"
+          COVERAGE_THRESHOLD: "100"
       - name: Integration tests
         run: make test-integration
         env:
