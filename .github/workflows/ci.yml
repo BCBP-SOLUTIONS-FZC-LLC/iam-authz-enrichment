@@ -10,12 +10,12 @@
 #
 # test: race + coverage gate at 100%, unit + integration against real
 # Valkey/LocalStack service containers. quality: fmt/vet/lint/arch-lint/
-# mod-verify/vuln-check. build-image: Dockerfile lint + build-to-cache (no
-# local load — trivy/smoke each restore their own copy from the GHA cache).
-# Consolidated into one workflow file (unlike iam-user-profile's
-# validate-test.yml/validate-quality.yml split) — this service has no
-# Postgres tier and a single test tier, so the extra reusable-workflow
-# indirection isn't earning its keep here.
+# mod-verify/vuln-check. Both live in validate-test.yml/validate-quality.yml
+# (reusable workflows) so release.yml can call the exact same gate rather
+# than duplicating it — this split wasn't earning its keep before
+# release.yml existed as a second caller (see that file's header comment).
+# build-image: Dockerfile lint + build-to-cache (no local load — trivy/smoke
+# each restore their own copy from the GHA cache).
 #
 # pr-summary posts a single status comment on pull_request events. push
 # publishes to GHCR on push to main, with SBOM/provenance attestations and
@@ -51,91 +51,15 @@ env:
 jobs:
   # ── runs in parallel with quality + build-image ───────────────────────────
   test:
-    # Matches the org-required status check name from iam-user-profile's
-    # validate-test.yml (name: "Validate / Test") + job id ("test") —
-    # GitHub concatenates those via workflow_call there; we get the same
-    # string directly since this is a plain job, not a reusable-workflow
-    # split (no release.yml here to share it with, so the split isn't
-    # earning its keep — see the workflow-level comment above).
-    name: Validate / Test / test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    outputs:
-      pct: ${{ steps.coverage.outputs.pct }}
-    services:
-      valkey:
-        image: valkey/valkey:8-alpine
-        ports: ["6379:6379"]
-        options: >-
-          --health-cmd "valkey-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-      localstack:
-        image: localstack/localstack:4.4.0
-        ports: ["4566:4566"]
-        env:
-          SERVICES: sqs
-          AWS_DEFAULT_REGION: ap-south-1
-        options: >-
-          --health-cmd "awslocal sqs list-queues"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@v7.0.0
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - name: Configure private module access
-        run: git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
-      - name: Init LocalStack queues
-        run: |
-          chmod +x scripts/init-localstack.sh
-          AWS_ACCESS_KEY_ID=localstack AWS_SECRET_ACCESS_KEY=localstack AWS_DEFAULT_REGION=ap-south-1 \
-            ./scripts/init-localstack.sh
-        env:
-          AWS_ENDPOINT_URL: http://localhost:4566
-      - name: Unit tests (race + coverage)
-        run: make test-ci
-      - name: Coverage gate (100%)
-        id: coverage
-        run: bash .github/scripts/coverage-gate.sh
-        env:
-          COVERAGE_THRESHOLD: "100"
-      - name: Integration tests
-        run: make test-integration
-        env:
-          VALKEY_URL: localhost:6379
-          AWS_ENDPOINT_URL: http://localhost:4566
-          AWS_ACCESS_KEY_ID: localstack
-          AWS_SECRET_ACCESS_KEY: localstack
-          AWS_REGION: ap-south-1
-      - uses: codecov/codecov-action@v7
-        with:
-          files: coverage.out
-          fail_ci_if_error: false
+    name: Validate / Test
+    uses: ./.github/workflows/validate-test.yml
+    secrets: inherit
 
   # ── runs in parallel with test + build-image ──────────────────────────────
   quality:
-    # Matches the org-required check name from iam-user-profile's
-    # validate-quality.yml — see the comment on the test job above.
-    name: Validate / Quality / quality
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7.0.0
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - name: Configure private module access
-        run: git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
-      - run: make fmt-check
-      - run: make vet
-      - run: make lint
-      - run: make arch-lint
-      - run: make mod-verify
-      - run: make vuln-check
+    name: Validate / Quality
+    uses: ./.github/workflows/validate-quality.yml
+    secrets: inherit
 
   # ── runs in parallel with test + quality; feeds trivy + smoke + push ─────
   build-image:

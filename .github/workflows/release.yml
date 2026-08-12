@@ -1,0 +1,283 @@
+# Triggered by version tags (e.g. v1.0.0 or v1.1.0-rc.1).
+# Pipeline: validate -> build (CHANGELOG gate + binaries) -> docker (CVE scan
+# + SBOM + sign) -> publish (GitHub Release).
+#
+# Deliberately omits iam-user-profile's release.yml `deploy-gate` job (a live
+# `helm upgrade` against a production cluster, gated on a KUBECONFIG_B64
+# secret, with an automatic rollback on a Prometheus-measured error-rate
+# spike). This repo has no production cluster credentials configured — a
+# copy-pasted deploy-gate would fail on every single release (its own first
+# step exits 1 if KUBECONFIG_B64 is unset) and block `publish` forever.
+# Wire that up deliberately, with real secrets, when there's an actual
+# cluster to deploy to — don't re-add this job just to match the sibling
+# repo's shape.
+name: Release
+
+"on":
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+      - "v[0-9]*.[0-9]*.[0-9]*-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  validate-test:
+    name: Validate / Test
+    uses: ./.github/workflows/validate-test.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref }}
+    secrets: inherit
+
+  validate-quality:
+    name: Validate / Quality
+    uses: ./.github/workflows/validate-quality.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref }}
+    secrets: inherit
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [validate-test, validate-quality]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Verify release tag matches checkout
+        run: bash .github/scripts/verify-release-tag.sh
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Block the release if CHANGELOG.md has no entry for this tag.
+      # Cut the entry before tagging (see CONTRIBUTING.md).
+      - name: Verify CHANGELOG entry exists
+        run: bash .github/scripts/verify-changelog-entry.sh
+
+      # Cross-compiles all target platforms and writes per-binary .sha256
+      # files. No make build step — the script owns the full build for
+      # release assets. This service is deployed exclusively as a container
+      # (see README § Out of scope) — these binaries are a convenience for
+      # local/non-Docker runs, not the primary distribution artifact.
+      - name: Prepare release binaries (all platforms)
+        run: bash .github/scripts/prepare-release-binary.sh
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: binary-${{ env.RELEASE_TAG }}
+          path: |
+            iam-authz-enrichment_*
+            release-asset.name
+          if-no-files-found: error
+          retention-days: 90
+
+  docker:
+    name: Docker image → GHCR
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      digest: ${{ steps.pushed.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      actions: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set SOURCE_DATE_EPOCH
+        id: sde
+        run: bash .github/scripts/set-source-date-epoch.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          # Produces: vMAJOR.MINOR.PATCH, vMAJOR.MINOR, vMAJOR (non-pre-releases).
+          # Also tags 'latest' for stable releases (no pre-release suffix).
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest,enable=${{ !contains(env.RELEASE_TAG, '-') }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: pushed
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # amd64-only by design, same as ci.yml's push job — no platforms
+          # fan-out until there's a real arm64 deploy target.
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_VERSION=${{ env.RELEASE_TAG }}
+            SOURCE_DATE_EPOCH=${{ steps.sde.outputs.SOURCE_DATE_EPOCH }}
+          secrets: |
+            go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v6.1.0
+        with:
+          path: /tmp/trivy-cache
+          key: trivy-db-${{ runner.os }}
+          restore-keys: |
+            trivy-db-${{ runner.os }}-
+
+      # Scan the released image for OS and library CVEs. Critical/High
+      # findings fail the release — a known-vulnerable image must not be
+      # tagged as a release that consuming services will pin.
+      - name: Scan image for CVEs
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: sarif
+          output: trivy-results.sarif
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          cache-dir: /tmp/trivy-cache
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4.37.6
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: trivy-results.sarif
+
+      # CycloneDX SBOM — full component inventory for compliance / audit.
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: cyclonedx
+          output: sbom.cyclonedx.json
+          exit-code: "0"
+          cache-dir: /tmp/trivy-cache
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sbom-${{ env.RELEASE_TAG }}
+          path: sbom.cyclonedx.json
+          retention-days: 90
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Export SLSA provenance
+        env:
+          IMAGE_DIGEST: ${{ steps.pushed.outputs.digest }}
+        run: bash .github/scripts/export-image-provenance.sh
+
+      - name: Upload provenance artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: provenance-${{ env.RELEASE_TAG }}
+          path: provenance.slsa.json
+          retention-days: 90
+
+      # Keyless signing via Sigstore OIDC — no long-lived key to rotate or leak.
+      - name: Sign image with Cosign
+        run: |
+          cosign sign --yes \
+            "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github\.com/${{ github.repository }}/.github/workflows/.*@refs/tags/.*$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
+
+  publish:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    # No deploy-gate to depend on here (see the header comment) — build and
+    # docker succeeding is the full bar for cutting the release.
+    needs: [build, docker]
+    if: needs.build.result == 'success' && needs.docker.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Extract release notes from CHANGELOG
+        env:
+          IMAGE_VERSION: ${{ needs.docker.outputs.version }}
+          IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
+        run: bash .github/scripts/extract-release-notes.sh
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: sbom-${{ env.RELEASE_TAG }}
+
+      - name: Download provenance
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: provenance-${{ env.RELEASE_TAG }}
+
+      - name: Download binary
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: binary-${{ env.RELEASE_TAG }}
+          path: .
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
+        run: bash .github/scripts/create-github-release.sh

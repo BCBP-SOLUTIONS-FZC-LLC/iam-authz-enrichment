@@ -1,0 +1,40 @@
+# Reusable workflow — quality gate. fmt + vet + lint + arch-lint +
+# mod-verify + vuln-check. Called by ci.yml and release.yml — see
+# validate-test.yml's header comment for why this is split out.
+name: Validate / Quality
+
+"on":
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to check out (leave empty to use the caller ref)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Configure private module access
+        run: git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - run: make fmt-check
+      - run: make vet
+      - run: make lint
+      - run: make arch-lint
+      - run: make mod-verify
+      - run: make vuln-check

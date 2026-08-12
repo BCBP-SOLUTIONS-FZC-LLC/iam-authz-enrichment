@@ -233,12 +233,24 @@ signing — no long-lived signing key to rotate or leak, no secret beyond the de
 `GITHUB_TOKEN`. This requires repo Settings → Actions → Workflow permissions set to "Read and
 write"; without it, the GHCR login/push step fails.
 
-There is currently no *tag-triggered* release workflow (versioned binaries, GitHub Releases,
-checksums, SLSA provenance export — unlike `iam-user-profile`'s `release.yml`) — add one
-deliberately, matching the platform team's actual deployment target, rather than copying that
-pipeline wholesale. Notify the platform team on Slack if a change here affects the Envoy
-`ext_authz` contract (response headers, `DenyReason` set, or the `CheckRequest` fields it
-reads) — every service behind this filter is a downstream consumer.
+Pushing a `v*` tag (e.g. `v0.1.0`, `v1.0.0-rc.1`) triggers `.github/workflows/release.yml`:
+`validate-test`/`validate-quality` (the same reusable gates `ci.yml` uses) → `build` (verifies
+the tag matches HEAD, verifies `CHANGELOG.md` has a matching `## [x.y.z]` entry, cross-compiles
+binaries for 5 platforms) → `docker` (builds, pushes a semver-tagged image, CVE-scans it,
+generates an SBOM + SLSA provenance, signs with Cosign) → `publish` (creates the GitHub Release
+with the CHANGELOG section as notes, plus the binaries/checksums/SBOM/provenance attached).
+Cut the `CHANGELOG.md` entry *before* tagging — `build` fails the release otherwise.
+
+Deliberately **not** included: `iam-user-profile`'s `release.yml` `deploy-gate` job, which does
+a live `helm upgrade` against a production cluster (gated on a `KUBECONFIG_B64` secret) with an
+automatic rollback on a Prometheus-measured error-rate spike. This repo has no production
+cluster credentials configured — copying that job verbatim would fail on every release (its own
+first step exits 1 if the secret is unset) and permanently block `publish`. Wire it up
+deliberately, with real secrets, once there's an actual cluster to deploy to.
+
+Notify the platform team on Slack if a change here affects the Envoy `ext_authz` contract
+(response headers, `DenyReason` set, or the `CheckRequest` fields it reads) — every service
+behind this filter is a downstream consumer.
 
 The Helm chart in `deploy/helm/` (applied by the platform CD pipeline) has no
 Ingress/HTTPRoute template — Envoy reaches `Authorization.Check` directly via the chart's
