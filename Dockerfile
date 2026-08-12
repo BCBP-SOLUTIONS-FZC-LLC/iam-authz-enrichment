@@ -5,6 +5,11 @@ FROM golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149a
 
 WORKDIR /build
 
+# GOPRIVATE is a Go toolchain module-privacy setting (an import-path glob
+# pattern), not a credential — hadolint's DL3064 heuristic flags it purely
+# because the name contains "PRIVATE". The ignore directive must be the
+# line immediately before the instruction it applies to.
+# hadolint ignore=DL3064
 ENV GOPRIVATE="github.com/BCBP-SOLUTIONS-FZC-LLC/*"
 ENV GONOSUMDB="github.com/BCBP-SOLUTIONS-FZC-LLC/*"
 
