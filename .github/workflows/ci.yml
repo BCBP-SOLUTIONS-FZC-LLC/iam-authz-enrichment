@@ -51,7 +51,13 @@ env:
 jobs:
   # ── runs in parallel with quality + build-image ───────────────────────────
   test:
-    name: Test (unit + integration)
+    # Matches the org-required status check name from iam-user-profile's
+    # validate-test.yml (name: "Validate / Test") + job id ("test") —
+    # GitHub concatenates those via workflow_call there; we get the same
+    # string directly since this is a plain job, not a reusable-workflow
+    # split (no release.yml here to share it with, so the split isn't
+    # earning its keep — see the workflow-level comment above).
+    name: Validate / Test / test
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -112,7 +118,9 @@ jobs:
 
   # ── runs in parallel with test + build-image ──────────────────────────────
   quality:
-    name: Quality (fmt/vet/lint/arch-lint/vuln)
+    # Matches the org-required check name from iam-user-profile's
+    # validate-quality.yml — see the comment on the test job above.
+    name: Validate / Quality / quality
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
