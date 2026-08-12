@@ -23,6 +23,8 @@ var allEnvVars = []string{
 	"AE_CTX_TTL", "AE_CTX_JITTER", "AE_TENDER_ACL_TTL", "AE_NEG_TTL",
 	"AE_PROCESSED_EVENT_TTL", "AE_STALE_IF_ERROR_MAX_AGE",
 	"GRPC_KEEPALIVE_TIME", "GRPC_KEEPALIVE_TIMEOUT", "GRPC_MAX_CONCURRENT_STREAMS",
+	"GRPC_MAX_RECV_MSG_SIZE_BYTES", "GRPC_MAX_SEND_MSG_SIZE_BYTES",
+	"GRPC_TLS_CERT_FILE", "GRPC_TLS_KEY_FILE", "GRPC_TLS_CLIENT_CA_FILE",
 	"SQS_MAX_RECEIVE_COUNT",
 	"AWS_REGION", "AWS_ENDPOINT_URL",
 	"MEMBERSHIP_AUTHZ_QUEUE_URL", "USER_AUTHZ_QUEUE_URL", "BILLING_AUTHZ_QUEUE_URL",
@@ -65,6 +67,11 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 30*time.Second, cfg.GRPCKeepAliveTime)
 	assert.Equal(t, 5*time.Second, cfg.GRPCKeepAliveTimeout)
 	assert.EqualValues(t, 1000, cfg.GRPCMaxConcurrentStreams)
+	assert.Equal(t, 256*1024, cfg.GRPCMaxRecvMsgSizeBytes)
+	assert.Equal(t, 256*1024, cfg.GRPCMaxSendMsgSizeBytes)
+	assert.Empty(t, cfg.GRPCTLSCertFile)
+	assert.Empty(t, cfg.GRPCTLSKeyFile)
+	assert.Empty(t, cfg.GRPCTLSClientCAFile)
 	assert.Equal(t, 5, cfg.SQSMaxReceiveCount)
 	assert.Equal(t, "ap-south-1", cfg.AWSRegion)
 	assert.Equal(t, "", cfg.AWSEndpointURL)
@@ -101,6 +108,11 @@ func TestLoad_CustomValues(t *testing.T) {
 	t.Setenv("GRPC_KEEPALIVE_TIME", "15s")
 	t.Setenv("GRPC_KEEPALIVE_TIMEOUT", "3s")
 	t.Setenv("GRPC_MAX_CONCURRENT_STREAMS", "500")
+	t.Setenv("GRPC_MAX_RECV_MSG_SIZE_BYTES", "131072")
+	t.Setenv("GRPC_MAX_SEND_MSG_SIZE_BYTES", "65536")
+	t.Setenv("GRPC_TLS_CERT_FILE", "/tls/tls.crt")
+	t.Setenv("GRPC_TLS_KEY_FILE", "/tls/tls.key")
+	t.Setenv("GRPC_TLS_CLIENT_CA_FILE", "/tls/ca.crt")
 	t.Setenv("SQS_MAX_RECEIVE_COUNT", "3")
 	t.Setenv("AWS_REGION", "eu-west-1")
 	t.Setenv("AWS_ENDPOINT_URL", "http://localstack:4566")
@@ -136,6 +148,11 @@ func TestLoad_CustomValues(t *testing.T) {
 	assert.Equal(t, 15*time.Second, cfg.GRPCKeepAliveTime)
 	assert.Equal(t, 3*time.Second, cfg.GRPCKeepAliveTimeout)
 	assert.EqualValues(t, 500, cfg.GRPCMaxConcurrentStreams)
+	assert.Equal(t, 131072, cfg.GRPCMaxRecvMsgSizeBytes)
+	assert.Equal(t, 65536, cfg.GRPCMaxSendMsgSizeBytes)
+	assert.Equal(t, "/tls/tls.crt", cfg.GRPCTLSCertFile)
+	assert.Equal(t, "/tls/tls.key", cfg.GRPCTLSKeyFile)
+	assert.Equal(t, "/tls/ca.crt", cfg.GRPCTLSClientCAFile)
 	assert.Equal(t, 3, cfg.SQSMaxReceiveCount)
 	assert.Equal(t, "eu-west-1", cfg.AWSRegion)
 	assert.Equal(t, "http://localstack:4566", cfg.AWSEndpointURL)
@@ -194,7 +211,10 @@ func TestLoad_InvalidDuration_EachField(t *testing.T) {
 // TestLoad_InvalidInt_EachField exercises every envInt-backed field's
 // error-return branch individually.
 func TestLoad_InvalidInt_EachField(t *testing.T) {
-	fields := []string{"GRPC_MAX_CONCURRENT_STREAMS", "SQS_MAX_RECEIVE_COUNT"}
+	fields := []string{
+		"GRPC_MAX_CONCURRENT_STREAMS", "SQS_MAX_RECEIVE_COUNT",
+		"GRPC_MAX_RECV_MSG_SIZE_BYTES", "GRPC_MAX_SEND_MSG_SIZE_BYTES",
+	}
 	for _, field := range fields {
 		t.Run(field, func(t *testing.T) {
 			clearEnv(t)
@@ -216,4 +236,46 @@ func TestLoad_InvalidRealmTenantMapSeed_JSON(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "REALM_TENANT_MAP_SEED")
+}
+
+// TestLoad_OrgMembershipDevDefault_FailsOutsideDev proves a deployment left
+// pointed at the local-dev Org & Membership URL fails fast at startup
+// instead of starting, passing health checks, and silently failing every
+// request that isn't a cache hit.
+func TestLoad_OrgMembershipDevDefault_FailsOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "production")
+	// ORG_MEMBERSHIP_BASE_URL left unset — resolves to the dev default.
+
+	_, err := config.Load()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ORG_MEMBERSHIP_BASE_URL")
+}
+
+// TestLoad_OrgMembershipDevDefault_AllowedInDev proves the same default is
+// fine when APP_ENV is (or defaults to) dev — this is the normal local
+// developer setup, not a misconfiguration.
+func TestLoad_OrgMembershipDevDefault_AllowedInDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "dev")
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.Equal(t, "http://localhost:8081", cfg.OrgMembershipBaseURL)
+}
+
+// TestLoad_OrgMembershipOverridden_PassesOutsideDev proves the check is on
+// the *value*, not the environment alone — a properly configured production
+// deployment must not be blocked by this validation.
+func TestLoad_OrgMembershipOverridden_PassesOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.Equal(t, "http://org-membership.iam.svc.cluster.local:8080", cfg.OrgMembershipBaseURL)
 }

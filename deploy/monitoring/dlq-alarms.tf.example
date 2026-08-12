@@ -1,0 +1,52 @@
+# Terraform snippet — CloudWatch alarms on the five §5 dead-letter queues.
+# This file is *illustrative*, not applied by the application. Platform
+# Terraform owns the authoritative version of this resource.
+#
+# Why this exists: DLQ routing is entirely SQS-native (see
+# internal/adapter/inbound/consumer's package doc comment and
+# ARCHITECTURE.md's "DLQ routing is infra-only" invariant) — no application
+# code ever reads a -dlq queue. Without an explicit alarm, a message that
+# lands in one sits there completely unmonitored: nothing pages anyone, and
+# nothing but a human manually checking `awslocal sqs get-queue-attributes`
+# would ever notice. Prometheus can't cover this gap either — SQS queue
+# depth is a CloudWatch-native metric, not something this service (or any
+# service) exports itself.
+#
+# One alarm per DLQ, firing on ANY message sitting in it (threshold 0) —
+# unlike the primary queues, a DLQ is never expected to hold anything
+# during normal operation, so even a single message is worth paging on,
+# not just a depth trend.
+
+variable "dlq_alarm_sns_topic_arn" {
+  description = "SNS topic ARN to notify when a §5 dead-letter queue receives a message. Wire this to whatever the platform team's on-call routing actually uses."
+  type        = string
+}
+
+locals {
+  authz_dlq_names = [
+    "membership-authz-q-dlq",
+    "user-authz-q-dlq",
+    "billing-authz-q-dlq",
+    "tenant-authz-q-dlq",
+    "tender-authz-q-dlq",
+  ]
+}
+
+resource "aws_cloudwatch_metric_alarm" "authz_dlq_depth" {
+  for_each = toset(local.authz_dlq_names)
+
+  alarm_name          = "iam-authz-enrichment-${each.value}-nonempty"
+  alarm_description   = "iam-authz-enrichment: ${each.value} has at least one message — a §5 event failed maxReceiveCount=5 redeliveries and needs manual replay/investigation. See CONTRIBUTING.md § Adding a new §5 event type / consumer for how DLQ routing works (SQS-native, no application code)."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  dimensions          = { QueueName = each.value }
+  statistic           = "Maximum"
+  period              = 300 # 5m — matches the primary queues' long-poll cadence; no need for finer granularity on a queue that should always read zero
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching" # a queue with no CloudWatch data yet (freshly created, zero traffic) is not an incident
+
+  alarm_actions = [var.dlq_alarm_sns_topic_arn]
+  ok_actions    = [var.dlq_alarm_sns_topic_arn]
+}

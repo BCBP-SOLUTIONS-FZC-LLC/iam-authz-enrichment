@@ -75,6 +75,22 @@ spec:
                   name: {{ $secretName }}
                   key: {{ . }}
             {{- end }}
+            {{- if .Values.grpcTLS.enabled }}
+            - name: GRPC_TLS_CERT_FILE
+              value: /etc/grpc-tls/tls.crt
+            - name: GRPC_TLS_KEY_FILE
+              value: /etc/grpc-tls/tls.key
+            {{- if .Values.grpcTLS.requireClientCert }}
+            - name: GRPC_TLS_CLIENT_CA_FILE
+              value: /etc/grpc-tls/ca.crt
+            {{- end }}
+            {{- end }}
+          {{- if .Values.grpcTLS.enabled }}
+          volumeMounts:
+            - name: grpc-tls
+              mountPath: /etc/grpc-tls
+              readOnly: true
+          {{- end }}
           startupProbe:
             {{- toYaml .Values.startupProbe | nindent 12 }}
           livenessProbe:
@@ -83,6 +99,12 @@ spec:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.grpcTLS.enabled }}
+      volumes:
+        - name: grpc-tls
+          secret:
+            secretName: {{ .Values.grpcTLS.secretName }}
+      {{- end }}
       affinity:
         # Hard anti-affinity: require pods to land on different nodes.
         # preferred (soft) anti-affinity allows all replicas on one node —

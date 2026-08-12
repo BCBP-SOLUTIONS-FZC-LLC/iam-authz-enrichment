@@ -474,7 +474,9 @@ graph LR
     l1 --- l2 --- l3
 ```
 
-**SLOs (§10):** decision latency p99 > 50ms for 5 min → SEV-2. Availability < 99.5% over 10 min → SEV-1. `authz_stale_if_error_served_total` at a nonzero rate means a live dependency outage is in progress — page on it directly rather than waiting for the SLO windows above to trip.
+**SLOs (§10):** decision latency p99 > 50ms for 5 min → SEV-2. Availability < 99.5% over 10 min → SEV-1. `authz_stale_if_error_served_total` at a nonzero rate means a live dependency outage is in progress — page on it directly rather than waiting for the SLO windows above to trip. These thresholds are validated against a single-machine, loopback-network `test/load` run only (README § Testing) — not yet measured against a real cluster/network path.
+
+**A gap Prometheus can't cover:** DLQ depth is a CloudWatch-native metric, and DLQ routing is entirely SQS-native (no application code ever reads a `-dlq` queue — see the "DLQ routing is infra-only" invariant above). `deploy/monitoring/dlq-alarms.tf.example` is the only alerting on a message actually landing in one; without it, a permanently-undeliverable message sits there unmonitored indefinitely. See `docs/runbook.md` for what to do when it fires.
 
 ---
 
@@ -493,6 +495,8 @@ graph LR
 | DLQ routing is infra-only | No `WithMaxReceiveCount`/`WithDeadLetterHandler` application code — SQS's native redrive policy does the counting (see `scripts/init-localstack.sh`) |
 | Stale-if-error never exceeds its hard cap regardless of configuration | `internal/config/config.go` clamps `AE_STALE_IF_ERROR_MAX_AGE` to 5 minutes even if a higher value is configured |
 | Realm-map freshness survives the direct-paid-signup edge case | Both `TenantConverted` and `TenantRealmReady` update the realm map; only the latter fires for a tenant that never went through conversion |
+| A deployment left pointed at the local-dev Org & Membership URL fails at startup, not silently on every request | `internal/config/config.go`'s `Load()` returns an error when `OrgMembershipBaseURL` is still `http://localhost:8081` and `APP_ENV != "dev"` |
+| The five SQS consumers stop concurrently, not sequentially, on shutdown | `cmd/server/main.go`'s shutdown path uses a `sync.WaitGroup`, bounding worst-case shutdown to one drain window instead of five |
 
 ---
 
@@ -503,6 +507,7 @@ STRIDE analysis of `iam-authz-enrichment`. Threats marked **External** are depen
 | STRIDE | Threat | Component | Mitigation |
 |--------|--------|-----------|------------|
 | **Spoofing** | Caller impersonates another tenant/user via a crafted request header | gRPC inbound | Identity is read exclusively from Envoy-`jwt_authn`-validated dynamic metadata; `Attributes.Request.Http.Headers` is never consulted for identity or policy facts (§8.1, §8.2) |
+| **Tampering / Information Disclosure** | Decisions and JWT-derived claims sniffed or altered in transit between Envoy and this service | gRPC inbound (network) | The server listens in plaintext unless `GRPC_TLS_CERT_FILE`/`GRPC_TLS_KEY_FILE` are set — "Envoy calls over mTLS" describes the *intended* deployment (a service mesh sidecar or the CNI layer), which this repo cannot verify or enforce on its own. **This is an unverified assumption, not a confirmed control** — see `docs/runbook.md` and README § Security. `GRPC_TLS_*`/`deploy/helm/values.yaml`'s `grpcTLS.enabled` is the app-level fallback for clusters without one |
 | **Spoofing** | Forged SQS message evicts or corrupts another tenant's cache entry | SQS consumers | `aws:SourceArn` condition on SQS resource policy (**External** — platform infra); event payloads only ever affect the `(tenant, user)` pair named in the envelope/payload |
 | **Tampering** | Corrupt or type-confused Valkey entry causes a wrong decision | Valkey cache | Defensive decode: a JSON-unmarshal failure returns an error, not a zero-value success — callers fall back to §7's failure-handling path, never silently serve a corrupt struct |
 | **Tampering** | Direct Valkey write bypasses tenant scoping | Valkey | Every key-builder function requires `tenant` as a parameter; there is no unscoped key path in this codebase to target |
@@ -537,5 +542,7 @@ Architecture diagrams live as standalone Mermaid source files under `docs/archit
 | `event-flow.mmd` | SQS consumer → dedup → Invalidator → cache |
 | `failure-handling.mmd` | §7 failure-handling matrix as a decision flow |
 | `observability-stack.mmd` | Interceptors, OTel spans, Prometheus, log redaction |
+
+See also [`docs/runbook.md`](docs/runbook.md) for what to do when each alert above actually fires.
 
 To render locally, open any `.mmd` file in a Mermaid-aware IDE (VS Code + Mermaid Preview, IntelliJ + Mermaid plugin) or paste into [mermaid.live](https://mermaid.live). GitHub renders the fenced blocks above natively.

@@ -39,7 +39,7 @@ This service **centralizes** the decision and the caching:
 
 ## Interface
 
-There is no REST API. The only inbound interface is Envoy's `ext_authz` v3 gRPC contract.
+There is no REST API. The only inbound interface is Envoy's `ext_authz` v3 gRPC contract, plus the standard `grpc.health.v1.Health` service (`Check`/`Watch`) for orchestrators that prefer a native gRPC health probe over the HTTP `/healthz` endpoint — both report the same signal (process startup, not dependency health; see § Local development's readiness note).
 
 ### `Authorization.Check`
 
@@ -439,7 +439,7 @@ See [`ARCHITECTURE.md` §Event flow](ARCHITECTURE.md#event-flow) for the full co
 
 - **Unit** (`internal/.../*_test.go`) — hand-written fakes (`test/fixtures`), no gomock/mockery, no Docker. Includes the §12 acceptance checklist: contract tests, one eviction test per event type, tenant-resolution edge cases, one test per §7 failure-matrix row, the `mfa_freshness_seconds`-never-cached regression, the header-spoofing regression, precedence-order tests, and the convergence-without-events vs. stale-if-error distinction test.
 - **Integration** (`test/integration`, build tag `integration`) — real Valkey (via `miniredis` is unit-only; this tier uses the actual `docker-compose` Valkey) + real LocalStack SQS, including an end-to-end DLQ test that waits for 5 real redeliveries.
-- **Load** (`test/load`) — manual 500 RPS / 100%-cache-miss harness against a running instance. Not run in CI; meaningful p99 numbers require a live Org & Membership instance behind `ORG_MEMBERSHIP_BASE_URL`.
+- **Load** (`test/load`) — manual 500 RPS harness against a running instance, both `-mode=hit` (95%+ cache-hit target) and `-mode=miss` (100% cache-miss latency floor). Not run in CI. Run once locally (Valkey + LocalStack up, a generic mock Org & Membership responder on `:8081`, `make run`) at 500 RPS/30s each: **hit** p50=0.82ms p95=1.29ms p99=1.68ms; **miss** p50=0.83ms p95=1.65ms p99=3.18ms — comfortably inside the documented 15ms/50ms budgets. **Caveat that matters**: this was a single-machine loopback-network test against a trivial Python mock, not a real network hop to a real Org & Membership instance on real cluster hardware — treat these as a sanity check that the harness and the code path work, not as validated production SLO evidence. Re-run against a real staging deployment before trusting the `AuthzEnrichmentDecisionLatencySLOBreach` alert's 50ms threshold on a new cluster.
 
 ```sh
 make test              # unit
@@ -468,6 +468,10 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `JWT_METADATA_NAMESPACE` / `JWT_PAYLOAD_KEY` | `envoy.filters.http.jwt_authn` / `trial` | Must match the Envoy `jwt_authn` filter config |
 | `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `localstack` | AWS credentials (use IRSA in production — reference IAM policy + Terraform snippet under [`deploy/iam/`](deploy/iam/)) |
+| `GRPC_MAX_RECV_MSG_SIZE_BYTES` / `_SEND_` | `262144` (256KiB) | Defense-in-depth, not a real operating limit — `CheckRequest`/`CheckResponse` are small |
+| `GRPC_TLS_CERT_FILE` / `_KEY_FILE` / `_CLIENT_CA_FILE` | _(empty → plaintext)_ | App-level TLS/mTLS for deployments with no service-mesh sidecar or CNI-level encryption — see § Security |
+
+Startup fails fast (not silently) if `ORG_MEMBERSHIP_BASE_URL` is left at its local-dev default (`http://localhost:8081`) outside `APP_ENV=dev` — see `docs/runbook.md`.
 
 ---
 
@@ -480,6 +484,7 @@ Hard invariants — see [`ARCHITECTURE.md` §Threat model](ARCHITECTURE.md#threa
 3. **`mfa_freshness_seconds` is never cached** — a tenant tightening its MFA window takes effect immediately, not after up to 60s.
 4. **Every Valkey key and outbound call is tenant-scoped by construction** — there's no separate access-control layer, since there's no database.
 5. **Log redaction:** only `sub`/`iss` are ever logged, in structured JSON. `auth_time` and every other claim: never, by construction.
+6. **Transport encryption is assumed, not enforced, by default.** The gRPC server listens in plaintext unless `GRPC_TLS_CERT_FILE`/`GRPC_TLS_KEY_FILE` are set — "Envoy calls this service over mTLS" describes the *intended* deployment (a service mesh sidecar or the CNI layer terminating mTLS transparently), which this repo cannot verify from here. **Confirm the target cluster actually has one of those before shipping real traffic**, or set the `GRPC_TLS_*` env vars (`deploy/helm/values.yaml`'s `grpcTLS.enabled`) to terminate TLS/mTLS in the app itself. `NetworkPolicy` alone is L3/L4 segmentation — it does not encrypt anything.
 
 ---
 
@@ -540,6 +545,7 @@ For local development, running `make docker-up` (Valkey + LocalStack only) and `
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layer model, request-flow/cache/event/failure-handling diagrams, key invariants, threat model.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch naming, PR checklist, commit style, how to extend each layer.
 - [`docs/architecture/`](docs/architecture/) — standalone Mermaid diagram sources.
+- [`docs/runbook.md`](docs/runbook.md) — what to do when each alert fires, and the common failure modes behind them.
 - `.go-arch-lint.yml` / `.golangci.yml` — the enforced dependency and lint rules.
 
 ## License / ownership

@@ -5,12 +5,15 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +21,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/health"
+	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 
@@ -59,6 +65,16 @@ func run() error {
 		"service": cfg.AppName, "version": buildVersion, "env": cfg.AppEnv,
 	})
 
+	// SHARED_REALM_ISSUER is legitimately optional — ResolveTenant falls
+	// back to RealmTenantMapSeed for dedicated-realm-only platforms (see
+	// tenant_resolve.go) — so this is a warning, not the hard startup
+	// failure config.Load() applies to ORG_MEMBERSHIP_BASE_URL. But BOTH
+	// empty outside dev means there is no tenant-resolution path at all:
+	// every request will resolve to DENY_MALFORMED_IDENTITY.
+	if cfg.AppEnv != "dev" && cfg.SharedRealmIssuer == "" && len(cfg.RealmTenantMapSeed) == 0 {
+		appLog.Warn("no tenant-resolution path configured — every request will get DENY_MALFORMED_IDENTITY until SHARED_REALM_ISSUER is set or a TenantConverted/TenantRealmReady event seeds the realm map", nil)
+	}
+
 	// 2. Metrics.
 	recorder := metrics.New()
 
@@ -91,22 +107,45 @@ func run() error {
 	// -> tracing -> metrics -> logging, from platform-gincommon. Not
 	// ProtectedUnaryInterceptors — Envoy calls this service over mTLS, not
 	// as a JWT-bearing client, so there's no bearer auth to require here.
-	grpcServer := grpc.NewServer(
+	// "mTLS" above describes the intended deployment (a service mesh
+	// sidecar or the CNI layer terminating it transparently) — this server
+	// listens in plaintext unless GRPC_TLS_CERT_FILE/GRPC_TLS_KEY_FILE are
+	// set, for deployments with no such layer.
+	serverOpts := []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(grpccommon.ObservabilityUnaryInterceptors(grpccommon.Config{
 			ServiceName:  cfg.AppName,
 			BuildVersion: buildVersion,
 			Logger:       appLog,
 		})...),
 		grpc.MaxConcurrentStreams(cfg.GRPCMaxConcurrentStreams),
+		grpc.MaxRecvMsgSize(cfg.GRPCMaxRecvMsgSizeBytes),
+		grpc.MaxSendMsgSize(cfg.GRPCMaxSendMsgSizeBytes),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time:    cfg.GRPCKeepAliveTime,
 			Timeout: cfg.GRPCKeepAliveTimeout,
 		}),
-	)
+	}
+	if cfg.GRPCTLSCertFile != "" && cfg.GRPCTLSKeyFile != "" {
+		tlsCreds, tlsErr := loadServerTLS(cfg)
+		if tlsErr != nil {
+			return fmt.Errorf("load grpc tls credentials: %w", tlsErr)
+		}
+		serverOpts = append(serverOpts, grpc.Creds(tlsCreds))
+		appLog.Info("grpc server terminating TLS itself", map[string]interface{}{
+			"mtls": cfg.GRPCTLSClientCAFile != "",
+		})
+	}
+	grpcServer := grpc.NewServer(serverOpts...)
 	authv3.RegisterAuthorizationServer(grpcServer, grpcadapter.NewServer(checker, grpcadapter.JWTMetadata{
 		Namespace:  cfg.JWTMetadataNamespace,
 		PayloadKey: cfg.JWTPayloadKey,
 	}))
+	// Native gRPC health checking (grpc.health.v1.Health) — lets Kubernetes'
+	// grpc: probe type be used as an alternative to the HTTP /healthz
+	// probe below; tied to the same MarkReady() signal, not dependency
+	// health (§7 — see ReadinessProbe's doc comment for why).
+	healthServer := health.NewServer()
+	healthgrpc.RegisterHealthServer(grpcServer, healthServer)
 	if cfg.AppEnv != "production" {
 		// Lets grpcurl/grpcui/Postman discover and call Check without a local
 		// copy of the envoy ext_authz .proto — same non-production-only
@@ -151,6 +190,7 @@ func run() error {
 		}
 	}()
 	probe.MarkReady()
+	healthServer.SetServingStatus("", healthgrpc.HealthCheckResponse_SERVING)
 
 	// 10. Graceful shutdown, ordered: gRPC -> HTTP -> consumers -> background
 	// work cancellation -> cache -> tracing/logging flush.
@@ -159,6 +199,9 @@ func run() error {
 	<-quit
 	appLog.Info("shutting down", nil)
 
+	// Reflects the draining state to anything still checking the native
+	// gRPC health service before GracefulStop finishes rejecting new RPCs.
+	healthServer.SetServingStatus("", healthgrpc.HealthCheckResponse_NOT_SERVING)
 	grpcServer.GracefulStop()
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
@@ -167,11 +210,24 @@ func run() error {
 		appLog.Warn("http shutdown error", map[string]interface{}{"error": err.Error()})
 	}
 
+	// Stopped concurrently, not sequentially: each Stop() can take up to its
+	// drain timeout plus a margin (platform-events default: 30s + 5s), and
+	// five consumers stopped one at a time could push total shutdown time
+	// to ~175s in the pathological case of all five genuinely stuck
+	// mid-handler at once (e.g. a Valkey outage coinciding with a deploy) —
+	// comfortably past most terminationGracePeriodSeconds settings. Running
+	// them concurrently bounds worst-case shutdown to one drain window.
+	var wg sync.WaitGroup
 	for _, c := range consumers {
-		if err := c.Stop(); err != nil {
-			appLog.Warn("consumer stop error", map[string]interface{}{"error": err.Error()})
-		}
+		wg.Add(1)
+		go func(c events.Consumer) {
+			defer wg.Done()
+			if err := c.Stop(); err != nil {
+				appLog.Warn("consumer stop error", map[string]interface{}{"error": err.Error()})
+			}
+		}(c)
 	}
+	wg.Wait()
 	cancelBackgroundWork()
 
 	if err := cache.Close(); err != nil {
@@ -179,6 +235,35 @@ func run() error {
 	}
 
 	return grpccommon.Shutdown(appLog)
+}
+
+// loadServerTLS builds the gRPC server's TLS credentials from
+// GRPCTLSCertFile/GRPCTLSKeyFile, additionally requiring and verifying a
+// client certificate (mTLS) when GRPCTLSClientCAFile is set. Only called
+// when both cert and key files are configured — see the call site's
+// comment on why this is optional at all.
+func loadServerTLS(cfg config.Config) (credentials.TransportCredentials, error) {
+	cert, err := tls.LoadX509KeyPair(cfg.GRPCTLSCertFile, cfg.GRPCTLSKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load server cert/key: %w", err)
+	}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if cfg.GRPCTLSClientCAFile != "" {
+		caPEM, err := os.ReadFile(cfg.GRPCTLSClientCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("read client CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("client CA file %q contains no valid certificates", cfg.GRPCTLSClientCAFile)
+		}
+		tlsConfig.ClientCAs = pool
+		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return credentials.NewTLS(tlsConfig), nil
 }
 
 // startConsumers builds and starts the five §5 SQS consumers. A consumer

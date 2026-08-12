@@ -48,6 +48,19 @@ type Config struct {
 	GRPCMaxConcurrentStreams uint32
 	GRPCKeepAliveTime        time.Duration
 	GRPCKeepAliveTimeout     time.Duration
+	GRPCMaxRecvMsgSizeBytes  int
+	GRPCMaxSendMsgSizeBytes  int
+
+	// GRPCTLSCertFile/GRPCTLSKeyFile: when both are set, the gRPC server
+	// terminates TLS itself instead of listening in plaintext. Optional —
+	// most deployments terminate mTLS at a service mesh sidecar or the CNI
+	// layer instead (see README § Security), but the app-level option must
+	// exist for environments without one. GRPCTLSClientCAFile additionally
+	// requires and verifies a client certificate (mTLS) when set; leave it
+	// empty for server-side-only TLS.
+	GRPCTLSCertFile     string
+	GRPCTLSKeyFile      string
+	GRPCTLSClientCAFile string
 
 	AWSRegion      string
 	AWSEndpointURL string // LocalStack endpoint override; empty in real AWS
@@ -72,6 +85,11 @@ type Config struct {
 // misconfigured env var requests.
 const staleIfErrorHardCap = 5 * time.Minute
 
+// devOrgMembershipBaseURL is the local-dev default — never a valid address
+// for a real Org & Membership service, so Load() fails outside APP_ENV=dev
+// if this is still the resolved value.
+const devOrgMembershipBaseURL = "http://localhost:8081"
+
 // Load reads Config from the environment, applying the same conventions as
 // the rest of the IAM fleet (plain os.Getenv + default fallback, no
 // viper/envconfig — see iam-user-profile's main.go envOr()).
@@ -86,7 +104,7 @@ func Load() (Config, error) {
 
 		ValkeyURL: envOr("VALKEY_URL", "localhost:6379"),
 
-		OrgMembershipBaseURL: envOr("ORG_MEMBERSHIP_BASE_URL", "http://localhost:8081"),
+		OrgMembershipBaseURL: envOr("ORG_MEMBERSHIP_BASE_URL", devOrgMembershipBaseURL),
 		SharedRealmIssuer:    envOr("SHARED_REALM_ISSUER", ""),
 		JWTMetadataNamespace: envOr("JWT_METADATA_NAMESPACE", "envoy.filters.http.jwt_authn"),
 		JWTPayloadKey:        envOr("JWT_PAYLOAD_KEY", "trial"),
@@ -99,6 +117,10 @@ func Load() (Config, error) {
 		BillingQueueURL:    envOr("BILLING_AUTHZ_QUEUE_URL", ""),
 		TenantQueueURL:     envOr("TENANT_AUTHZ_QUEUE_URL", ""),
 		TenderQueueURL:     envOr("TENDER_AUTHZ_QUEUE_URL", ""),
+
+		GRPCTLSCertFile:     envOr("GRPC_TLS_CERT_FILE", ""),
+		GRPCTLSKeyFile:      envOr("GRPC_TLS_KEY_FILE", ""),
+		GRPCTLSClientCAFile: envOr("GRPC_TLS_CLIENT_CA_FILE", ""),
 	}
 
 	var err error
@@ -148,6 +170,18 @@ func Load() (Config, error) {
 	}
 	cfg.GRPCMaxConcurrentStreams = uint32(streams)
 
+	// CheckRequest/CheckResponse payloads are small (a handful of claims and
+	// six headers) — 256KiB is generous headroom, not a real operating
+	// limit, kept far below gRPC-Go's 4MiB default as defense-in-depth
+	// against a malformed or abusive message from a misbehaving Envoy
+	// instance (§8: Envoy is trusted, but "trusted" isn't "unbounded").
+	if cfg.GRPCMaxRecvMsgSizeBytes, err = envInt("GRPC_MAX_RECV_MSG_SIZE_BYTES", 256*1024); err != nil {
+		return Config{}, err
+	}
+	if cfg.GRPCMaxSendMsgSizeBytes, err = envInt("GRPC_MAX_SEND_MSG_SIZE_BYTES", 256*1024); err != nil {
+		return Config{}, err
+	}
+
 	if cfg.SQSMaxReceiveCount, err = envInt("SQS_MAX_RECEIVE_COUNT", 5); err != nil {
 		return Config{}, err
 	}
@@ -156,6 +190,23 @@ func Load() (Config, error) {
 	cfg.RealmTenantMapSeed = map[string]string{}
 	if err := json.Unmarshal([]byte(seed), &cfg.RealmTenantMapSeed); err != nil {
 		return Config{}, fmt.Errorf("REALM_TENANT_MAP_SEED: invalid JSON: %w", err)
+	}
+
+	// ORG_MEMBERSHIP_BASE_URL left at its local-dev default outside dev is
+	// never correct — there's no legitimate deployment where the Org &
+	// Membership sibling actually runs at localhost:8081 inside this
+	// service's own container. Left unchecked, the process starts, passes
+	// health checks, and then silently fails every request that isn't a
+	// cache hit — a startup crash-loop is far more visible and actionable
+	// than that. SHARED_REALM_ISSUER has no equivalent check: it's
+	// legitimately optional (ResolveTenant falls back to RealmTenantMapSeed
+	// for dedicated-realm-only platforms — see tenant_resolve.go), so main.go
+	// logs a warning for that case instead of failing here.
+	if cfg.AppEnv != "dev" && cfg.OrgMembershipBaseURL == devOrgMembershipBaseURL {
+		return Config{}, fmt.Errorf(
+			"ORG_MEMBERSHIP_BASE_URL is left at its local-dev default (%s) with APP_ENV=%q — set it to the real Org & Membership service address",
+			devOrgMembershipBaseURL, cfg.AppEnv,
+		)
 	}
 
 	return cfg, nil

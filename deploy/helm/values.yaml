@@ -77,10 +77,14 @@ env:
   JWT_METADATA_NAMESPACE: "envoy.filters.http.jwt_authn"
   JWT_PAYLOAD_KEY: "trial"
 
-  # gRPC server tuning (§11).
+  # gRPC server tuning (§11). Message-size limits are deliberately far below
+  # gRPC-Go's 4MiB default — CheckRequest/CheckResponse payloads are small;
+  # this is defense-in-depth, not a real operating limit.
   GRPC_MAX_CONCURRENT_STREAMS: "1000"
   GRPC_KEEPALIVE_TIME: "30s"
   GRPC_KEEPALIVE_TIMEOUT: "5s"
+  GRPC_MAX_RECV_MSG_SIZE_BYTES: "262144"
+  GRPC_MAX_SEND_MSG_SIZE_BYTES: "262144"
 
   # AWS — five inbound SQS queues, zero outbound (§5). Required: leave a
   # *_QUEUE_URL blank only to intentionally start that consumer idle.
@@ -176,6 +180,23 @@ readinessProbe:
   failureThreshold: 3
   timeoutSeconds: 3
 
+# grpcTLS — disabled by default: the gRPC server listens in plaintext,
+# trusting a service mesh sidecar or the CNI layer to terminate mTLS
+# transparently (see networkPolicy's comment above and README § Security).
+# Enable this ONLY when the target cluster has no such layer — it makes
+# cmd/server/main.go terminate TLS itself instead.
+#
+# When enabled, secretName must reference a pre-existing Kubernetes Secret
+# (kubernetes.io/tls type, or Opaque with matching keys) containing at
+# least tls.crt/tls.key; set requireClientCert to also mount ca.crt and
+# require/verify a client certificate (mTLS) rather than server-side-only
+# TLS. This chart does not create that Secret — provision it the same way
+# as iam-authz-enrichment-secrets (existingSecret, cert-manager, ESO, etc.).
+grpcTLS:
+  enabled: false
+  secretName: "iam-authz-enrichment-tls"
+  requireClientCert: false
+
 # NetworkPolicy — enabled by default. Restricts grpc-port ingress to wherever
 # Envoy's ext_authz caller actually runs, and http-port (metrics) ingress to
 # the monitoring namespace. Override to false only in environments where the
@@ -186,6 +207,13 @@ readinessProbe:
 # Service mesh sidecar (Istio/Linkerd ext_authz): every namespace running a
 # sidecar needs to reach this Service — widen ingressControllerNamespaceSelector
 # accordingly, or use additionalIngressRules for a mesh-wide allow.
+#
+# NetworkPolicy alone is L3/L4 segmentation — it does NOT encrypt traffic.
+# "Envoy calls this service over mTLS" (README § Security) describes the
+# INTENDED deployment: a service mesh sidecar or the CNI layer terminating
+# mTLS transparently, which this chart cannot configure or verify from here
+# — confirm the target cluster actually has one before shipping real
+# traffic. grpcTLS below is the fallback for clusters that don't.
 networkPolicy:
   enabled: true
   # Namespace label selector for wherever Envoy's ext_authz filter runs.

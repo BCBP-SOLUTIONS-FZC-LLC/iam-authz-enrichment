@@ -106,6 +106,9 @@ For full layout and flow details see [ARCHITECTURE.md](ARCHITECTURE.md).
    `ConsumeAuthzEvents` statement in `deploy/iam/policy.json` and the Terraform
    `templatefile` call in `deploy/iam/policy.tf.example` — the IAM role must be updated
    before the new consumer is deployed, or it fails on its first `ReceiveMessage` call.
+7. If the queue is new, also add its `-dlq` name to `deploy/monitoring/dlq-alarms.tf.example`'s
+   `authz_dlq_names` list — DLQ routing is entirely SQS-native (no application code reads a
+   `-dlq` queue), so without an alarm a message that lands there sits unmonitored indefinitely.
 
 ### Adding a new environment variable
 
@@ -113,6 +116,16 @@ For full layout and flow details see [ARCHITECTURE.md](ARCHITECTURE.md).
    any hard invariant (e.g. "capped at 5m regardless of what this is set to").
 2. Read it in `internal/config/config.go`.
 3. Update the Environment variables table in `README.md`.
+4. If a real deployment must set it to something functional (not just tune a default —
+   compare `ORG_MEMBERSHIP_BASE_URL` vs. `AE_CTX_TTL`), consider whether `Load()` should
+   fail fast when it's left at a non-functional default outside `APP_ENV=dev`, the same way
+   `ORG_MEMBERSHIP_BASE_URL` does. A silent default that only breaks at request time is much
+   harder to diagnose than a startup crash-loop with a clear error message.
+5. If it also needs to reach `platform-gincommon` (e.g. another `OTEL_*` var), check whether
+   that library reads it via `os.Getenv` directly rather than through this service's own
+   config — if so, it won't inherit this service's own `APP_ENV` *default* the way this
+   service's own env vars do (see `.env-example`'s `OTEL_EXPORTER_OTLP_INSECURE` comment for
+   the exact gotcha this caused).
 
 ## Testing requirements
 
@@ -201,6 +214,7 @@ long-running integration branch — target `main` unless a maintainer says other
 - [ ] Documentation update checklist above reviewed — relevant docs updated
 - [ ] No new source of identity/authz input other than Envoy's validated `Attributes.MetadataContext` (§8) — never a request header
 - [ ] If a cached value was added: confirmed it's *not* `mfa_freshness_seconds` or an equivalent "must react immediately" value, or explicitly excluded from caching with a regression test
+- [ ] If a new effectively-required env var was added (something every real deployment must set, not just tune): confirmed whether it needs a fail-fast check in `internal/config/config.go` like `ORG_MEMBERSHIP_BASE_URL`'s, rather than silently defaulting to a non-functional dev value in production
 
 ## Commit style
 
