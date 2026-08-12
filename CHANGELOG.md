@@ -19,8 +19,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - `sync.WaitGroup`-parallelized SQS consumer shutdown in `cmd/server/main.go`, replacing a sequential loop — each `Stop()` can take up to ~35s in the worst case, so five stopped one at a time could push total shutdown past most `terminationGracePeriodSeconds` settings under a correlated failure (e.g. a Valkey outage coinciding with a deploy). Verified via a real `kill -TERM` against a running process that shutdown still completes cleanly.
-
-### Changed
 - `deploy-gate`'s health query uses `grpc_server_handled_total{status_class="5xx"}` (`platform-gincommon`'s gRPC interceptor chain), not `iam-user-profile`'s `http_requests_total` — this service has no HTTP business traffic. Requires a `KUBECONFIG_B64` secret, optional `K8S_NAMESPACE`/`PROMETHEUS_URL` vars, and a pre-provisioned `iam-authz-enrichment-secrets` Kubernetes Secret in the target namespace.
 - `deploy-gate` now only runs when `vars.DEPLOY_GATE_ENABLED == 'true'` (default: skipped) — checked `iam-user-profile`'s actual current `release.yml` and confirmed it has no skip logic either; it presumably just never fails there because that secret is already configured for that repo. Blocking every release on infrastructure that doesn't exist yet was the wrong default for a brand-new service. `publish` accepts a skipped gate but not a failed one, and the GitHub Release notes get an explicit "not deployed/health-checked" line when the gate was skipped, so that's visible on the Release page itself, not just in the workflow run's logs.
 
