@@ -1,0 +1,39 @@
+sequenceDiagram
+    participant SQS as SQS Queue
+    participant Consumer as platform-events Consumer
+    participant Dedup as dedupingHandler
+    participant Cache as Valkey Cache
+    participant Handler as *Handler (membership/user/billing/tenant/tender)
+    participant Inv as Invalidator
+    participant DLQ as SQS -dlq
+
+    SQS ->> Consumer: ReceiveMessage (long poll)
+    Consumer ->> Dedup: dispatch Envelope[json.RawMessage]
+    Dedup ->> Cache: MarkProcessed(event.ID)  — SET NX, 7-day TTL
+
+    alt already processed
+        Cache -->> Dedup: false
+        Dedup -->> Consumer: nil (ack — message deleted, not reprocessed)
+    else first delivery of this event ID
+        Cache -->> Dedup: true
+        Dedup ->> Handler: handler(ctx, envelope)
+        Handler ->> Handler: filter by event.Type<br/>e.g. UserUpdated only if 'email' is in changed_fields
+
+        alt event type not relevant to this queue
+            Handler -->> Dedup: nil (no-op)
+        else decode error (malformed payload)
+            Handler -->> Dedup: error
+            Dedup ->> Cache: EvictProcessed(event.ID)
+            Note over Dedup,Cache: undoes the MarkProcessed claim — a permanently\nmalformed message must still count toward maxReceiveCount,\nnot be silently swallowed as already-processed on redelivery
+            Dedup -->> Consumer: error (message NOT deleted)
+        else relevant, decodes cleanly
+            Handler ->> Inv: HandleXxx(ctx, tenant, payload)
+            Inv ->> Cache: Evict*/Set* (§5 — see cache-strategy.mmd)
+            Inv -->> Handler: nil
+            Handler -->> Dedup: nil
+            Dedup -->> Consumer: nil (ack — message deleted)
+        end
+    end
+
+    Consumer -->> SQS: DeleteMessage (only on nil)
+    Note over SQS,DLQ: A message left undeleted becomes visible again after its\nvisibility timeout and is redelivered. After 5 receives, SQS's own\nredrive policy — not application code — moves it to the -dlq (§5).\nA DLQ'd message degrades to stale-until-TTL-expiry, not a\ncorrectness failure requiring replay.

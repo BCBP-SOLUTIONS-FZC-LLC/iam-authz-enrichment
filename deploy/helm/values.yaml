@@ -1,0 +1,233 @@
+# No ingress / HTTPRoute / SecurityPolicy templates in this chart, unlike
+# iam-user-profile's. This service has no public HTTP API — Envoy calls
+# Authorization.Check directly as a grpc_service cluster reference in its
+# ext_authz filter config (README § Envoy configuration sketch), not through
+# a Gateway API Route. There is nothing to route to; the grpc Service below
+# is reached by cluster DNS name, same as any other internal gRPC backend.
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment
+  pullPolicy: IfNotPresent
+  tag: ""
+
+serviceAccount:
+  create: true
+  # Annotations added to the ServiceAccount — use for IRSA on EKS:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/iam-authz-enrichment
+  # When IRSA is configured, remove AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+  # from envFromSecret / secretValues and rely on the pod's ambient IAM role instead.
+  annotations: {}
+
+# Two ports: grpc is the actual traffic (Envoy's Authorization.Check calls);
+# http carries only /healthz, /readyz, and /metrics — no business routes.
+service:
+  type: ClusterIP
+  grpcPort: 9091
+  httpPort: 8080
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 75
+  # RPS-equivalent: every Check() call produces exactly one authz_decisions_total
+  # increment, so this is a direct per-pod decision-rate target, not an
+  # approximation the way a generic HTTP request counter would be.
+  targetDecisionsPerSecondPerReplica: 500
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+
+env:
+  APP_ENV: "production"
+  APP_PORT: "8080"
+  GRPC_PORT: "9091"
+
+  # §4.1 cache TTLs / jitter and the §7 stale-if-error hard cap. Defaults match
+  # .env-example; override only if the platform team has a documented reason.
+  AE_CTX_TTL: "60s"
+  AE_CTX_JITTER: "6s"
+  AE_TENDER_ACL_TTL: "15s"
+  AE_NEG_TTL: "5s"
+  AE_PROCESSED_EVENT_TTL: "168h"
+  AE_STALE_IF_ERROR_MAX_AGE: "5m"
+
+  # Org & Membership sibling service (§6) — I-8/I-12/I-14. Required: point at
+  # the real in-cluster service, e.g. http://iam-org-membership.iam.svc.cluster.local:8080.
+  ORG_MEMBERSHIP_BASE_URL: ""
+  ORG_MEMBERSHIP_TIMEOUT: "10ms"
+
+  # Tenant resolution (§2 point 3). SHARED_REALM_ISSUER is required — the
+  # Keycloak issuer for the shared trial realm. REALM_TENANT_MAP_SEED is a
+  # startup-only JSON seed for dedicated realms, kept fresh at runtime by the
+  # tenant-authz-q consumer — leave "{}" unless bootstrapping a fresh cluster.
+  SHARED_REALM_ISSUER: ""
+  REALM_TENANT_MAP_SEED: "{}"
+
+  # Must match the Envoy jwt_authn filter config exactly (README § Envoy
+  # configuration sketch) — see internal/adapter/inbound/grpc/claims.go.
+  JWT_METADATA_NAMESPACE: "envoy.filters.http.jwt_authn"
+  JWT_PAYLOAD_KEY: "trial"
+
+  # gRPC server tuning (§11).
+  GRPC_MAX_CONCURRENT_STREAMS: "1000"
+  GRPC_KEEPALIVE_TIME: "30s"
+  GRPC_KEEPALIVE_TIMEOUT: "5s"
+
+  # AWS — five inbound SQS queues, zero outbound (§5). Required: leave a
+  # *_QUEUE_URL blank only to intentionally start that consumer idle.
+  AWS_REGION: "ap-south-1"
+  AWS_ENDPOINT_URL: ""   # blank → real AWS SQS; only set for LocalStack-backed environments
+  MEMBERSHIP_AUTHZ_QUEUE_URL: ""
+  USER_AUTHZ_QUEUE_URL: ""
+  BILLING_AUTHZ_QUEUE_URL: ""
+  TENANT_AUTHZ_QUEUE_URL: ""
+  TENDER_AUTHZ_QUEUE_URL: ""
+  SQS_MAX_RECEIVE_COUNT: "5"
+
+  # Read directly from process env by platform-gincommon (not this service's
+  # own internal/config) — see that library's internal/config/env.go.
+  OTEL_SERVICE_NAME: "iam-authz-enrichment"
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""     # gRPC OTel collector endpoint (e.g. otelcollector:4317)
+  OTEL_EXPORTER_OTLP_INSECURE: "false"
+
+envFromSecret:
+  - VALKEY_URL
+  - AWS_ACCESS_KEY_ID
+  - AWS_SECRET_ACCESS_KEY
+
+# existingSecret — preferred for production.
+# Set to the name of a pre-existing Kubernetes Secret whose keys match envFromSecret.
+# When set, the chart will NOT create a Secret resource; secretValues is ignored.
+# Use with External Secrets Operator, AWS Secrets Manager CSI, or Sealed Secrets:
+#   existingSecret: "iam-authz-enrichment-secrets"
+existingSecret: ""
+
+# rotationEpoch — used only when existingSecret is set.
+# Bump this value to trigger a rolling restart after an external secret is rotated:
+#   helm upgrade ... --set rotationEpoch=$(date +%s)
+rotationEpoch: "0"
+
+# Secret values — used ONLY when existingSecret is empty.
+# Pass via --set or a Helm secrets plugin (never commit real values).
+# Warning: Helm stores these in the release history Secret (base64, not encrypted).
+# In production, always prefer existingSecret over this map.
+secretValues:
+  VALKEY_URL: ""
+  AWS_ACCESS_KEY_ID: ""
+  AWS_SECRET_ACCESS_KEY: ""
+
+# gRPC GracefulStop (fast — in-flight Check() calls are sub-100ms) + HTTP
+# Shutdown (30s ctx timeout, cmd/server/main.go) + 5 SQS consumers stopped
+# SEQUENTIALLY, each with up to a 30s drain + 5s margin (platform-events
+# default) if a handler is genuinely in flight. 60s covers the realistic
+# case; it does NOT cover the pathological worst case of all 5 consumers
+# simultaneously blocked for their full drain window (~175s) — that would
+# require parallelizing consumer shutdown in main.go, which this chart
+# cannot fix. Raise this if consumer-stop latency shows up in shutdown logs.
+terminationGracePeriodSeconds: 60
+
+# podDisruptionBudget — ensures at least 2 pods survive voluntary disruptions
+# (node drains, cluster upgrades). Requires replicaCount >= 3 (the default);
+# set enabled: false only when running fewer than 3 replicas (dev/staging scale-down).
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# startupProbe budget is short — unlike iam-user-profile there are no
+# migrations or schema checks to wait out; Valkey/SQS/Org&Membership are all
+# soft dependencies per §7, so the process is ready almost immediately after
+# the gRPC/HTTP listeners bind.
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  failureThreshold: 6   # 6 × 5s = 30s startup budget
+  timeoutSeconds: 3
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 0   # startupProbe handles the initial delay
+  periodSeconds: 15
+  failureThreshold: 3
+  timeoutSeconds: 3
+
+# /readyz deliberately reports process-startup only, NOT dependency health
+# (internal/adapter/inbound/http/router.go) — this service never goes
+# "unready" due to a downstream outage, by design (§7: bypass, not fail).
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 0
+  periodSeconds: 10
+  failureThreshold: 3
+  timeoutSeconds: 3
+
+# NetworkPolicy — enabled by default. Restricts grpc-port ingress to wherever
+# Envoy's ext_authz caller actually runs, and http-port (metrics) ingress to
+# the monitoring namespace. Override to false only in environments where the
+# CNI plugin does not support NetworkPolicy.
+#
+# Envoy Gateway: data-plane Envoy proxy pods run in the same namespace as the
+# Gateway resource (not envoy-gateway-system, which is the control plane).
+# Service mesh sidecar (Istio/Linkerd ext_authz): every namespace running a
+# sidecar needs to reach this Service — widen ingressControllerNamespaceSelector
+# accordingly, or use additionalIngressRules for a mesh-wide allow.
+networkPolicy:
+  enabled: true
+  # Namespace label selector for wherever Envoy's ext_authz filter runs.
+  # Envoy Gateway:   kubernetes.io/metadata.name: <namespace where Gateway lives>
+  envoyNamespaceSelector:
+    kubernetes.io/metadata.name: envoy-gateway-system
+  # Optional pod label selector — combined with namespaceSelector (logical AND).
+  # Envoy Gateway data-plane pods carry:
+  #   gateway.envoyproxy.io/owning-gateway-name: <gateway-name>
+  #   gateway.envoyproxy.io/owning-gateway-namespace: <gateway-namespace>
+  # Leave empty ({}) to allow all pods in the Envoy namespace.
+  envoyPodSelector: {}
+  metricsIngress:
+    enabled: true
+    # Namespace where Prometheus runs.
+    namespaceSelector:
+      kubernetes.io/metadata.name: monitoring
+    # Pod label selector for the Prometheus pod.
+    podSelector:
+      app.kubernetes.io/name: prometheus
+  # Extra ingress rules (raw NetworkPolicy ingress spec entries).
+  additionalIngressRules: []
+  # Extra egress rules (raw NetworkPolicy egress spec entries). Add a rule
+  # here for Org & Membership (ORG_MEMBERSHIP_BASE_URL) — its port isn't
+  # fixed by convention the way Valkey/AWS are, so it isn't in the default
+  # egress list below.
+  additionalEgressRules: []
+
+# ServiceMonitor — requires kube-prometheus-stack (monitoring.coreos.com/v1 CRD).
+# Enable to have Prometheus auto-discover and scrape /metrics.
+# NOTE: PrometheusRule (alerting rules) is also gated on this flag — no scrape
+# means no metrics, which means all alerts stay permanently inactive. Set to
+# true (and add the correct serviceMonitorSelector labels) before relying on
+# any alert in deploy/monitoring/ or deploy/helm/templates/prometheusrule.yaml.
+serviceMonitor:
+  enabled: true
+  interval: "30s"
+  scrapeTimeout: "10s"
+  # Labels added to the ServiceMonitor (must match your Prometheus operator's
+  # serviceMonitorSelector — typically: release: kube-prometheus-stack).
+  additionalLabels: {}
+  # Relabeling rules applied to scraped metrics before ingestion.
+  relabelings: []
+  # Restrict to this namespace; omit to match the release namespace.
+  namespaceSelector: {}

@@ -1,0 +1,40 @@
+# Prometheus Adapter ConfigMap — maps authz_decisions_total to the Custom
+# Metrics API so the HPA can scale on authz_decisions_per_second.
+#
+# Deploy into the namespace where prometheus-adapter runs (typically kube-system
+# or monitoring). Merge with any existing prometheus-adapter ConfigMap rather
+# than replacing it.
+#
+# Reference:
+#   https://github.com/kubernetes-sigs/prometheus-adapter/blob/master/docs/config.md
+#
+# After applying, verify the metric is visible:
+#   kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1 | jq '.resources[].name' | grep authz
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-adapter-config
+  namespace: monitoring   # adjust to match your prometheus-adapter deployment namespace
+  labels:
+    app.kubernetes.io/name: prometheus-adapter
+    app.kubernetes.io/component: metrics
+data:
+  config.yaml: |
+    rules:
+      # Expose per-pod decision rate as authz_decisions_per_second so the HPA
+      # can use type: Pods / metric: authz_decisions_per_second. Every
+      # Check() call increments authz_decisions_total exactly once (allow or
+      # deny), so this is a direct decision-rate signal, computed from the
+      # counter scraped by the ServiceMonitor (serviceMonitor.enabled: true
+      # in Helm values).
+      - seriesQuery: 'authz_decisions_total{namespace!="",pod!=""}'
+        resources:
+          overrides:
+            namespace:
+              resource: namespace
+            pod:
+              resource: pod
+        name:
+          matches: "^(.*)_total$"
+          as: "${1}_per_second"
+        metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'

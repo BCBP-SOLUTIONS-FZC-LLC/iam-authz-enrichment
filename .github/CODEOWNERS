@@ -1,0 +1,32 @@
+# Default: every file requires review from the IAM team.
+* @BCBP-SOLUTIONS-FZC-LLC/iam-team
+
+# Workflow and CI changes require explicit sign-off.
+.github/workflows/ @BCBP-SOLUTIONS-FZC-LLC/iam-team
+.github/dependabot.yml @BCBP-SOLUTIONS-FZC-LLC/iam-team
+
+# Envoy ext_authz contract — the gRPC surface every service behind this filter
+# depends on. Changes to request decoding, response headers, or DenyReason
+# mapping ripple to every downstream consumer.
+internal/adapter/inbound/grpc/ @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTIONS-FZC-LLC/platform-team
+
+# Domain model — DenyReason enum, policy predicates, cache value objects.
+# Structural changes here ripple through every layer.
+internal/domain/ @BCBP-SOLUTIONS-FZC-LLC/iam-team
+
+# §3.1 precedence chain and §7 failure-handling matrix — the core authorization
+# decision logic. Reordering or weakening a check here is a security-relevant change.
+internal/usecase/ @BCBP-SOLUTIONS-FZC-LLC/iam-team
+
+# §5 event consumers — payload shape changes affect the five upstream publishers
+# (Membership, User, Billing, Tenant, Tender services), not just this repo.
+internal/adapter/inbound/consumer/ @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTIONS-FZC-LLC/platform-team
+
+# Cache key schema and TTLs — §4. A key-shape change without a coordinated
+# rollout can strand stale entries under the old key indefinitely.
+internal/adapter/outbound/valkey/ @BCBP-SOLUTIONS-FZC-LLC/iam-team
+
+# Deployment config — Helm chart, IAM policy, and alerting rules applied by
+# the platform CD pipeline. A NetworkPolicy or IAM-policy change here can
+# take the service (and everything behind Envoy's ext_authz filter) offline.
+deploy/ @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTIONS-FZC-LLC/platform-team

@@ -1,0 +1,31 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConsumeAuthzEvents",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": [
+        "${membership_authz_queue_arn}",
+        "${user_authz_queue_arn}",
+        "${billing_authz_queue_arn}",
+        "${tenant_authz_queue_arn}",
+        "${tender_authz_queue_arn}"
+      ]
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/eks/*:*"
+    }
+  ]
+}

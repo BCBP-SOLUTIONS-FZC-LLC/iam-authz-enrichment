@@ -1,0 +1,73 @@
+services:
+  app:
+    build: .
+    ports:
+      - "9091:9091"
+      - "8080:8080"
+    environment:
+      APP_ENV: dev
+      APP_NAME: iam-authz-enrichment
+      APP_PORT: "8080"
+      GRPC_PORT: "9091"
+      VALKEY_URL: valkey:6379
+      ORG_MEMBERSHIP_BASE_URL: http://host.docker.internal:8081
+      AWS_REGION: ap-south-1
+      AWS_ACCESS_KEY_ID: localstack
+      AWS_SECRET_ACCESS_KEY: localstack
+      AWS_ENDPOINT_URL: http://localstack:4566
+      MEMBERSHIP_AUTHZ_QUEUE_URL: http://localstack:4566/000000000000/membership-authz-q
+      USER_AUTHZ_QUEUE_URL: http://localstack:4566/000000000000/user-authz-q
+      BILLING_AUTHZ_QUEUE_URL: http://localstack:4566/000000000000/billing-authz-q
+      TENANT_AUTHZ_QUEUE_URL: http://localstack:4566/000000000000/tenant-authz-q
+      TENDER_AUTHZ_QUEUE_URL: http://localstack:4566/000000000000/tender-authz-q
+      SHARED_REALM_ISSUER: https://kc.example.com/realms/shared-trial
+    depends_on:
+      valkey:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  localstack:
+    # Community edition — SQS only, no licence required. This service
+    # consumes only (§1); local dev/integration tests create the five
+    # queues directly (scripts/init-localstack.sh) rather than routing
+    # through SNS, since there's nothing to publish here.
+    image: localstack/localstack:4.4.0
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs
+      DEBUG: 0
+      AWS_DEFAULT_REGION: ap-south-1
+      # Optional — Community edition (this image) works fine without it.
+      # Only relevant if you're also using LocalStack Desktop's Pro login;
+      # this service has no feature that actually requires Pro (§ see
+      # README "Testing events locally" — SQS is Community-tier already).
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/init-localstack.sh:/etc/localstack/init/ready.d/init-localstack.sh
+    healthcheck:
+      test: ["CMD", "awslocal", "sqs", "list-queues"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  localstack_data:

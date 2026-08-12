@@ -1,0 +1,25 @@
+# Version control
+.git
+.gitignore
+
+# Environment files — never bake secrets into the image
+.env
+.env-example
+
+# Development tooling and docs
+.claude/
+*.md
+README.md
+
+# Test artefacts
+test/
+coverage.out
+coverage.html
+*.coverprofile
+
+# Build artefacts already compiled outside Docker
+bin/
+
+# IDE and OS noise
+.idea/
+.DS_Store

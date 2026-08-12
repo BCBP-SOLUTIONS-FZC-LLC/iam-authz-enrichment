@@ -1,0 +1,31 @@
+graph LR
+    cmd(["cmd/server"])
+    grpc(["adapter/inbound/grpc"])
+    http(["adapter/inbound/http"])
+    consumer(["adapter/inbound/consumer"])
+    valkey(["adapter/outbound/valkey"])
+    orgmembership(["adapter/outbound/orgmembership"])
+    metrics(["adapter/outbound/metrics"])
+    usecase(["usecase"])
+    policy(["domain/policy"])
+    domain(["domain"])
+    config(["config"])
+
+    cmd --> grpc & http & consumer
+    cmd --> valkey & orgmembership & metrics
+    cmd --> usecase & policy & domain & config
+
+    grpc --> usecase & policy & domain
+    consumer --> usecase & policy & domain
+    http --> domain
+
+    usecase --> policy & domain
+
+    valkey --> policy & domain
+    orgmembership --> policy & domain
+    metrics --> policy & domain
+
+    policy --> domain
+
+    config --- config_note["no internal deps — pure env-var loading"]
+

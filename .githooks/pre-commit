@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Local commit gates: formatting and lint.
+set -euo pipefail
+
+echo "[pre-commit] running tidy..."
+make tidy
+
+echo "[pre-commit] running fmt-check..."
+make fmt-check
+
+echo "[pre-commit] running lint..."
+make lint

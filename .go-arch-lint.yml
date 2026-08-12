@@ -1,0 +1,95 @@
+version: 3
+workdir: .
+
+allow:
+  depOnAnyVendor: true
+  deepScan: false
+
+# Tests and dev tooling are not part of the runtime architecture.
+exclude:
+  - test
+  - scripts
+
+excludeFiles:
+  - '.*_test\.go$'
+
+components:
+  domain:
+    in: internal/domain
+
+  # A subdirectory of domain (§1's mandated layout), but its own Go package
+  # and its own arch-lint component: policy predicates depend on domain's
+  # value types but domain itself has zero internal deps.
+  policy:
+    in: internal/domain/policy
+
+  config:
+    in: internal/config
+
+  usecase:
+    in: internal/usecase
+
+  adapters_inbound:
+    in:
+      - internal/adapter/inbound/grpc
+      - internal/adapter/inbound/http
+      - internal/adapter/inbound/consumer
+
+  adapters_outbound:
+    in:
+      - internal/adapter/outbound/valkey
+      - internal/adapter/outbound/orgmembership
+      - internal/adapter/outbound/metrics
+
+  cmd:
+    in:
+      - cmd/server
+
+deps:
+  # domain: no internal imports at all — pure value types + sentinel errors.
+  domain:
+    anyVendorDeps: true
+
+  # policy: pure predicate functions over domain value types (§3: no I/O).
+  policy:
+    mayDependOn:
+      - domain
+
+  # config: plain env-var loading, no internal deps.
+  config:
+    anyVendorDeps: true
+
+  # usecase: domain + policy only — orchestration depends on the ports it
+  # declares itself (internal/usecase/ports.go), never on a concrete adapter
+  # or on config (TTLs/timeouts arrive as plain constructor parameters).
+  usecase:
+    mayDependOn:
+      - domain
+      - policy
+
+  # inbound adapters: usecase (the orchestration layer they call into) +
+  # domain + policy. Never another adapter, never config directly (cmd wires
+  # config values into constructor parameters).
+  adapters_inbound:
+    mayDependOn:
+      - usecase
+      - domain
+      - policy
+
+  # outbound adapters: domain + policy only — they implement usecase's port
+  # interfaces structurally and must never import usecase itself, or they'd
+  # create the exact import cycle Clean Architecture forbids.
+  adapters_outbound:
+    mayDependOn:
+      - domain
+      - policy
+
+  # composition root: wires everything together — may import all layers.
+  cmd:
+    mayDependOn:
+      - domain
+      - policy
+      - config
+      - usecase
+      - adapters_inbound
+      - adapters_outbound

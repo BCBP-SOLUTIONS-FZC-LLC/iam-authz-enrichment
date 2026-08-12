@@ -1,0 +1,35 @@
+iam-authz-enrichment {{ .Chart.Version }} deployed.
+
+━━ REQUIRED ACTIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{{ if not .Values.existingSecret -}}
+⚠  Credentials are stored in Helm release history (base64, not encrypted).
+   Migrate to External Secrets Operator or AWS Secrets Manager CSI:
+     existingSecret: "iam-authz-enrichment-secrets"
+   Then remove secretValues from your values file.
+
+{{ end -}}
+{{ if not .Values.networkPolicy.enabled -}}
+⚠  networkPolicy.enabled is false. The /metrics endpoint is unauthenticated
+   and reachable by any pod in the cluster. Enable in production:
+     networkPolicy.enabled: true
+   Ensure the Envoy namespace label matches:
+     envoyNamespaceSelector: {{ .Values.networkPolicy.envoyNamespaceSelector | toJson }}
+
+{{ end -}}
+⚠  Point Envoy's ext_authz filter at this Service's grpc port — there is no
+   Ingress/HTTPRoute/GRPCRoute to configure; Authorization.Check is reached
+   by cluster DNS directly (README § Envoy configuration sketch):
+     {{ include "iam-authz-enrichment.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.grpcPort }}
+
+━━ VERIFY DEPLOYMENT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  kubectl rollout status deployment/{{ include "iam-authz-enrichment.fullname" . }} -n {{ .Release.Namespace }}
+  kubectl get pods -l {{ include "iam-authz-enrichment.selectorLabels" . | replace ": " "=" | replace "\n" "," }}
+
+  # Smoke-test the grpc port from inside the cluster (requires grpcurl in the debug pod):
+  kubectl run grpcurl --rm -it --restart=Never --image=fullstorydev/grpcurl -- \
+    -plaintext {{ include "iam-authz-enrichment.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.grpcPort }} list
+
+Readiness: (cluster-internal only) http://<pod-ip>:{{ .Values.service.httpPort }}/readyz — reports process startup only, NOT dependency health (§7: bypass, not fail).
+Metrics:   (cluster-internal only) http://<pod-ip>:{{ .Values.service.httpPort }}/metrics
