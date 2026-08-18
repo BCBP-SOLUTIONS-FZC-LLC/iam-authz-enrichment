@@ -98,7 +98,7 @@ jobs:
 
       # Build and write all layers to GHA + registry cache (no local load needed here).
       - name: Build image → cache
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -125,7 +125,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       # Restore from GHA cache (all layers cached → near-instant rebuild).
       - name: Load image from cache
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -155,7 +155,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       # Restore from GHA cache (all layers cached → near-instant rebuild).
       - name: Load image from cache
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -287,7 +287,7 @@ jobs:
 
       - name: Build and push
         id: pushed
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
