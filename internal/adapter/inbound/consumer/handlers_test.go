@@ -37,6 +37,22 @@ func TestMembershipHandler_KnownType_Evicts(t *testing.T) {
 	assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:tenant-1:alice")
 }
 
+func TestMembershipHandler_MembershipRevoked_EvictsTenderACLToo(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	deps := testDeps(cache)
+	handler := membershipHandler(deps)
+
+	err := handler(context.Background(), envelope(t, "MembershipRevoked", "tenant-1", map[string]string{"user_id": "alice"}))
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"EvictMembershipContext:tenant-1:alice",
+		"EvictNegative:tenant-1:alice",
+		"EvictTenderACLForUser:tenant-1:alice",
+	}, cache.SortedCalls())
+}
+
 func badPayloadEnvelope(eventType string) events.Envelope[json.RawMessage] {
 	return events.Envelope[json.RawMessage]{ID: "evt-1", Type: eventType, TenantID: "tenant-1", Payload: json.RawMessage(`"not-an-object"`)}
 }

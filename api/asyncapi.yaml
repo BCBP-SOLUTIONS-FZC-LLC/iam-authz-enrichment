@@ -1,0 +1,1153 @@
+asyncapi: 3.0.0
+
+info:
+  title: AuthZ Enrichment Service — Events
+  version: "1.0.0"
+  description: |
+    Event contract for `iam-authz-enrichment`, the platform's Envoy
+    `ext_authz` v3 Policy Decision Point (PDP).
+
+    This service is **receive-only** on the event bus: it consumes 15 event
+    types across five independent SQS queues and publishes **zero**
+    events — it has no state changes of its own to announce
+    (`internal/adapter/inbound/consumer`'s own package doc: "This service
+    consumes only — it publishes nothing"). There is no outbox table, no
+    SNS/EventBridge producer, and no database of any kind — every event
+    received is a cache-invalidation trigger against this service's own
+    Valkey cache (LLD §6, §7), never a domain state mutation of its own.
+
+    Producers, one set of event types per queue:
+
+      Queue                 Producer(s)                            Events
+      ──────────────────────────────────────────────────────────────────
+      membership-authz-q    Org & Membership (iam-org-membership)   6
+      user-authz-q          User Profile (iam-user-profile)         3
+      billing-authz-q       Billing Service                         3
+      tenant-authz-q        Realm Provisioner                       2
+      tender-authz-q        Tender Service                          1
+
+    This service owns none of these schemas — every message definition below
+    is consumer-side documentation of an upstream contract, kept in sync
+    with the producer, not the source of truth for it (the same convention
+    `iam-tender-acl`'s own asyncapi.yaml already established for its two
+    consumed event types). Where the producer's own published asyncapi.yaml
+    was directly available (Org & Membership's `membership-authz-q` events,
+    User Profile's `user-authz-q` events), the schemas below were verified
+    against it field-for-field. Where it was not (Billing Service, Realm
+    Provisioner, Tender Service — no asyncapi.yaml available in this
+    workspace), the schemas below reflect only what this service's own code
+    actually reads, explicitly flagged per-message below.
+
+    Idempotency: unlike every other IAM service, this service has **no
+    database**, so there is no `processed_events` table. Idempotency is
+    instead a Valkey `SET NX` on `ae:processed:{event_id}` (7-day TTL,
+    matching the SQS message-lifetime convention) — the functional
+    equivalent of `INSERT ... ON CONFLICT DO NOTHING` for a service with
+    nothing to insert into (LLD §7.6). A handler failure explicitly evicts
+    the just-set marker (`EvictProcessed`) so a genuinely-failing message
+    still counts toward `maxReceiveCount` and reaches its DLQ, instead of
+    being falsely treated as already-processed on redelivery.
+
+    DLQ: all five queues follow the identical, purely SQS-native
+    convention — `maxReceiveCount=5` before a message lands in its own
+    `-dlq`, configured on the queue resource itself
+    (`scripts/init-localstack.sh`), never in application code. Because
+    every event here is a cache-invalidation trigger rather than a state
+    mutation, a DLQ'd message degrades to "this cache entry may be stale
+    until its TTL naturally expires" (5–60s, LLD §6.1) rather than a
+    correctness failure requiring replay (LLD §7.7).
+  x-consumer-behavior:
+    DepartmentMembershipGranted:
+      on_receipt:
+        - "Evict ae:ctx:{tenant}:{user}"
+        - "Evict ae:neg:{tenant}:{user}"
+      publishes_events: false
+    DepartmentMembershipRevoked:
+      on_receipt:
+        - "Evict ae:ctx:{tenant}:{user}"
+        - "Evict ae:neg:{tenant}:{user}"
+      publishes_events: false
+    DepartmentMembershipLevelChanged:
+      on_receipt:
+        - "Evict ae:ctx:{tenant}:{user}"
+        - "Evict ae:neg:{tenant}:{user}"
+      publishes_events: false
+    TenantRoleGranted:
+      on_receipt:
+        - "Evict ae:ctx:{tenant}:{user}"
+        - "Evict ae:neg:{tenant}:{user}"
+      publishes_events: false
+    TenantRoleRevoked:
+      on_receipt:
+        - "Evict ae:ctx:{tenant}:{user}"
+        - "Evict ae:neg:{tenant}:{user}"
+      publishes_events: false
+    MembershipRevoked:
+      on_receipt:
+        - "Evict ae:ctx:{tenant}:{user}"
+        - "Evict ae:neg:{tenant}:{user}"
+        - "Best-effort evict every ae:tender_acl:{tenant}:*:{user} entry"
+      publishes_events: false
+      note: >-
+        LLD §16 AE-20 — Org & Membership's per-user removal cascade signal.
+        A full member removal soft-deletes the tenant_memberships row and
+        leaves the user's per-grant rows inert rather than firing
+        DepartmentMembershipRevoked/TenantRoleRevoked individually, so this
+        is the only membership-authz-q event that fires on a whole-
+        membership removal — and gets a wider eviction than the other five
+        as a result. The tender-ACL eviction is best-effort: a failure logs
+        a warning but never fails the event (a partial scan degrades to
+        "stale until its 15s TTL expires", not a correctness failure).
+    UserUpdated:
+      on_receipt:
+        - "If changed_fields includes \"email\": evict ae:ctx:{tenant}:{user} + ae:neg:{tenant}:{user}"
+        - "Any other changed_fields value: no-op"
+      publishes_events: false
+      note: >-
+        The only membership/user-queue event with a payload-content filter —
+        every other event type here evicts unconditionally on receipt.
+    UserAvailabilityChanged:
+      on_receipt:
+        - "Evict ae:ctx:{tenant}:{user}"
+        - "Evict ae:neg:{tenant}:{user}"
+      publishes_events: false
+      note: >-
+        Historically evicted because a user's active_delegations[] rode the
+        I-8 projection and availability changes shifted delegation state;
+        the delegations extraction (LLD §16 AE-18) dropped that field from
+        I-8 entirely, so this eviction is no longer load-bearing for any
+        authz fact — retained unconditionally rather than turned into a
+        no-op, since evicting an already-fresh key is harmless and removing
+        the subscription entirely is a separate, not-yet-made decision.
+    UserDeleted:
+      on_receipt:
+        - "Evict ae:ctx:{tenant}:{user}"
+        - "Evict ae:neg:{tenant}:{user}"
+        - "Best-effort evict every ae:tender_acl:{tenant}:*:{user} entry"
+      publishes_events: false
+    TenantPlanChanged:
+      on_receipt:
+        - "Evict ae:tenant:{tenant} (single key — no payload decode needed beyond the envelope's own tenant_id)"
+      publishes_events: false
+    TenantSubscriptionCancelled:
+      on_receipt:
+        - "Evict ae:tenant:{tenant} (single key — no payload decode needed beyond the envelope's own tenant_id)"
+      publishes_events: false
+    TenantReactivated:
+      on_receipt:
+        - "Evict ae:tenant:{tenant} (single key — no payload decode needed beyond the envelope's own tenant_id)"
+      publishes_events: false
+    TenantConverted:
+      on_receipt:
+        - "Update the in-process realm→tenant map (realm from payload → this event's tenant_id)"
+        - "Evict ae:tenant:{tenant}"
+      publishes_events: false
+      note: >-
+        Realm strategy changed (shared → dedicated), so the tenant-scoped
+        cache slice is stale and the realm map needs the new mapping for
+        future JWT `iss`-based tenant resolution (LLD §8.3).
+    TenantRealmReady:
+      on_receipt:
+        - "Update the in-process realm→tenant map (realm from payload → this event's tenant_id) — NO cache eviction"
+      publishes_events: false
+      note: >-
+        Wiring this (not just TenantConverted) matters: a newly-dedicated
+        realm created via direct-paid signup fires only TenantRealmReady,
+        never TenantConverted (LLD §5).
+    TenderRestricted:
+      on_receipt:
+        - "Flip the in-memory restricted-tender fact for (tenant, tender) — NOT a cache eviction"
+      publishes_events: false
+      note: >-
+        The only event in this document that doesn't touch Valkey at all —
+        RestrictedTenderSet is a plain in-process map, independently held
+        per replica (every replica consumes every queue, LLD §3.4), rebuilt
+        from scratch on pod restart by whatever backlog of TenderRestricted
+        events SQS still has undelivered.
+
+defaultContentType: application/json
+
+tags:
+  - $ref: "#/components/tags/consumed"
+  - $ref: "#/components/tags/published"
+
+servers:
+  membershipAuthZQueue:
+    host: sqs.amazonaws.com
+    protocol: sqs
+    description: >-
+      AWS SQS queue `membership-authz-q`, consumed by this service.
+      Companion dead-letter queue `membership-authz-q-dlq` receives
+      messages after `maxReceiveCount=5` failed processing attempts
+      (`scripts/init-localstack.sh`). Reachable only internally
+      (VPC endpoint / mesh-restricted).
+    bindings:
+      sqs:
+        queueUrl: "https://sqs.ap-south-1.amazonaws.com/000000000000/membership-authz-q"
+
+  userAuthZQueue:
+    host: sqs.amazonaws.com
+    protocol: sqs
+    description: >-
+      AWS SQS queue `user-authz-q`, consumed by this service. Companion
+      dead-letter queue `user-authz-q-dlq` receives messages after
+      `maxReceiveCount=5` failed processing attempts.
+    bindings:
+      sqs:
+        queueUrl: "https://sqs.ap-south-1.amazonaws.com/000000000000/user-authz-q"
+
+  billingAuthZQueue:
+    host: sqs.amazonaws.com
+    protocol: sqs
+    description: >-
+      AWS SQS queue `billing-authz-q`, consumed by this service. Companion
+      dead-letter queue `billing-authz-q-dlq` receives messages after
+      `maxReceiveCount=5` failed processing attempts.
+    bindings:
+      sqs:
+        queueUrl: "https://sqs.ap-south-1.amazonaws.com/000000000000/billing-authz-q"
+
+  tenantAuthZQueue:
+    host: sqs.amazonaws.com
+    protocol: sqs
+    description: >-
+      AWS SQS queue `tenant-authz-q`, consumed by this service. Companion
+      dead-letter queue `tenant-authz-q-dlq` receives messages after
+      `maxReceiveCount=5` failed processing attempts.
+    bindings:
+      sqs:
+        queueUrl: "https://sqs.ap-south-1.amazonaws.com/000000000000/tenant-authz-q"
+
+  tenderAuthZQueue:
+    host: sqs.amazonaws.com
+    protocol: sqs
+    description: >-
+      AWS SQS queue `tender-authz-q`, consumed by this service. Companion
+      dead-letter queue `tender-authz-q-dlq` receives messages after
+      `maxReceiveCount=5` failed processing attempts.
+    bindings:
+      sqs:
+        queueUrl: "https://sqs.ap-south-1.amazonaws.com/000000000000/tender-authz-q"
+
+channels:
+  membership-authz-q:
+    address: membership-authz-q
+    title: Membership and role events (AuthZ Enrichment consumer)
+    description: >-
+      Six event types, all evicting the per-user ae:ctx slice; MembershipRevoked
+      additionally evicts ae:tender_acl (§16 AE-20).
+    servers:
+      - $ref: "#/servers/membershipAuthZQueue"
+    messages:
+      DepartmentMembershipGranted:
+        $ref: "#/components/messages/DepartmentMembershipGranted"
+      DepartmentMembershipRevoked:
+        $ref: "#/components/messages/DepartmentMembershipRevoked"
+      DepartmentMembershipLevelChanged:
+        $ref: "#/components/messages/DepartmentMembershipLevelChanged"
+      TenantRoleGranted:
+        $ref: "#/components/messages/TenantRoleGranted"
+      TenantRoleRevoked:
+        $ref: "#/components/messages/TenantRoleRevoked"
+      MembershipRevoked:
+        $ref: "#/components/messages/MembershipRevoked"
+    bindings:
+      sqs:
+        queue:
+          name: membership-authz-q
+          fifoQueue: false
+        deadLetterQueue:
+          name: membership-authz-q-dlq
+          maxReceiveCount: 5
+
+  user-authz-q:
+    address: user-authz-q
+    title: User lifecycle events (AuthZ Enrichment consumer)
+    description: >-
+      Three event types from User Profile. UserUpdated evicts only when
+      "email" is in changed_fields; UserAvailabilityChanged and UserDeleted
+      evict unconditionally, the latter also best-effort-evicting
+      ae:tender_acl.
+    servers:
+      - $ref: "#/servers/userAuthZQueue"
+    messages:
+      UserUpdated:
+        $ref: "#/components/messages/UserUpdated"
+      UserAvailabilityChanged:
+        $ref: "#/components/messages/UserAvailabilityChanged"
+      UserDeleted:
+        $ref: "#/components/messages/UserDeleted"
+    bindings:
+      sqs:
+        queue:
+          name: user-authz-q
+          fifoQueue: false
+        deadLetterQueue:
+          name: user-authz-q-dlq
+          maxReceiveCount: 5
+
+  billing-authz-q:
+    address: billing-authz-q
+    title: Billing / subscription events (AuthZ Enrichment consumer)
+    description: >-
+      Three event types, all evicting the same single tenant-scoped key
+      (ae:tenant:{tenant}) regardless of which fired — no payload decode
+      needed beyond the envelope's own tenant_id.
+    servers:
+      - $ref: "#/servers/billingAuthZQueue"
+    messages:
+      TenantPlanChanged:
+        $ref: "#/components/messages/TenantPlanChanged"
+      TenantSubscriptionCancelled:
+        $ref: "#/components/messages/TenantSubscriptionCancelled"
+      TenantReactivated:
+        $ref: "#/components/messages/TenantReactivated"
+    bindings:
+      sqs:
+        queue:
+          name: billing-authz-q
+          fifoQueue: false
+        deadLetterQueue:
+          name: billing-authz-q-dlq
+          maxReceiveCount: 5
+
+  tenant-authz-q:
+    address: tenant-authz-q
+    title: Tenant realm events (AuthZ Enrichment consumer)
+    description: >-
+      Two event types that keep the in-process realm→tenant map fresh for
+      JWT-issuer-based tenant resolution (LLD §8.3). Only TenantConverted
+      also evicts ae:tenant.
+    servers:
+      - $ref: "#/servers/tenantAuthZQueue"
+    messages:
+      TenantConverted:
+        $ref: "#/components/messages/TenantConverted"
+      TenantRealmReady:
+        $ref: "#/components/messages/TenantRealmReady"
+    bindings:
+      sqs:
+        queue:
+          name: tenant-authz-q
+          fifoQueue: false
+        deadLetterQueue:
+          name: tenant-authz-q-dlq
+          maxReceiveCount: 5
+
+  tender-authz-q:
+    address: tender-authz-q
+    title: Tender restriction events (AuthZ Enrichment consumer)
+    description: >-
+      One event type. Flips an in-process fact (not a cache eviction) that
+      the §3.1 step-4 tender-ACL overlay reads to decide whether a
+      tender-scoped request needs the overlay check at all.
+    servers:
+      - $ref: "#/servers/tenderAuthZQueue"
+    messages:
+      TenderRestricted:
+        $ref: "#/components/messages/TenderRestricted"
+    bindings:
+      sqs:
+        queue:
+          name: tender-authz-q
+          fifoQueue: false
+        deadLetterQueue:
+          name: tender-authz-q-dlq
+          maxReceiveCount: 5
+
+operations:
+  receiveMembershipAuthZ:
+    action: receive
+    channel:
+      $ref: "#/channels/membership-authz-q"
+    title: Receive membership and role events
+    summary: Evict per-user membership cache on department/role grants, revokes, and whole-membership removal.
+    description: >-
+      Receives any of six event types from membership-authz-q and, if the
+      envelope's event id has not already been marked processed
+      (ae:processed:{event_id} — SET NX, §7.6), evicts ae:ctx:{tenant}:{user}
+      and ae:neg:{tenant}:{user} for the affected user. MembershipRevoked
+      additionally best-effort-evicts every ae:tender_acl entry for that
+      user (§16 AE-20). There are no `send` operations anywhere in this
+      document — this service publishes nothing.
+    messages:
+      - $ref: "#/channels/membership-authz-q/messages/DepartmentMembershipGranted"
+      - $ref: "#/channels/membership-authz-q/messages/DepartmentMembershipRevoked"
+      - $ref: "#/channels/membership-authz-q/messages/DepartmentMembershipLevelChanged"
+      - $ref: "#/channels/membership-authz-q/messages/TenantRoleGranted"
+      - $ref: "#/channels/membership-authz-q/messages/TenantRoleRevoked"
+      - $ref: "#/channels/membership-authz-q/messages/MembershipRevoked"
+
+  receiveUserAuthZ:
+    action: receive
+    channel:
+      $ref: "#/channels/user-authz-q"
+    title: Receive user lifecycle events
+    summary: Evict per-user membership cache on an email change, availability change, or account deletion.
+    description: >-
+      Receives any of three event types from user-authz-q. UserUpdated
+      evicts only when changed_fields includes "email" (a consumer-side
+      filter, not an SNS attribute filter); UserAvailabilityChanged and
+      UserDeleted evict unconditionally. UserDeleted additionally
+      best-effort-evicts every ae:tender_acl entry for that user.
+    messages:
+      - $ref: "#/channels/user-authz-q/messages/UserUpdated"
+      - $ref: "#/channels/user-authz-q/messages/UserAvailabilityChanged"
+      - $ref: "#/channels/user-authz-q/messages/UserDeleted"
+
+  receiveBillingAuthZ:
+    action: receive
+    channel:
+      $ref: "#/channels/billing-authz-q"
+    title: Receive billing / subscription events
+    summary: Evict the tenant-scoped cache slice on a plan change, cancellation, or reactivation.
+    description: >-
+      Receives any of three event types from billing-authz-q and evicts
+      ae:tenant:{tenant} — a single key, regardless of which of the three
+      fired, since all three affect the same tenant-scoped cache slice
+      (plan, feature_flags, subscription_status, read_only).
+    messages:
+      - $ref: "#/channels/billing-authz-q/messages/TenantPlanChanged"
+      - $ref: "#/channels/billing-authz-q/messages/TenantSubscriptionCancelled"
+      - $ref: "#/channels/billing-authz-q/messages/TenantReactivated"
+
+  receiveTenantAuthZ:
+    action: receive
+    channel:
+      $ref: "#/channels/tenant-authz-q"
+    title: Receive tenant realm events
+    summary: Keep the in-process realm→tenant map current for JWT-issuer-based tenant resolution.
+    description: >-
+      Receives TenantConverted or TenantRealmReady and updates the
+      in-process realm→tenant map. TenantConverted additionally evicts
+      ae:tenant:{tenant} (the realm strategy changed, so the cached slice
+      is stale); TenantRealmReady never evicts anything.
+    messages:
+      - $ref: "#/channels/tenant-authz-q/messages/TenantConverted"
+      - $ref: "#/channels/tenant-authz-q/messages/TenantRealmReady"
+
+  receiveTenderAuthZ:
+    action: receive
+    channel:
+      $ref: "#/channels/tender-authz-q"
+    title: Receive tender restriction events
+    summary: Flip the in-process restricted-tender fact the tender-ACL overlay reads.
+    description: >-
+      Receives TenderRestricted and marks (tenant, tender) restricted in
+      an in-process set — not a Valkey write. The §3.1 step-4 tender-ACL
+      overlay only calls out to the Tender ACL Service (TAC-4) for a tender
+      this set marks restricted; every other tender-scoped request skips
+      the overlay entirely.
+    messages:
+      - $ref: "#/channels/tender-authz-q/messages/TenderRestricted"
+
+components:
+  tags:
+    consumed:
+      name: consumed
+      description: >-
+        This service is the consumer, not the producer, for every message
+        carrying this tag. Canonical schema ownership sits with the
+        producing service — these definitions are this service's
+        consumer-side documentation, kept in sync with upstream, not the
+        source of truth for it.
+    published:
+      name: published
+      description: >-
+        This service publishes zero events — no message in this document
+        carries this tag. Declared for symmetry with every sibling
+        service's asyncapi.yaml (the same convention iam-tender-acl's
+        asyncapi.yaml already established), and so a Published/Consumed
+        viewer has somewhere to render a message if that ever changes,
+        which as of this revision it never has: this is, and is designed
+        to remain, a pure event sink.
+
+  messages:
+    DepartmentMembershipGranted:
+      name: DepartmentMembershipGranted
+      title: Department Membership Granted
+      summary: A user was granted membership in a department at a given level.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/DepartmentMembershipGrantedPayload"
+      examples:
+        - name: DepartmentMembershipGrantedExample
+          summary: A typical DepartmentMembershipGranted event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d4e"
+            type: "DepartmentMembershipGranted"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:15:00Z"
+            data:
+              user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
+              tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+              department_id: "fd72f513-45f0-46ca-a1ed-9183be72484c"
+              level: "reviewer"
+              actor_id: "1a2b3c4d-5555-4e6f-9a0b-000000000003"
+      x-consumer-schema-dependency:
+        # Verified field-for-field against iam-org-membership's own
+        # api/asyncapi.yaml (components.schemas.DepartmentMembershipGrantedPayload).
+        # This service reads only user_id from the payload (usecase.
+        # MembershipEventPayload) — department_id/level/actor_id are decoded
+        # by the producer's schema but not consumed here; the eviction is
+        # the same single ae:ctx key regardless of which fact changed.
+        depends-on-shape:
+          user_id: uuid
+          tenant_id: uuid
+          department_id: uuid
+          level: "preparator | reviewer | approver"
+          actor_id: uuid
+        producer-lifecycle-status: stable
+
+    DepartmentMembershipRevoked:
+      name: DepartmentMembershipRevoked
+      title: Department Membership Revoked
+      summary: A user's membership in a department was revoked.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/DepartmentMembershipRevokedPayload"
+      examples:
+        - name: DepartmentMembershipRevokedExample
+          summary: A typical DepartmentMembershipRevoked event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d4f"
+            type: "DepartmentMembershipRevoked"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:16:00Z"
+            data:
+              user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
+              tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+              department_id: "fd72f513-45f0-46ca-a1ed-9183be72484c"
+              actor_id: "1a2b3c4d-5555-4e6f-9a0b-000000000003"
+      x-consumer-schema-dependency:
+        depends-on-shape:
+          user_id: uuid
+          tenant_id: uuid
+          department_id: uuid
+          actor_id: uuid
+        producer-lifecycle-status: stable
+
+    DepartmentMembershipLevelChanged:
+      name: DepartmentMembershipLevelChanged
+      title: Department Membership Level Changed
+      summary: A user's level within a department changed (e.g. reviewer → approver).
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/DepartmentMembershipLevelChangedPayload"
+      examples:
+        - name: DepartmentMembershipLevelChangedExample
+          summary: A typical DepartmentMembershipLevelChanged event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d50"
+            type: "DepartmentMembershipLevelChanged"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:17:00Z"
+            data:
+              user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
+              tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+              department_id: "fd72f513-45f0-46ca-a1ed-9183be72484c"
+              previous_level: "reviewer"
+              new_level: "approver"
+              actor_id: "1a2b3c4d-5555-4e6f-9a0b-000000000003"
+      x-consumer-schema-dependency:
+        depends-on-shape:
+          user_id: uuid
+          tenant_id: uuid
+          department_id: uuid
+          previous_level: "preparator | reviewer | approver"
+          new_level: "preparator | reviewer | approver"
+          actor_id: uuid
+        producer-lifecycle-status: stable
+
+    TenantRoleGranted:
+      name: TenantRoleGranted
+      title: Tenant Role Granted
+      summary: A user was granted a tenant-level role.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/TenantRoleGrantedPayload"
+      examples:
+        - name: TenantRoleGrantedExample
+          summary: A typical TenantRoleGranted event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d51"
+            type: "TenantRoleGranted"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:18:00Z"
+            data:
+              user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
+              tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+              role_code: "tenant_admin"
+              actor_id: "1a2b3c4d-5555-4e6f-9a0b-000000000003"
+      x-consumer-schema-dependency:
+        depends-on-shape:
+          user_id: uuid
+          tenant_id: uuid
+          role_code: "tenant_owner | tenant_admin | tender_admin"
+          actor_id: uuid
+        producer-lifecycle-status: stable
+
+    TenantRoleRevoked:
+      name: TenantRoleRevoked
+      title: Tenant Role Revoked
+      summary: A user's tenant-level role was revoked.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/TenantRoleRevokedPayload"
+      examples:
+        - name: TenantRoleRevokedExample
+          summary: A typical TenantRoleRevoked event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d52"
+            type: "TenantRoleRevoked"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:19:00Z"
+            data:
+              user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
+              tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+              role_code: "tenant_admin"
+              actor_id: "1a2b3c4d-5555-4e6f-9a0b-000000000003"
+      x-consumer-schema-dependency:
+        depends-on-shape:
+          user_id: uuid
+          tenant_id: uuid
+          role_code: "tenant_owner | tenant_admin | tender_admin"
+          actor_id: uuid
+        producer-lifecycle-status: stable
+
+    MembershipRevoked:
+      name: MembershipRevoked
+      title: Membership Revoked
+      summary: A user's entire tenant membership was removed (not a single grant) — the whole-membership-removal cascade signal.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/MembershipRevokedPayload"
+      examples:
+        - name: MembershipRevokedExample
+          summary: A typical MembershipRevoked event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d53"
+            type: "MembershipRevoked"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:20:00Z"
+            data:
+              tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+              user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
+              actor_id: "1a2b3c4d-5555-4e6f-9a0b-000000000003"
+      x-consumer-schema-dependency:
+        # Verified against iam-org-membership's asyncapi.yaml
+        # (components.schemas.MembershipRevokedPayload) — confirmed
+        # required: tenant_id, user_id; actor_id optional (absent for
+        # system-driven removals). Same event, same schema, this service's
+        # own §16 AE-20 subscription (implemented — see invalidate.go's
+        # HandleMembershipRevoked).
+        depends-on-shape:
+          tenant_id: uuid
+          user_id: "uuid (required — the removed user)"
+          actor_id: "uuid (optional — absent for system-driven removals)"
+        producer-lifecycle-status: stable
+
+    UserUpdated:
+      name: UserUpdated
+      title: User Updated
+      summary: One or more user profile fields changed; this service acts only when "email" is among them.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/UserUpdatedPayload"
+      examples:
+        - name: UserUpdatedExample
+          summary: An email-change event — the only changed_fields value this service acts on.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d54"
+            type: "UserUpdated"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:21:00Z"
+            data:
+              user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
+              changed_fields: ["email"]
+              email: "alice@example.com"
+      x-consumer-schema-dependency:
+        # Verified against iam-user-profile's own api/asyncapi.yaml
+        # (components.schemas.UserUpdatedPayload), which explicitly
+        # annotates its `email` property: "AuthZ Enrichment Service
+        # subscribes to receive this field." changed_fields carries 17
+        # possible values fleet-wide; this service reads only user_id and
+        # checks whether "email" is present — every other value is a no-op.
+        depends-on-shape:
+          user_id: uuid
+          changed_fields: "array of well-known field-name strings, never empty"
+          email: "string, format email — present only when email changed"
+        producer-lifecycle-status: stable
+
+    UserAvailabilityChanged:
+      name: UserAvailabilityChanged
+      title: User Availability Changed
+      summary: A user's availability status (available/busy/ooo) changed.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/UserAvailabilityChangedPayload"
+      examples:
+        - name: UserAvailabilityChangedExample
+          summary: A typical UserAvailabilityChanged event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d55"
+            type: "UserAvailabilityChanged"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:22:00Z"
+            data:
+              user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
+              status: "ooo"
+      x-consumer-schema-dependency:
+        # Verified against iam-user-profile's own api/asyncapi.yaml
+        # (components.schemas.UserAvailabilityChangedPayload). This service
+        # reads only user_id — status/ooo_from/ooo_until/delegate_user_id
+        # are decoded by the producer's schema but not consumed here.
+        depends-on-shape:
+          user_id: uuid
+          status: "available | busy | ooo"
+        producer-lifecycle-status: stable
+
+    UserDeleted:
+      name: UserDeleted
+      title: User Deleted
+      summary: A user's account was soft-deleted (GDPR erasure).
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/UserDeletedPayload"
+      examples:
+        - name: UserDeletedExample
+          summary: A typical UserDeleted event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d56"
+            type: "UserDeleted"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:23:00Z"
+            data:
+              user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
+              deleted_at: "2026-08-26T03:23:00Z"
+      x-consumer-schema-dependency:
+        # Verified against iam-user-profile's own api/asyncapi.yaml
+        # (components.schemas.UserDeletedPayload). This service reads only
+        # user_id — deleted_at is decoded by the producer's schema but not
+        # consumed here.
+        depends-on-shape:
+          user_id: uuid
+          deleted_at: date-time
+        producer-lifecycle-status: stable
+
+    TenantPlanChanged:
+      name: TenantPlanChanged
+      title: Tenant Plan Changed
+      summary: A tenant's subscription plan changed.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/EnvelopeOnlyPayload"
+      examples:
+        - name: TenantPlanChangedExample
+          summary: A typical TenantPlanChanged event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d57"
+            type: "TenantPlanChanged"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:24:00Z"
+            data: {}
+      x-consumer-schema-dependency:
+        # No published asyncapi.yaml was available for the producer
+        # (Billing Service) in this workspace to verify against. This
+        # service's own handler (billingHandler, internal/adapter/inbound/
+        # consumer/handlers.go) decodes NO payload fields at all for this
+        # event type — only the envelope's own tenant_id drives the
+        # eviction (ae:tenant:{tenant}) — so there is nothing to get wrong
+        # here regardless of the producer's actual payload shape.
+        depends-on-shape:
+          note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
+        producer-lifecycle-status: unknown
+
+    TenantSubscriptionCancelled:
+      name: TenantSubscriptionCancelled
+      title: Tenant Subscription Cancelled
+      summary: A tenant's subscription was cancelled (triggers read-only enforcement, LLD §8.7).
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/EnvelopeOnlyPayload"
+      examples:
+        - name: TenantSubscriptionCancelledExample
+          summary: A typical TenantSubscriptionCancelled event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d58"
+            type: "TenantSubscriptionCancelled"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:25:00Z"
+            data: {}
+      x-consumer-schema-dependency:
+        depends-on-shape:
+          note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
+        producer-lifecycle-status: unknown
+
+    TenantReactivated:
+      name: TenantReactivated
+      title: Tenant Reactivated
+      summary: A previously-cancelled tenant subscription was reactivated.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/EnvelopeOnlyPayload"
+      examples:
+        - name: TenantReactivatedExample
+          summary: A typical TenantReactivated event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d59"
+            type: "TenantReactivated"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:26:00Z"
+            data: {}
+      x-consumer-schema-dependency:
+        depends-on-shape:
+          note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
+        producer-lifecycle-status: unknown
+
+    TenantConverted:
+      name: TenantConverted
+      title: Tenant Converted
+      summary: A tenant's realm strategy changed (shared trial realm → dedicated realm).
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/TenantRealmEventPayload"
+      examples:
+        - name: TenantConvertedExample
+          summary: A typical TenantConverted event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d5a"
+            type: "TenantConverted"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:27:00Z"
+            data:
+              realm: "acme-corp"
+      x-consumer-schema-dependency:
+        # No published asyncapi.yaml was available for the producer (Realm
+        # Provisioner) in this workspace to verify against. Reflects only
+        # usecase.TenantRealmEventPayload, the shape this service's own
+        # code (HandleTenantConverted) actually decodes.
+        depends-on-shape:
+          realm: "string — the dedicated realm identifier, used as the JWT iss claim for tenant resolution (LLD §8.3)"
+        producer-lifecycle-status: unknown
+
+    TenantRealmReady:
+      name: TenantRealmReady
+      title: Tenant Realm Ready
+      summary: A dedicated realm finished provisioning and is ready for tenant resolution (fires alone for direct-paid signups, without a preceding TenantConverted).
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/TenantRealmEventPayload"
+      examples:
+        - name: TenantRealmReadyExample
+          summary: A typical TenantRealmReady event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d5b"
+            type: "TenantRealmReady"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:28:00Z"
+            data:
+              realm: "acme-corp"
+      x-consumer-schema-dependency:
+        depends-on-shape:
+          realm: "string — the dedicated realm identifier, used as the JWT iss claim for tenant resolution (LLD §8.3)"
+        producer-lifecycle-status: unknown
+
+    TenderRestricted:
+      name: TenderRestricted
+      title: Tender Restricted
+      summary: A tender was flagged restricted, requiring the tender-ACL overlay check for view/edit/approve actions on it.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/TenderRestrictedPayload"
+      examples:
+        - name: TenderRestrictedExample
+          summary: A typical TenderRestricted event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d5c"
+            type: "TenderRestricted"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T03:29:00Z"
+            data:
+              tender_id: "b1c2d3e4-6666-4f7a-8b9c-000000000004"
+      x-consumer-schema-dependency:
+        # No published asyncapi.yaml was available for the producer
+        # (Tender Service) in this workspace to verify against. Reflects
+        # only usecase.TenderRestrictedPayload, the shape this service's
+        # own code (HandleTenderRestricted) actually decodes.
+        depends-on-shape:
+          tender_id: "uuid — the tender being flagged restricted"
+        producer-lifecycle-status: unknown
+
+  schemas:
+    DepartmentMembershipGrantedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - user_id
+        - tenant_id
+        - department_id
+        - level
+        - actor_id
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: The user granted the department membership. This service's only consumed field.
+        tenant_id:
+          type: string
+          format: uuid
+        department_id:
+          type: string
+          format: uuid
+        level:
+          type: string
+          enum: [preparator, reviewer, approver]
+        actor_id:
+          type: string
+          format: uuid
+
+    DepartmentMembershipRevokedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - user_id
+        - tenant_id
+        - department_id
+        - actor_id
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: The user whose department membership was revoked. This service's only consumed field.
+        tenant_id:
+          type: string
+          format: uuid
+        department_id:
+          type: string
+          format: uuid
+        actor_id:
+          type: string
+          format: uuid
+
+    DepartmentMembershipLevelChangedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - user_id
+        - tenant_id
+        - department_id
+        - previous_level
+        - new_level
+        - actor_id
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: The user whose department level changed. This service's only consumed field.
+        tenant_id:
+          type: string
+          format: uuid
+        department_id:
+          type: string
+          format: uuid
+        previous_level:
+          type: string
+          enum: [preparator, reviewer, approver]
+        new_level:
+          type: string
+          enum: [preparator, reviewer, approver]
+        actor_id:
+          type: string
+          format: uuid
+
+    TenantRoleGrantedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - user_id
+        - tenant_id
+        - role_code
+        - actor_id
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: The user granted the tenant-level role. This service's only consumed field.
+        tenant_id:
+          type: string
+          format: uuid
+        role_code:
+          type: string
+          enum: [tenant_owner, tenant_admin, tender_admin]
+        actor_id:
+          type: string
+          format: uuid
+
+    TenantRoleRevokedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - user_id
+        - tenant_id
+        - role_code
+        - actor_id
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: The user whose tenant-level role was revoked. This service's only consumed field.
+        tenant_id:
+          type: string
+          format: uuid
+        role_code:
+          type: string
+          enum: [tenant_owner, tenant_admin, tender_admin]
+        actor_id:
+          type: string
+          format: uuid
+
+    MembershipRevokedPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - tenant_id
+        - user_id
+      properties:
+        tenant_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+          description: The user removed from the tenant (source of the cascade). This service's only consumed field.
+        actor_id:
+          type: string
+          format: uuid
+          description: >-
+            Principal that performed the removal. Optional — absent for
+            system-driven removals where no HTTP actor context is
+            available.
+
+    UserUpdatedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - user_id
+        - changed_fields
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: This service's only unconditionally-consumed field.
+        changed_fields:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+          description: >-
+            Names of the user fields that changed. This service checks
+            only for the presence of "email" in this array; every other
+            value (of the 17 possible fleet-wide) is a no-op here.
+        email:
+          type: string
+          format: email
+          description: New email value, present only when email changed. Read only when changed_fields includes "email".
+
+    UserAvailabilityChangedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - user_id
+        - status
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: This service's only consumed field.
+        status:
+          type: string
+          enum: [available, busy, ooo]
+
+    UserDeletedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - user_id
+        - deleted_at
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: This service's only consumed field.
+        deleted_at:
+          type: string
+          format: date-time
+
+    EnvelopeOnlyPayload:
+      type: object
+      additionalProperties: true
+      description: >-
+        No payload fields are decoded for this event type — the eviction
+        (ae:tenant:{tenant}) is driven entirely by the envelope's own
+        top-level tenant_id field, common to every event this service
+        consumes. The producer may send an arbitrary data body; this
+        service ignores all of it.
+
+    TenantRealmEventPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - realm
+      properties:
+        realm:
+          type: string
+          description: >-
+            The dedicated realm identifier. Used as the key in this
+            service's in-process realm→tenant map, matched against a JWT's
+            iss claim during tenant resolution (LLD §8.3).
+
+    TenderRestrictedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - tender_id
+      properties:
+        tender_id:
+          type: string
+          format: uuid
+          description: >-
+            The tender being flagged restricted. Recorded in this service's
+            in-process RestrictedTenderSet, keyed by (tenant, tender_id)
+            using the envelope's own tenant_id.

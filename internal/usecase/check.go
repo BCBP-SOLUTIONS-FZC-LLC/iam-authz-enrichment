@@ -111,7 +111,8 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 		return domain.Denied(domain.DenyTenantReadOnly)
 	}
 
-	// §3.1 step 3: base role/department policy — the four HLD-seed policies.
+	// §3.1 step 3: base role/department policy — 3 of the 4 HLD-seed
+	// policies (the 4th, the tender-ACL overlay, runs separately at step 4).
 	if !policy.EvaluateBase(policy.Input{Subject: subject, Membership: membership, Request: reqFacts}) {
 		return domain.Denied(domain.DenyRoleInsufficient)
 	}
@@ -275,7 +276,9 @@ func (c *Checker) resolveTenderACL(ctx context.Context, tenant, tenderID, user s
 // the comment below on why a call failure also denies rather than allowing).
 func (c *Checker) checkMFAFreshness(ctx context.Context, tenant string, claims Claims) bool {
 	mfaCtx, mfaSpan := tracer.Start(ctx, "authz.mfa_freshness_call")
+	mfaStart := c.now()
 	window, err := c.org.GetMFAFreshness(mfaCtx, tenant)
+	c.metrics.ObserveI14Latency(c.now().Sub(mfaStart))
 	mfaSpan.End()
 	if err != nil {
 		// The doc gives tender-ACL its own explicit "fail closed for that

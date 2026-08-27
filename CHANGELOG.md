@@ -6,26 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+This service has no production deployment yet — pre-1.0, still in active development.
+
 ### Added
-- `.github/workflows/release.yml`, triggered by `v*` tags: validate → build (CHANGELOG gate + 5-platform binaries) → docker (semver-tagged image, CVE scan, SBOM, SLSA provenance, Cosign sign) → deploy-gate (live Helm deploy to production + health check, auto-rollback) → publish (GitHub Release with everything attached).
-- `.github/workflows/validate-test.yml` / `validate-quality.yml`, extracted from `ci.yml` as reusable workflows so `release.yml` shares the exact same test/quality gates instead of duplicating them.
-- **Fail-fast startup validation**: `internal/config/config.go`'s `Load()` now returns an error when `ORG_MEMBERSHIP_BASE_URL` is left at its local-dev default outside `APP_ENV=dev` — previously the process started, passed health checks, and silently failed every non-cache-hit request instead. A separate, non-fatal warning logs at startup when neither `SHARED_REALM_ISSUER` nor `REALM_TENANT_MAP_SEED` resolve any tenant (that combination is legitimately valid on a genuinely brand-new platform, so it's a warning, not a hard failure).
-- **Optional app-level TLS/mTLS for the gRPC server** (`GRPC_TLS_CERT_FILE`/`_KEY_FILE`/`_CLIENT_CA_FILE`, `deploy/helm/values.yaml`'s `grpcTLS.enabled`) — the server previously had no `grpc.Creds(...)` at all, meaning "Envoy calls this service over mTLS" was an unverified deployment assumption, not something the app enforced. Verified all three transport modes (plaintext, TLS, mTLS with client-cert enforcement) end-to-end with real self-signed certs and `grpcurl`.
-- **Native `grpc.health.v1.Health` service**, tied to the same `MarkReady()` signal as HTTP `/healthz` — lets Kubernetes' `grpc:` probe type be used as an alternative to the HTTP probe. Set to `NOT_SERVING` at the start of graceful shutdown, before `GracefulStop`.
-- `GRPC_MAX_RECV_MSG_SIZE_BYTES`/`_SEND_` (default 256KiB each, well below gRPC-Go's 4MiB default) — defense-in-depth against a malformed/abusive message from a misbehaving Envoy instance.
-- `deploy/monitoring/dlq-alarms.tf.example` — CloudWatch alarms on the five §5 dead-letter queues. DLQ routing is entirely SQS-native (no application code reads a `-dlq` queue), so without this a message that lands in one was completely unmonitored. Also added `deploy/monitoring/README.md` indexing all three files there.
-- `docs/runbook.md` — what to do when each Prometheus alert / the new DLQ alarm fires, plus the startup-validation and OTel-log-noise failure modes below.
-- Real `test/load` baseline numbers (previously "never run"): 500 RPS sustained, hit mode p99=1.68ms, miss mode p99=3.18ms — see README § Testing for the important caveat (single-machine, loopback network, not validated production evidence).
+- `VERSIONING.md` — SemVer rules and release process for the runtime contract (`DenyReason` values, injected headers, `CheckRequest` field usage, env vars, `values.yaml` shape).
+- `api/asyncapi.yaml` — event-contract spec (5 consumed queues, 15 event types, 0 published), served live at `GET /asyncapi`/`GET /asyncapi.yaml` (`DOCS_ENABLED`/`DOCS_AUTH_TOKEN`).
+- `authz_i14_call_latency_seconds` metric (MFA-freshness/I-14 call latency), matching the existing I-8/I-12 histograms.
+- `MembershipRevoked` subscription on `membership-authz-q` (LLD §16 AE-20) — evicts `ae:ctx`/`ae:neg`/`ae:tender_acl` on a whole-membership removal.
+- `TENDER_ACL_BASE_URL`/`TENDER_ACL_TIMEOUT` — tender-ACL checks now call `iam-tender-acl` directly instead of Org & Membership (ADR-0007 Wave 3 Phase 4).
+- Fail-fast startup validation: refuses to start if `ORG_MEMBERSHIP_BASE_URL`/`TENDER_ACL_BASE_URL` is left at its dev default outside `APP_ENV=dev`.
+- Optional app-level gRPC TLS/mTLS (`GRPC_TLS_CERT_FILE`/`_KEY_FILE`/`_CLIENT_CA_FILE`).
+- Native `grpc.health.v1.Health` service alongside HTTP `/healthz`.
+- `GRPC_MAX_RECV_MSG_SIZE_BYTES`/`_SEND_` limits (256KiB, defense-in-depth).
+- Per-queue SQS consumer concurrency env vars (`*_AUTHZ_QUEUE_CONCURRENCY`, default 4 each).
+- `deploy/monitoring/dlq-alarms.tf.example` + `docs/runbook.md`.
+- `.github/workflows/release.yml` (tag-triggered image build/scan/sign/publish) + reusable `validate-test.yml`/`validate-quality.yml`.
+- Real `test/load` baseline numbers: 500 RPS, hit p99=1.68ms, miss p99=3.18ms (single-machine, not production-validated).
 
 ### Changed
-- `sync.WaitGroup`-parallelized SQS consumer shutdown in `cmd/server/main.go`, replacing a sequential loop — each `Stop()` can take up to ~35s in the worst case, so five stopped one at a time could push total shutdown past most `terminationGracePeriodSeconds` settings under a correlated failure (e.g. a Valkey outage coinciding with a deploy). Verified via a real `kill -TERM` against a running process that shutdown still completes cleanly.
-- `deploy-gate`'s health query uses `grpc_server_handled_total{status_class="5xx"}` (`platform-gincommon`'s gRPC interceptor chain), not `iam-user-profile`'s `http_requests_total` — this service has no HTTP business traffic. Requires a `KUBECONFIG_B64` secret, optional `K8S_NAMESPACE`/`PROMETHEUS_URL` vars, and a pre-provisioned `iam-authz-enrichment-secrets` Kubernetes Secret in the target namespace.
-- `deploy-gate` now only runs when `vars.DEPLOY_GATE_ENABLED == 'true'` (default: skipped) — checked `iam-user-profile`'s actual current `release.yml` and confirmed it has no skip logic either; it presumably just never fails there because that secret is already configured for that repo. Blocking every release on infrastructure that doesn't exist yet was the wrong default for a brand-new service. `publish` accepts a skipped gate but not a failed one, and the GitHub Release notes get an explicit "not deployed/health-checked" line when the gate was skipped, so that's visible on the Release page itself, not just in the workflow run's logs.
+- `/metrics` moved off `APP_PORT` to its own dedicated port (`METRICS_PORT`, default 9090).
+- `deploy/helm/values.yaml` replica/HPA range corrected to 5–20 to match the LLD's design commitment.
+- SQS consumer shutdown parallelized (`sync.WaitGroup`) instead of sequential, bounding worst-case shutdown time.
+- `release.yml`'s `deploy-gate` uses a gRPC-specific health query and only runs when `DEPLOY_GATE_ENABLED=true` (default skipped — no cluster provisioned yet).
+- Bumped `platform-gincommon` to v1.3.0; the HTTP router now goes through `gincommon.ObservabilityMiddlewares` instead of a bare `gin.New()`.
 
 ### Fixed
-- `hadolint`'s `DL3064` false-flagged `ENV GOPRIVATE` purely because "PRIVATE" is in the name (the value is a public Go import-path glob, not a credential) — introduced by a Dependabot bump of `hadolint-action` 3.3.0 → 3.4.0. Suppressed with `# hadolint ignore=DL3064` immediately above the instruction (hadolint's ignore directive must be the line directly before the instruction it applies to — an explanatory comment sitting between the two breaks the association).
-- `extract-release-notes.sh`'s `cmd | tee file | true` pattern (copied from `iam-user-profile`) silently killed the script with SIGPIPE (exit 141) under `set -euo pipefail` — `true` doesn't read stdin, so it closes the pipe before `tee` finishes writing, and the script exits right there, before the CHANGELOG-missing check or the image-metadata append ever run. Replaced with plain `>` redirection.
-- `export-image-provenance.sh` (copied from `iam-user-profile`) used `cosign download attestation` to read a BuildKit-native provenance attestation (from `provenance: mode=max` on the build step) — `cosign download attestation` targets attestations *cosign itself* creates via `cosign attest`, a different format from what `docker/build-push-action`'s `provenance`/`sbom` inputs attach, and cannot read them at all regardless of `--predicate-type` filtering or build caching. Two earlier attempts each addressed a real, separately-documented issue (buildx defaults to a `v0.2` predicate rather than `v1`; combining `cache-from`/`cache-to: type=gha` with attestations can drop them per `moby/buildkit#4501`) but neither was this bug, which is why "found no attestations" persisted unchanged through both. Rewrote the script to use `docker buildx imagetools inspect --format '{{ json .Provenance.SLSA }}'` instead, which understands BuildKit's native attestation format directly — no cosign involved for this step (cosign is still used, correctly, for image *signing* later in the same job). Left the `v0.2` predicate-type awareness and the `type=gha` cache removal in place — both are still real, worth having regardless of whether they were the culprit here.
+- `/asyncapi` HTML viewer rendered `�` instead of the description — byte-level string truncation split multi-byte UTF-8 characters. Fixed with a rune-boundary-safe `truncateRunes` helper.
+- `api/asyncapi.yaml`'s producer-summary table incorrectly listed the same combined producer for `billing-authz-q` and `tenant-authz-q`; corrected to each queue's actual distinct producer.
+- A few CI script bugs: a hadolint false-positive on `ENV GOPRIVATE`, a SIGPIPE in `extract-release-notes.sh`, and `export-image-provenance.sh` reading provenance attestations with the wrong tool.
+
+### Removed
+- `active_delegations[]` / `domain.Delegation` — dropped entirely; delegation state moved to its own service (`iam-delegation`, ADR-0008).
 
 ## [0.1.0] - 2026-08-12
 

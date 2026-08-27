@@ -13,7 +13,9 @@ spec:
     matchLabels:
       {{- include "iam-authz-enrichment.selectorLabels" . | nindent 6 }}
   endpoints:
-    - port: http
+    # Metrics are served on the dedicated "metrics" port (9090), separate
+    # from "http" (healthz/readyz only) and "grpc" (the real traffic).
+    - port: metrics
       path: /metrics
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}

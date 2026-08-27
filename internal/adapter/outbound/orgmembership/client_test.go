@@ -31,16 +31,14 @@ func TestGetMemberships_EmptyArraysNeverNull(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, time.Second)
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
 	membership, tenantCtx, err := client.GetMemberships(context.Background(), "tenant-1", "user-1")
 
 	require.NoError(t, err)
 	assert.NotNil(t, membership.Roles)
 	assert.NotNil(t, membership.Departments)
-	assert.NotNil(t, membership.Delegations)
 	assert.Empty(t, membership.Roles)
 	assert.Empty(t, membership.Departments)
-	assert.Empty(t, membership.Delegations)
 	assert.NotNil(t, tenantCtx.FeatureFlags)
 	assert.Empty(t, tenantCtx.FeatureFlags)
 	assert.Equal(t, "pro", tenantCtx.Plan)
@@ -53,7 +51,6 @@ func TestGetMemberships_FullResponse_DecodesCorrectly(t *testing.T) {
 		_, _ = w.Write([]byte(`{
 			"roles": ["tenant_admin"],
 			"departments": [{"department_id": "eng", "level": "approver"}],
-			"active_delegations": [{"from_user_id": "boss", "department_id": "eng", "level": "reviewer"}],
 			"plan": "enterprise",
 			"feature_flags": ["flag-a", "flag-b"],
 			"subscription_status": "active",
@@ -63,13 +60,12 @@ func TestGetMemberships_FullResponse_DecodesCorrectly(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, time.Second)
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
 	membership, tenantCtx, err := client.GetMemberships(context.Background(), "tenant-1", "user-1")
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"tenant_admin"}, membership.Roles)
 	assert.Equal(t, []domain.Department{{DepartmentID: "eng", Level: "approver"}}, membership.Departments)
-	assert.Equal(t, []domain.Delegation{{FromUserID: "boss", DepartmentID: "eng", Level: "reviewer"}}, membership.Delegations)
 	assert.Equal(t, "enterprise", tenantCtx.Plan)
 	assert.Equal(t, []string{"flag-a", "flag-b"}, tenantCtx.FeatureFlags)
 }
@@ -81,7 +77,7 @@ func TestGetMemberships_404_ReturnsErrNotFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, time.Second)
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
 	_, _, err := client.GetMemberships(context.Background(), "tenant-1", "user-1")
 
 	assert.ErrorIs(t, err, domain.ErrNotFound)
@@ -94,7 +90,7 @@ func TestGetMemberships_ServerError_ReturnsErrUnavailable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, time.Second)
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
 	_, _, err := client.GetMemberships(context.Background(), "tenant-1", "user-1")
 
 	assert.ErrorIs(t, err, domain.ErrUnavailable)
@@ -108,7 +104,7 @@ func TestGetMemberships_Timeout_ReturnsErrUnavailable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, 5*time.Millisecond)
+	client := orgmembership.New(srv.URL, 5*time.Millisecond, srv.URL, 5*time.Millisecond)
 	_, _, err := client.GetMemberships(context.Background(), "tenant-1", "user-1")
 
 	assert.ErrorIs(t, err, domain.ErrUnavailable)
@@ -124,7 +120,7 @@ func TestGetTenderACL_NoGrant_IsNotAnError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, time.Second)
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
 	acl, err := client.GetTenderACL(context.Background(), "tenant-1", "tender-1", "user-1")
 
 	require.NoError(t, err)
@@ -138,7 +134,7 @@ func TestGetTenderACL_ServerError_ReturnsErrUnavailable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, time.Second)
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
 	_, err := client.GetTenderACL(context.Background(), "tenant-1", "tender-1", "user-1")
 
 	assert.ErrorIs(t, err, domain.ErrUnavailable)
@@ -151,7 +147,7 @@ func TestGetTenderACL_Timeout_ReturnsErrUnavailable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, 5*time.Millisecond)
+	client := orgmembership.New(srv.URL, 5*time.Millisecond, srv.URL, 5*time.Millisecond)
 	_, err := client.GetTenderACL(context.Background(), "tenant-1", "tender-1", "user-1")
 
 	assert.ErrorIs(t, err, domain.ErrUnavailable)
@@ -164,7 +160,7 @@ func TestGetMFAFreshness_ServerError_ReturnsErrUnavailable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, time.Second)
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
 	_, err := client.GetMFAFreshness(context.Background(), "tenant-1")
 
 	assert.ErrorIs(t, err, domain.ErrUnavailable)
@@ -177,7 +173,7 @@ func TestGetMFAFreshness_Timeout_ReturnsErrUnavailable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, 5*time.Millisecond)
+	client := orgmembership.New(srv.URL, 5*time.Millisecond, srv.URL, 5*time.Millisecond)
 	_, err := client.GetMFAFreshness(context.Background(), "tenant-1")
 
 	assert.ErrorIs(t, err, domain.ErrUnavailable)
@@ -188,7 +184,7 @@ func TestGetMemberships_MalformedBaseURL_RequestBuildError(t *testing.T) {
 	// A malformed base URL (invalid percent-encoding) makes
 	// http.NewRequestWithContext itself fail, exercising getJSON's "build
 	// request" error branch — distinct from a network/timeout failure.
-	client := orgmembership.New("http://%zz", time.Second)
+	client := orgmembership.New("http://%zz", time.Second, "http://%zz", time.Second)
 	_, _, err := client.GetMemberships(context.Background(), "tenant-1", "user-1")
 
 	assert.ErrorIs(t, err, domain.ErrUnavailable)
@@ -202,7 +198,7 @@ func TestGetMemberships_MalformedJSONResponse_ReturnsErrUnavailable(t *testing.T
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, time.Second)
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
 	_, _, err := client.GetMemberships(context.Background(), "tenant-1", "user-1")
 
 	assert.ErrorIs(t, err, domain.ErrUnavailable)
@@ -216,7 +212,7 @@ func TestGetMFAFreshness_DecodesSeconds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := orgmembership.New(srv.URL, time.Second)
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
 	d, err := client.GetMFAFreshness(context.Background(), "tenant-1")
 
 	require.NoError(t, err)

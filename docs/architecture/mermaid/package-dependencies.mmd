@@ -10,6 +10,7 @@ graph LR
     policy(["domain/policy"])
     domain(["domain"])
     config(["config"])
+    api(["api"])
 
     cmd --> grpc & http & consumer
     cmd --> valkey & orgmembership & metrics
@@ -17,7 +18,7 @@ graph LR
 
     grpc --> usecase & policy & domain
     consumer --> usecase & policy & domain
-    http --> domain
+    http --> api
 
     usecase --> policy & domain
 

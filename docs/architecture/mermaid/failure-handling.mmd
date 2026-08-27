@@ -19,7 +19,7 @@ flowchart TD
 
     subgraph tenderacl["Tender-ACL overlay (§3.1 step 4) — an INDEPENDENT rule"]
         direction TD
-        t1(["I-12 call times out or errors"]) --> t2["Fails closed for THIS overlay ONLY:\nDENY_TENDER_ACL_INSUFFICIENT\n— never escalates to 503, never denies\nnon-tender-scoped aspects of the request"]
+        t1(["TAC-4 call (iam-tender-acl, formerly I-12) times out or errors"]) --> t2["Fails closed for THIS overlay ONLY:\nDENY_TENDER_ACL_INSUFFICIENT\n— never escalates to 503, never denies\nnon-tender-scoped aspects of the request"]
     end
 
     classDef allow fill:#1a7f37,color:#fff;

@@ -4,13 +4,16 @@ services:
     ports:
       - "9091:9091"
       - "8080:8080"
+      - "9090:9090"
     environment:
       APP_ENV: dev
       APP_NAME: iam-authz-enrichment
       APP_PORT: "8080"
+      METRICS_PORT: "9090"
       GRPC_PORT: "9091"
       VALKEY_URL: valkey:6379
       ORG_MEMBERSHIP_BASE_URL: http://host.docker.internal:8081
+      TENDER_ACL_BASE_URL: http://host.docker.internal:8086
       AWS_REGION: ap-south-1
       AWS_ACCESS_KEY_ID: localstack
       AWS_SECRET_ACCESS_KEY: localstack
@@ -36,7 +39,14 @@ services:
   valkey:
     image: valkey/valkey:8-alpine
     ports:
-      - "6379:6379"
+      # Host-side port only — mapped off the 6379 default because several
+      # sibling IAM repos' own docker-compose stacks already claim it
+      # (iam-group-mapping) or nearby ports (iam-org-membership 6380,
+      # iam-catalog-admin 6381, iam-tender-acl 6382, iam-delegation 6383)
+      # when run side by side on the same machine. Container-to-container
+      # traffic (the app service's VALKEY_URL above) still uses the
+      # untranslated 6379 over the compose network, unaffected by this.
+      - "6384:6379"
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
@@ -50,7 +60,15 @@ services:
     # through SNS, since there's nothing to publish here.
     image: localstack/localstack:4.4.0
     ports:
-      - "4566:4566"
+      # Host-side port only — mapped off the 4566 default because several
+      # sibling IAM repos' own docker-compose stacks already claim it
+      # (iam-user-profile) or nearby ports (iam-org-membership 4567,
+      # iam-group-mapping 4568, iam-tender-acl 4569, iam-delegation 4570)
+      # when run side by side on the same machine. Container-to-container
+      # traffic (the app service's AWS_ENDPOINT_URL/*_QUEUE_URL above)
+      # still uses the untranslated 4566 over the compose network,
+      # unaffected by this.
+      - "4571:4566"
     environment:
       SERVICES: sqs
       DEBUG: 0

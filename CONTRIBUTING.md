@@ -6,7 +6,7 @@ test requirements, and the PR process.
 
 ## Prerequisites
 
-- Go 1.26.5+ (matches `go.mod`)
+- Go 1.26.6+ (matches `go.mod`)
 - Docker (required for the Valkey + LocalStack SQS integration tier)
 - `golangci-lint` and `go-arch-lint` are managed as Go tools — no separate install needed
 - `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (private module access)
@@ -44,11 +44,11 @@ internal/
   config/                      ← Env var loading
   adapter/inbound/
     grpc/                      ← envoy.service.auth.v3.Authorization/Check server
-    http/                      ← healthz/readyz/metrics only — no business HTTP API
+    http/                      ← healthz/readyz only — no business HTTP API; /metrics has its own dedicated listener (cmd/server)
     consumer/                  ← one handler per §5 SQS queue
   adapter/outbound/
     valkey/                    ← Cache adapter (go-redis/v9), §4 key schema + jittered TTL envelope
-    orgmembership/              ← I-8/I-12/I-14 HTTP client
+    orgmembership/              ← I-8/I-14 HTTP client (Org & Membership) + TAC-4/I-12 HTTP client (iam-tender-acl, ADR-0007 Wave 3 Phase 4)
     metrics/                   ← Prometheus recorder
 test/
   fixtures/                    ← Hand-written fakes for usecase ports (no gomock/mockery)

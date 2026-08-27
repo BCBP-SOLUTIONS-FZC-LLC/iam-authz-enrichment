@@ -7,9 +7,9 @@ metadata:
     {{- include "iam-authz-enrichment.labels" . | nindent 4 }}
 spec:
   # At least 2 pods must remain available during voluntary disruptions
-  # (node drains, rolling updates). With minReplicas: 3 this allows
-  # one pod to be evicted at a time without violating the anti-affinity
-  # requirement or taking the service below quorum.
+  # (node drains, rolling updates). With minReplicas: 5 this allows
+  # multiple pods to be evicted at a time without violating the
+  # anti-affinity requirement or taking the service below quorum.
   minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
   selector:
     matchLabels:

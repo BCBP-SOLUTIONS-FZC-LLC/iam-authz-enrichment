@@ -52,6 +52,7 @@ type Recorder interface {
 	ObserveSingleflightCoalesced()
 	ObserveI8Latency(d time.Duration)
 	ObserveI12Latency(d time.Duration)
+	ObserveI14Latency(d time.Duration)
 	ObserveDecisionLatency(d time.Duration)
 }
 
@@ -65,6 +66,7 @@ func (NoopRecorder) ObserveStaleIfErrorServed()              {}
 func (NoopRecorder) ObserveSingleflightCoalesced()           {}
 func (NoopRecorder) ObserveI8Latency(time.Duration)          {}
 func (NoopRecorder) ObserveI12Latency(time.Duration)         {}
+func (NoopRecorder) ObserveI14Latency(time.Duration)         {}
 func (NoopRecorder) ObserveDecisionLatency(time.Duration)    {}
 
 // Logger mirrors platform-gincommon's port.Logger method set structurally —

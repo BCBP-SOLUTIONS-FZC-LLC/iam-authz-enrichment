@@ -36,13 +36,23 @@ type Recorder struct {
 	sfCoalescedTotal prometheus.Counter
 	i8Latency        prometheus.Histogram
 	i12Latency       prometheus.Histogram
+	i14Latency       prometheus.Histogram
 }
 
-// New builds and registers all authz_* metrics on the default registry —
-// the same one internal/adapter/inbound/http's /metrics route scrapes via
-// promhttp.Handler().
-func New() *Recorder {
-	return newRecorder(prometheus.DefaultRegisterer)
+// New builds and registers all authz_* metrics on reg — the same registry
+// internal/adapter/inbound/http's /metrics route scrapes via
+// promhttp.Handler(). reg is optional (variadic so every existing zero-arg
+// call site keeps compiling) and defaults to prometheus.DefaultRegisterer;
+// cmd/server passes gincommon.MetricsRegisterer() so these collectors are
+// explicitly confirmed to land in the same registry as platform-gincommon's
+// own metrics, rather than assuming DefaultRegisterer and hoping gincommon
+// agrees (same convention as iam-user-profile's metrics.Register).
+func New(reg ...prometheus.Registerer) *Recorder {
+	registerer := prometheus.DefaultRegisterer
+	if len(reg) > 0 && reg[0] != nil {
+		registerer = reg[0]
+	}
+	return newRecorder(registerer)
 }
 
 // newRecorder builds and registers all authz_* metrics on reg. Factored out
@@ -96,7 +106,12 @@ func newRecorder(reg prometheus.Registerer) *Recorder {
 		}),
 		i12Latency: f.NewHistogram(prometheus.HistogramOpts{
 			Name:    "authz_i12_call_latency_seconds",
-			Help:    "Org & Membership tender-ACL (I-12) call latency.",
+			Help:    "iam-tender-acl TAC-4 (formerly Org & Membership's I-12) tender-ACL call latency.",
+			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 16),
+		}),
+		i14Latency: f.NewHistogram(prometheus.HistogramOpts{
+			Name:    "authz_i14_call_latency_seconds",
+			Help:    "Org & Membership MFA-freshness (I-14) call latency.",
 			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 16),
 		}),
 	}
@@ -130,5 +145,6 @@ func (r *Recorder) ObserveSingleflightCoalesced() { r.sfCoalescedTotal.Inc() }
 
 func (r *Recorder) ObserveI8Latency(d time.Duration)  { r.i8Latency.Observe(d.Seconds()) }
 func (r *Recorder) ObserveI12Latency(d time.Duration) { r.i12Latency.Observe(d.Seconds()) }
+func (r *Recorder) ObserveI14Latency(d time.Duration) { r.i14Latency.Observe(d.Seconds()) }
 
 func (r *Recorder) ObserveDecisionLatency(d time.Duration) { r.decisionLatency.Observe(d.Seconds()) }

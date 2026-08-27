@@ -70,12 +70,16 @@ requires Valkey up + sibling down + a stale entry available).
 
 Sustained `DENY_SERVICE_UNAVAILABLE` — §7 has fail-closed (no stale entry
 was available to serve instead), or the tender-ACL overlay's independent
-fail-closed rule is firing on I-12 failures.
+fail-closed rule is firing on TAC-4 failures (formerly I-12 — as of
+ADR-0007 Wave 3 Phase 4, this call goes to **iam-tender-acl**, not Org &
+Membership; check that service's health first if this alert is isolated to
+tender-scoped requests).
 
 1. Same dependency checks as `AuthzEnrichmentStaleIfErrorServing` — this is
    usually the same underlying outage, just past the grace window or with
    no cache warm enough to bridge it (e.g. brand-new tenants/users with no
-   existing cache entry at all).
+   existing cache entry at all). For a TAC-4-only spike, check
+   **iam-tender-acl** specifically, not Org & Membership.
 2. If this is firing with Org & Membership *healthy*, check this service's
    own logs for `"membership rebuild failed, no stale entry available"` —
    the error string in that log line is the actual dial/timeout error, not

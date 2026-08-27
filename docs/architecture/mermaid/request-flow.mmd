@@ -4,12 +4,13 @@ sequenceDiagram
     participant Checker
     participant Cache as Valkey Cache
     participant Org as Org & Membership
+    participant TenderACL as iam-tender-acl
     participant Policy as domain/policy
 
     Envoy ->> Server: Check(CheckRequest)
     Note over Envoy,Server: jwt_authn already validated the JWT — Server never<br/>re-validates it, and never reads request headers for identity (§8.2)
 
-    Server ->> Server: decodeClaims(MetadataContext)<br/>decodeRequestFacts(ContextExtensions)
+    Server ->> Server: decodeClaims(MetadataContext)<br/>decodeRequestFacts(ContextExtensions + tender_id from URL path)
 
     alt claims.Subject is empty
         Server -->> Envoy: Denied 401 DENY_MALFORMED_IDENTITY
@@ -68,8 +69,8 @@ sequenceDiagram
                     opt tender-scoped and flagged restricted
                         Checker ->> Cache: GetTenderACL
                         alt cache miss
-                            Checker ->> Org: GetTenderACL(tenant, tender, user)
-                            Org -->> Checker: grant or ErrUnavailable
+                            Checker ->> TenderACL: GetTenderACL(tenant, tender, user)
+                            TenderACL -->> Checker: grant or ErrUnavailable
                             alt call fails
                                 Checker -->> Server: Denied — DENY_TENDER_ACL_INSUFFICIENT
                                 Note over Checker: §7 row 4 — fails closed for THIS<br/>overlay only, never 503

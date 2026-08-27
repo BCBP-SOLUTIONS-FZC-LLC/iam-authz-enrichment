@@ -133,21 +133,3 @@ func TestMeetsDepartmentLevel(t *testing.T) {
 	assert.False(t, policy.MeetsDepartmentLevel(m, "eng", policy.LevelApprover), "reviewer does not meet approver")
 	assert.False(t, policy.MeetsDepartmentLevel(m, "sales", policy.LevelPreparator), "no membership in that department at all")
 }
-
-func TestMeetsDepartmentLevel_Delegation(t *testing.T) {
-	t.Parallel()
-	m := domain.NewMembershipContext()
-	// No direct membership in "eng" — only a delegated approver capacity.
-	m.Delegations = []domain.Delegation{{FromUserID: "boss", DepartmentID: "eng", Level: "approver"}}
-
-	assert.True(t, policy.MeetsDepartmentLevel(m, "eng", policy.LevelApprover), "a delegation grants the delegated level")
-}
-
-func TestMeetsDepartmentLevel_BestOfMembershipAndDelegation(t *testing.T) {
-	t.Parallel()
-	m := domain.NewMembershipContext()
-	m.Departments = []domain.Department{{DepartmentID: "eng", Level: "preparator"}}
-	m.Delegations = []domain.Delegation{{FromUserID: "boss", DepartmentID: "eng", Level: "approver"}}
-
-	assert.True(t, policy.MeetsDepartmentLevel(m, "eng", policy.LevelApprover), "the higher of direct membership and delegation applies")
-}

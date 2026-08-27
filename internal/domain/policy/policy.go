@@ -22,9 +22,7 @@ func hasRole(roles []string, want string) bool {
 }
 
 // departmentLevel returns the acting subject's effective level in
-// departmentID, folding in active delegations (a delegate acts at the
-// delegated level for that department), and whether any membership or
-// delegation grants access to it at all.
+// departmentID, and whether any membership grants access to it at all.
 func departmentLevel(m domain.MembershipContext, departmentID string) (DepartmentLevel, bool) {
 	best := DepartmentLevel("")
 	found := false
@@ -36,11 +34,6 @@ func departmentLevel(m domain.MembershipContext, departmentID string) (Departmen
 		}
 	}
 	for _, d := range m.Departments {
-		if d.DepartmentID == departmentID {
-			consider(d.Level)
-		}
-	}
-	for _, d := range m.Delegations {
 		if d.DepartmentID == departmentID {
 			consider(d.Level)
 		}

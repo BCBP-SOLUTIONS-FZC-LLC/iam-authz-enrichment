@@ -20,6 +20,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
@@ -28,6 +29,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/grpccommon"
 	gincommonlogger "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
 
@@ -75,8 +77,11 @@ func run() error {
 		appLog.Warn("no tenant-resolution path configured — every request will get DENY_MALFORMED_IDENTITY until SHARED_REALM_ISSUER is set or a TenantConverted/TenantRealmReady event seeds the realm map", nil)
 	}
 
-	// 2. Metrics.
-	recorder := metrics.New()
+	// 2. Metrics. gincommon.MetricsRegisterer() confirms these collectors
+	// land on the same registry as platform-gincommon's own HTTP metrics
+	// (below) rather than assuming prometheus.DefaultRegisterer and hoping
+	// gincommon agrees — same convention as iam-user-profile.
+	recorder := metrics.New(gincommon.MetricsRegisterer())
 
 	// 3. Cache.
 	cache := valkey.New(valkey.Config{
@@ -92,8 +97,10 @@ func run() error {
 		StaleIfErrorMaxAge: cfg.StaleIfErrorMaxAge,
 	})
 
-	// 4. Org & Membership client.
-	orgClient := orgmembership.New(cfg.OrgMembershipBaseURL, cfg.OrgMembershipTimeout)
+	// 4. Org & Membership + iam-tender-acl client (I-12/GetTenderACL moved to
+	// the latter in ADR-0007 Wave 3 Phase 4 — see orgmembership.New's doc
+	// comment).
+	orgClient := orgmembership.New(cfg.OrgMembershipBaseURL, cfg.OrgMembershipTimeout, cfg.TenderACLBaseURL, cfg.TenderACLTimeout)
 
 	// 5. In-process policy state + usecase layer.
 	realmMap := usecase.NewRealmMap(cfg.RealmTenantMapSeed)
@@ -158,14 +165,37 @@ func run() error {
 		return fmt.Errorf("listen grpc: %w", err)
 	}
 
-	// 7. HTTP server (health/readiness/metrics only — no business logic).
+	// 7. HTTP server (health/readiness, plus the opt-in AsyncAPI viewer —
+	// no other business logic).
 	probe := &httpadapter.ReadinessProbe{}
 	httpServer := &http.Server{
-		Addr:         ":" + cfg.AppPort,
-		Handler:      httpadapter.NewRouter(probe),
+		Addr: ":" + cfg.AppPort,
+		Handler: httpadapter.NewRouter(probe, gincommon.Config{
+			Logger:       appLog,
+			ServiceName:  cfg.AppName,
+			BuildVersion: buildVersion,
+		}, httpadapter.DocsConfig{
+			Environment: cfg.AppEnv,
+			Enabled:     cfg.DocsEnabled,
+			AuthToken:   cfg.DocsAuthToken,
+		}),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
+	}
+
+	// Metrics on a dedicated port/listener, separate from the health/
+	// readiness server above — mirrors iam-org-membership's/
+	// iam-tender-acl's/iam-user-profile's/iam-catalog-admin's identical
+	// split (fleet-wide consistency; this service's AppPort already
+	// carries no business API to protect from a shared-port NetworkPolicy
+	// grant, since the actual authz decision path is exclusively gRPC).
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsServer := &http.Server{
+		Addr:              ":" + cfg.MetricsPort,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	// 8. Background workers: the five SQS consumers.
@@ -189,6 +219,12 @@ func run() error {
 			appLog.Error("http server exited", map[string]interface{}{"error": serveErr.Error()})
 		}
 	}()
+	go func() {
+		appLog.Info("metrics server listening", map[string]interface{}{"addr": metricsServer.Addr})
+		if serveErr := metricsServer.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
+			appLog.Error("metrics server exited", map[string]interface{}{"error": serveErr.Error()})
+		}
+	}()
 	probe.MarkReady()
 	healthServer.SetServingStatus("", healthgrpc.HealthCheckResponse_SERVING)
 
@@ -208,6 +244,9 @@ func run() error {
 	defer cancelShutdown()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		appLog.Warn("http shutdown error", map[string]interface{}{"error": err.Error()})
+	}
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		appLog.Warn("metrics server shutdown error", map[string]interface{}{"error": err.Error()})
 	}
 
 	// Stopped concurrently, not sequentially: each Stop() can take up to its
@@ -290,20 +329,25 @@ func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache,
 	}
 
 	builders := []struct {
-		name     string
-		queueURL string
-		build    func(string, consumer.Deps, ...events.ConsumerOption) (events.Consumer, error)
+		name        string
+		queueURL    string
+		concurrency int
+		build       func(string, consumer.Deps, ...events.ConsumerOption) (events.Consumer, error)
 	}{
-		{"membership-authz-q", cfg.MembershipQueueURL, consumer.NewMembershipConsumer},
-		{"user-authz-q", cfg.UserQueueURL, consumer.NewUserConsumer},
-		{"billing-authz-q", cfg.BillingQueueURL, consumer.NewBillingConsumer},
-		{"tenant-authz-q", cfg.TenantQueueURL, consumer.NewTenantConsumer},
-		{"tender-authz-q", cfg.TenderQueueURL, consumer.NewTenderConsumer},
+		{"membership-authz-q", cfg.MembershipQueueURL, cfg.MembershipQueueConcurrency, consumer.NewMembershipConsumer},
+		{"user-authz-q", cfg.UserQueueURL, cfg.UserQueueConcurrency, consumer.NewUserConsumer},
+		{"billing-authz-q", cfg.BillingQueueURL, cfg.BillingQueueConcurrency, consumer.NewBillingConsumer},
+		{"tenant-authz-q", cfg.TenantQueueURL, cfg.TenantQueueConcurrency, consumer.NewTenantConsumer},
+		{"tender-authz-q", cfg.TenderQueueURL, cfg.TenderQueueConcurrency, consumer.NewTenderConsumer},
 	}
 
 	consumers := make([]events.Consumer, 0, len(builders))
 	for _, b := range builders {
-		c, err := b.build(b.queueURL, deps)
+		// events.WithConcurrency sets how many messages this consumer hands
+		// to handler goroutines at once; the platform-events default is 1
+		// (fully serial per queue), which would bottleneck cache-eviction
+		// under a burst of events (e.g. a bulk department restructuring).
+		c, err := b.build(b.queueURL, deps, events.WithConcurrency(b.concurrency))
 		if err != nil {
 			return nil, fmt.Errorf("build %s consumer: %w", b.name, err)
 		}

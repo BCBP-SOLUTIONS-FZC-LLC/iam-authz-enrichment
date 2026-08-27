@@ -53,7 +53,7 @@ func TestValkey_MembershipContext_RoundTrip_ThenExpires(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.CacheMiss, result)
 
-	want := domain.MembershipContext{Roles: []string{"tenant_admin"}, Departments: []domain.Department{}, Delegations: []domain.Delegation{}}
+	want := domain.MembershipContext{Roles: []string{"tenant_admin"}, Departments: []domain.Department{}}
 	require.NoError(t, cache.SetMembershipContext(ctx, tenant, user, want))
 
 	got, result, err := cache.GetMembershipContext(ctx, tenant, user)

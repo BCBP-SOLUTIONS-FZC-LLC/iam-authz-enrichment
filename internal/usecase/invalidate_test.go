@@ -51,6 +51,55 @@ func TestInvalidator_MembershipEvent_EvictNegError_Propagates(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestInvalidator_MembershipRevoked_EvictCtxError_ShortCircuitsBeforeTenderACL(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.EvictCtxErr = errors.New("valkey down")
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+
+	err := inv.HandleMembershipRevoked(context.Background(), "tenant-1", usecase.MembershipEventPayload{UserID: "alice"})
+
+	require.Error(t, err)
+	assert.NotContains(t, cache.SortedCalls(), "EvictTenderACLForUser:tenant-1:alice")
+}
+
+func TestInvalidator_MembershipRevoked_EvictNegError_Propagates(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.EvictNegErr = errors.New("valkey down")
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+
+	err := inv.HandleMembershipRevoked(context.Background(), "tenant-1", usecase.MembershipEventPayload{UserID: "alice"})
+
+	require.Error(t, err)
+}
+
+func TestInvalidator_MembershipRevoked_TenderACLEvictionFails_BestEffortDoesNotPropagate(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.EvictTenderACLErr = errors.New("valkey down")
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+
+	err := inv.HandleMembershipRevoked(context.Background(), "tenant-1", usecase.MembershipEventPayload{UserID: "alice"})
+
+	require.NoError(t, err, "§16 AE-20: the tender-ACL eviction is best-effort — its failure must not fail the whole event")
+}
+
+func TestInvalidator_MembershipRevoked_EvictsCtxNegativeAndTenderACL(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+
+	err := inv.HandleMembershipRevoked(context.Background(), "tenant-1", usecase.MembershipEventPayload{UserID: "alice"})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"EvictMembershipContext:tenant-1:alice",
+		"EvictNegative:tenant-1:alice",
+		"EvictTenderACLForUser:tenant-1:alice",
+	}, cache.SortedCalls())
+}
+
 func TestInvalidator_UserUpdated_OnlyEvictsOnEmailChange(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()

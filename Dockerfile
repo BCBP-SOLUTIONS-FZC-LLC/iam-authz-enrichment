@@ -48,6 +48,6 @@ LABEL org.opencontainers.image.title="iam-authz-enrichment" \
 
 COPY --from=builder /build/bin/iam-authz-enrichment /iam-authz-enrichment
 
-EXPOSE 8080 9091
+EXPOSE 8080 9090 9091
 
 ENTRYPOINT ["/iam-authz-enrichment"]

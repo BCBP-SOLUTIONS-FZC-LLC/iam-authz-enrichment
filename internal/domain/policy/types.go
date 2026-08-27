@@ -66,7 +66,10 @@ type RequestFacts struct {
 
 	// TenderID and RequiredAccessLevel are set when the action is scoped to
 	// a tender that may be flagged restricted (§3.1 step 4). RequiredAccessLevel
-	// is one of domain.AccessLevelView/Edit/Approve.
+	// is one of domain.AccessLevelView/Edit/Approve. Unlike the other fields
+	// here, TenderID is parsed by the inbound adapter from the request's raw
+	// URL path (a per-resource ID can't be a static ContextExtensions value
+	// — see grpc.tenderIDFromPath's doc comment).
 	TenderID            string
 	TenderRestricted    bool
 	RequiredAccessLevel string

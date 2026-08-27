@@ -583,6 +583,7 @@ func TestNoopRecorder_AllMethodsAreSafeNoOps(t *testing.T) {
 	r.ObserveSingleflightCoalesced()
 	r.ObserveI8Latency(time.Millisecond)
 	r.ObserveI12Latency(time.Millisecond)
+	r.ObserveI14Latency(time.Millisecond)
 	r.ObserveDecisionLatency(time.Millisecond)
 }
 

@@ -14,6 +14,13 @@ excludeFiles:
   - '.*_test\.go$'
 
 components:
+  # The embedded AsyncAPI spec (api/embed.go) — a pure data leaf, no logic
+  # and no internal deps, the same shape as domain below. Consumed only by
+  # the AsyncAPI viewer in adapters_inbound (internal/adapter/inbound/http/
+  # asyncapi.go).
+  api:
+    in: api
+
   domain:
     in: internal/domain
 
@@ -46,6 +53,10 @@ components:
       - cmd/server
 
 deps:
+  # api: no internal imports at all — a single //go:embed'd []byte.
+  api:
+    anyVendorDeps: true
+
   # domain: no internal imports at all — pure value types + sentinel errors.
   domain:
     anyVendorDeps: true
@@ -69,12 +80,15 @@ deps:
 
   # inbound adapters: usecase (the orchestration layer they call into) +
   # domain + policy. Never another adapter, never config directly (cmd wires
-  # config values into constructor parameters).
+  # config values into constructor parameters). api is the one exception —
+  # the AsyncAPI viewer (internal/adapter/inbound/http/asyncapi.go) reads
+  # the embedded spec directly, not through usecase.
   adapters_inbound:
     mayDependOn:
       - usecase
       - domain
       - policy
+      - api
 
   # outbound adapters: domain + policy only — they implement usecase's port
   # interfaces structurally and must never import usecase itself, or they'd

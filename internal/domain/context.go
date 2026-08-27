@@ -9,14 +9,6 @@ type Department struct {
 	Level        string `json:"level"`
 }
 
-// Delegation is an active grant of another user's department/level capacity
-// to the acting subject (e.g. an approver delegating while on leave).
-type Delegation struct {
-	FromUserID   string `json:"from_user_id"`
-	DepartmentID string `json:"department_id"`
-	Level        string `json:"level"`
-}
-
 // MembershipContext holds the per-user membership facts cached under
 // ae:ctx:{tenant}:{user} (LLD §4.1) — everything except mfa_freshness_seconds,
 // which is never cached here (§4.4).
@@ -28,7 +20,6 @@ type Delegation struct {
 type MembershipContext struct {
 	Roles       []string     `json:"roles"`
 	Departments []Department `json:"departments"`
-	Delegations []Delegation `json:"active_delegations"`
 }
 
 // TenantContext holds the tenant-scoped facts cached under ae:tenant:{tenant}
@@ -48,7 +39,6 @@ func NewMembershipContext() MembershipContext {
 	return MembershipContext{
 		Roles:       []string{},
 		Departments: []Department{},
-		Delegations: []Delegation{},
 	}
 }
 

@@ -78,10 +78,8 @@ func TestNewMembershipContext_EmptyListsNeverNil(t *testing.T) {
 	m := domain.NewMembershipContext()
 	assert.NotNil(t, m.Roles)
 	assert.NotNil(t, m.Departments)
-	assert.NotNil(t, m.Delegations)
 	assert.Empty(t, m.Roles)
 	assert.Empty(t, m.Departments)
-	assert.Empty(t, m.Delegations)
 }
 
 func TestNewTenantContext_EmptyListsNeverNil(t *testing.T) {

@@ -14,10 +14,11 @@ import (
 
 // Config is the fully-resolved runtime configuration.
 type Config struct {
-	AppName  string
-	AppEnv   string
-	AppPort  string
-	GRPCPort string
+	AppName     string
+	AppEnv      string
+	AppPort     string
+	MetricsPort string
+	GRPCPort    string
 
 	ValkeyURL          string
 	ValkeyDialTimeout  time.Duration
@@ -26,6 +27,15 @@ type Config struct {
 
 	OrgMembershipBaseURL string
 	OrgMembershipTimeout time.Duration
+
+	// TenderACLBaseURL/TenderACLTimeout back I-12 (GetTenderACL) only, since
+	// ADR-0007 Wave 3 Phase 4 repoints that one call at iam-tender-acl —
+	// I-8/I-14 stay on OrgMembershipBaseURL above. A separate, tighter
+	// timeout than OrgMembershipTimeout's 10ms default: iam-tender-acl's own
+	// TAC-4 SLO is 5ms cache-hit/20ms cache-miss (its LLD §14.1), and this
+	// client has no visibility into which case a given call will hit.
+	TenderACLBaseURL string
+	TenderACLTimeout time.Duration
 
 	// SharedRealmIssuer is the Keycloak issuer URL for the shared trial
 	// realm — the fallback tenant-resolution path for tenants not yet in
@@ -62,6 +72,14 @@ type Config struct {
 	GRPCTLSKeyFile      string
 	GRPCTLSClientCAFile string
 
+	// DocsEnabled/DocsAuthToken gate the AsyncAPI event-contract viewer
+	// (/asyncapi, /asyncapi.yaml — internal/adapter/inbound/http's
+	// DocsConfig). Outside AppEnv=="production" the viewer is always on
+	// regardless of DocsEnabled; in production it's opt-in via DocsEnabled
+	// and, if DocsAuthToken is set, gated behind a bearer token.
+	DocsEnabled   bool
+	DocsAuthToken string
+
 	AWSRegion      string
 	AWSEndpointURL string // LocalStack endpoint override; empty in real AWS
 
@@ -71,6 +89,17 @@ type Config struct {
 	TenantQueueURL     string
 	TenderQueueURL     string
 	SQSMaxReceiveCount int
+
+	// *QueueConcurrency sets events.WithConcurrency per queue — the number
+	// of messages each consumer hands to a handler goroutine at once,
+	// rather than the platform-events library default of 1 (fully serial
+	// per queue). Same per-queue-configurable pattern as
+	// iam-org-membership's SQS_*_CONCURRENCY vars.
+	MembershipQueueConcurrency int
+	UserQueueConcurrency       int
+	BillingQueueConcurrency    int
+	TenantQueueConcurrency     int
+	TenderQueueConcurrency     int
 
 	// RealmTenantMapSeed is the startup seed for the in-process realm→tenant
 	// map (JSON object, realm -> tenant_id). Events (TenantConverted,
@@ -90,6 +119,14 @@ const staleIfErrorHardCap = 5 * time.Minute
 // if this is still the resolved value.
 const devOrgMembershipBaseURL = "http://localhost:8081"
 
+// devTenderACLBaseURL is the local-dev default for iam-tender-acl (ADR-0007
+// Wave 3 Phase 4 — I-12/GetTenderACL is repointed here from Org &
+// Membership; GetMemberships/GetMFAFreshness (I-8/I-14) are unaffected and
+// still call devOrgMembershipBaseURL above). Matches iam-tender-acl's own
+// dev HTTP_PORT (8086, see its .env.example) — same fail-fast-outside-dev
+// convention as devOrgMembershipBaseURL.
+const devTenderACLBaseURL = "http://localhost:8086"
+
 // Load reads Config from the environment, applying the same conventions as
 // the rest of the IAM fleet (plain os.Getenv + default fallback, no
 // viper/envconfig — see iam-user-profile's main.go envOr()).
@@ -98,6 +135,14 @@ func Load() (Config, error) {
 		AppName: envOr("APP_NAME", "iam-authz-enrichment"),
 		AppEnv:  envOr("APP_ENV", "dev"),
 		AppPort: envOr("APP_PORT", "8080"),
+		// /metrics is served on its own dedicated port/listener, separate
+		// from AppPort — mirrors iam-org-membership's/iam-tender-acl's/
+		// iam-user-profile's/iam-catalog-admin's identical split. This
+		// service's AppPort already carries no business API (healthz/
+		// readyz/metrics only — the actual authz decision path is
+		// exclusively gRPC), so the split is for fleet-wide consistency
+		// rather than closing a NetworkPolicy gap here.
+		MetricsPort: envOr("METRICS_PORT", "9090"),
 		// 9091, not 9090 — 9090 is Prometheus's own conventional port and is
 		// also commonly pre-bound by Docker Desktop's backend on macOS.
 		GRPCPort: envOr("GRPC_PORT", "9091"),
@@ -108,6 +153,8 @@ func Load() (Config, error) {
 		SharedRealmIssuer:    envOr("SHARED_REALM_ISSUER", ""),
 		JWTMetadataNamespace: envOr("JWT_METADATA_NAMESPACE", "envoy.filters.http.jwt_authn"),
 		JWTPayloadKey:        envOr("JWT_PAYLOAD_KEY", "trial"),
+
+		TenderACLBaseURL: envOr("TENDER_ACL_BASE_URL", devTenderACLBaseURL),
 
 		AWSRegion:      envOr("AWS_REGION", "ap-south-1"),
 		AWSEndpointURL: envOr("AWS_ENDPOINT_URL", ""),
@@ -121,6 +168,8 @@ func Load() (Config, error) {
 		GRPCTLSCertFile:     envOr("GRPC_TLS_CERT_FILE", ""),
 		GRPCTLSKeyFile:      envOr("GRPC_TLS_KEY_FILE", ""),
 		GRPCTLSClientCAFile: envOr("GRPC_TLS_CLIENT_CA_FILE", ""),
+
+		DocsAuthToken: envOr("DOCS_AUTH_TOKEN", ""),
 	}
 
 	var err error
@@ -134,6 +183,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.OrgMembershipTimeout, err = envDuration("ORG_MEMBERSHIP_TIMEOUT", 10*time.Millisecond); err != nil {
+		return Config{}, err
+	}
+	if cfg.TenderACLTimeout, err = envDuration("TENDER_ACL_TIMEOUT", 20*time.Millisecond); err != nil {
 		return Config{}, err
 	}
 	if cfg.AeCtxTTL, err = envDuration("AE_CTX_TTL", 60*time.Second); err != nil {
@@ -186,6 +238,26 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	if cfg.DocsEnabled, err = envBool("DOCS_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.MembershipQueueConcurrency, err = envInt("MEMBERSHIP_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
+		return Config{}, err
+	}
+	if cfg.UserQueueConcurrency, err = envInt("USER_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
+		return Config{}, err
+	}
+	if cfg.BillingQueueConcurrency, err = envInt("BILLING_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
+		return Config{}, err
+	}
+	if cfg.TenantQueueConcurrency, err = envInt("TENANT_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
+		return Config{}, err
+	}
+	if cfg.TenderQueueConcurrency, err = envInt("TENDER_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
+		return Config{}, err
+	}
+
 	seed := envOr("REALM_TENANT_MAP_SEED", "{}")
 	cfg.RealmTenantMapSeed = map[string]string{}
 	if err := json.Unmarshal([]byte(seed), &cfg.RealmTenantMapSeed); err != nil {
@@ -206,6 +278,14 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf(
 			"ORG_MEMBERSHIP_BASE_URL is left at its local-dev default (%s) with APP_ENV=%q — set it to the real Org & Membership service address",
 			devOrgMembershipBaseURL, cfg.AppEnv,
+		)
+	}
+	// Same fail-fast reasoning as ORG_MEMBERSHIP_BASE_URL above, for
+	// iam-tender-acl (ADR-0007 Wave 3 Phase 4).
+	if cfg.AppEnv != "dev" && cfg.TenderACLBaseURL == devTenderACLBaseURL {
+		return Config{}, fmt.Errorf(
+			"TENDER_ACL_BASE_URL is left at its local-dev default (%s) with APP_ENV=%q — set it to the real iam-tender-acl service address",
+			devTenderACLBaseURL, cfg.AppEnv,
 		)
 	}
 
@@ -241,4 +321,16 @@ func envInt(key string, def int) (int, error) {
 		return 0, fmt.Errorf("%s: invalid integer %q: %w", key, v, err)
 	}
 	return n, nil
+}
+
+func envBool(key string, def bool) (bool, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s: invalid boolean %q: %w", key, v, err)
+	}
+	return b, nil
 }

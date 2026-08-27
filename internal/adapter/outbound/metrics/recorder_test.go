@@ -37,6 +37,20 @@ func TestNew_RegistersOnDefaultRegisterer(t *testing.T) {
 	assert.NotNil(t, r)
 }
 
+func TestNew_RegistersOnExplicitRegisterer(t *testing.T) {
+	t.Parallel()
+	// Proves New(reg) wires newRecorder to the given registerer instead of
+	// silently falling back to prometheus.DefaultRegisterer — the case
+	// cmd/server exercises by passing gincommon.MetricsRegisterer().
+	reg := prometheus.NewRegistry()
+	r := New(reg)
+	assert.NotNil(t, r)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	assert.NotEmpty(t, mfs, "authz_* metrics should be registered on the explicit registerer")
+}
+
 func TestObserveDecision_Allow(t *testing.T) {
 	t.Parallel()
 	r := newTestRecorder(t)
@@ -104,9 +118,11 @@ func TestObserveLatencies(t *testing.T) {
 
 	r.ObserveI8Latency(5 * time.Millisecond)
 	r.ObserveI12Latency(3 * time.Millisecond)
+	r.ObserveI14Latency(2 * time.Millisecond)
 	r.ObserveDecisionLatency(1 * time.Millisecond)
 
 	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i8Latency))
 	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i12Latency))
+	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i14Latency))
 	assert.Equal(t, uint64(1), histogramSampleCount(t, r.decisionLatency))
 }

@@ -15,18 +15,25 @@ import (
 // hand-built events.Envelope) without any SQS/LocalStack machinery.
 
 // membershipHandler implements membership-authz-q (§5):
-// DepartmentMembershipGranted/Revoked/LevelChanged, TenantRoleGranted/Revoked.
+// DepartmentMembershipGranted/Revoked/LevelChanged, TenantRoleGranted/Revoked,
+// and MembershipRevoked — Org & Membership's per-user removal cascade signal
+// (LLD §16 AE-20), the only event that fires on a whole-membership removal
+// (per-grant rows are left inert rather than individually revoked), so it
+// gets a wider eviction than the other five (also clears ae:tender_acl).
 func membershipHandler(deps Deps) events.Handler {
 	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 		switch env.Type {
 		case "DepartmentMembershipGranted", "DepartmentMembershipRevoked", "DepartmentMembershipLevelChanged",
-			"TenantRoleGranted", "TenantRoleRevoked":
+			"TenantRoleGranted", "TenantRoleRevoked", "MembershipRevoked":
 		default:
 			return nil
 		}
 		var p usecase.MembershipEventPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
 			return fmt.Errorf("decode %s payload: %w", env.Type, err)
+		}
+		if env.Type == "MembershipRevoked" {
+			return deps.Invalidator.HandleMembershipRevoked(ctx, env.TenantID, p)
 		}
 		return deps.Invalidator.HandleMembershipEvent(ctx, env.TenantID, p)
 	}

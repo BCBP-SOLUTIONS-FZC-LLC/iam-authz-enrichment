@@ -3,7 +3,7 @@
 Real-time authorization decisions for the platform: enriches every authenticated request with tenant, role, and permission context via a low-latency, cache-backed policy engine.
 
 **Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment`
-**Module:** Go 1.26.5+ · private module · stateless, 5–20 replicas, HPA on RPS · **no database**
+**Module:** Go 1.26.6+ · private module · stateless, 5–20 replicas, HPA on RPS · **no database**
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full layer model, request-flow/cache/event/failure-handling diagrams, and the threat model.
 
@@ -62,7 +62,11 @@ Envoy calls `Check(CheckRequest) → CheckResponse` after `jwt_authn` has valida
 | `assignee_user_id` | Current ticket assignee, for the edit-tender-section policy |
 | `department_id` | Acting department, for department-level checks |
 | `required_department_level` | `preparator`/`reviewer`/`approver` — `approver` triggers the MFA-freshness gate |
-| `tender_id` / `required_access_level` | Tender-scoped actions — triggers the tender-ACL overlay if the tender is flagged restricted |
+| `required_access_level` | Minimum tender-ACL grant level a tender-scoped action needs (`view`/`edit`/`approve`) — triggers the tender-ACL overlay if the tender is flagged restricted |
+
+`tender_id` is **not** one of these — it's a per-resource ID, not static route metadata, so it can't be a `context_extensions` value the way the keys above can (Envoy has no mechanism to template a URL segment into a route's static `context_extensions` map per request). Instead it's parsed straight out of `CheckRequest.Attributes.Request.Http.Path` (`internal/adapter/inbound/grpc/requestfacts.go`'s `tenderIDFromPath`), matching the `/tenders/{id}` segment regardless of HTTP method — a route like `/api/v1/tenders/tender-1` or `/api/v1/tenders/tender-1/sections/3` yields `tender-1` whether the method is GET, POST, PATCH, or DELETE.
+
+> **Route-design requirement.** Every tender-scoped route — `GET`, `POST`, `PUT`, `PATCH`, `DELETE` alike — **must** carry the tender ID as a `/tenders/{id}` URL path segment. `tenderIDFromPath` never reads a request body and never reads `context_extensions` for this value, so a route that only places the tender ID in a POST/PATCH/DELETE JSON body will silently skip the tender-ACL overlay for that route (`RequiresTenderACL()` sees an empty `TenderID` and returns `false`) instead of failing loudly — a restricted tender would not actually be protected on that route. This is the responsibility of whoever authors the Envoy/gateway route config for tender-scoped APIs, not something this service can detect or enforce on its own. See [`docs/lld/iam-lld-authz-enrichment.md`](docs/lld/iam-lld-authz-enrichment.md) §4.2 policy 8 and §16 AE-22 for the full rationale.
 
 **On Allow**, `OkHttpResponse.Headers` carries exactly six headers, nothing else — see [decision.go](internal/domain/decision.go):
 
@@ -101,6 +105,11 @@ http_filters:
 
 # Per-route context_extensions attach the policy_action / department_id / etc.
 # facts a raw request doesn't otherwise carry (see the Policy input table above).
+#
+# Tender-scoped routes (GET/POST/PUT/PATCH/DELETE alike) MUST keep the tender
+# ID as a /tenders/{id} URL path segment — never body-only — or the tender-ACL
+# overlay silently doesn't apply to that route. See the Route-design
+# requirement note above.
 ```
 
 ---
@@ -111,6 +120,9 @@ Clean Architecture — dependencies point inward; outer layers never import inne
 
 ```
 iam-authz-enrichment/
+├── api/
+│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels, 15 event types, 0 published
+│   └── embed.go                       # //go:embed asyncapi.yaml — served at GET /asyncapi · GET /asyncapi.yaml
 ├── cmd/server/                        # Composition root: config, logger, cache, org client, gRPC+HTTP servers, 5 SQS consumers
 ├── internal/
 │   ├── domain/                        # Decision, DenyReason, MembershipContext, TenantContext, TenderACL, sentinel errors
@@ -119,18 +131,22 @@ iam-authz-enrichment/
 │   ├── adapter/
 │   │   ├── inbound/
 │   │   │   ├── grpc/                  # ext_authz v3 server — claims/request-facts decode, response encode
-│   │   │   ├── http/                  # /healthz · /readyz · /metrics only — no business logic
+│   │   │   ├── http/                  # /healthz · /readyz · /asyncapi · /asyncapi.yaml — no business logic; /metrics has its own dedicated listener (see cmd/server)
 │   │   │   └── consumer/              # 5 SQS consumers, one per §5 queue
 │   │   └── outbound/
 │   │       ├── valkey/                # Cache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed
-│   │       ├── orgmembership/         # HTTP client — I-8 memberships, I-12 tender-acl, I-14 mfa-freshness
+│   │       ├── orgmembership/         # HTTP client — I-8 memberships (Org & Membership), TAC-4/I-12 tender-acl (iam-tender-acl), I-14 mfa-freshness (Org & Membership)
 │   │       └── metrics/               # Prometheus authz_* series (§10)
 │   └── config/                        # Load() — env vars only, no hot-reload (§11)
-├── docs/architecture/                 # Mermaid diagram sources — see ARCHITECTURE.md
+├── docs/
+│   ├── lld/iam-lld-authz-enrichment.md  # Low-Level Design — precedence chain, cache-key table, §16 AE-# register
+│   ├── architecture/                  # ARCHITECTURE.md's own supporting material — README.md + 7 Mermaid diagram sources
+│   └── runbook.md                     # What to do when each Prometheus alert / CloudWatch DLQ alarm fires
 ├── deploy/
 │   ├── helm/                          # Helm chart — no Ingress/HTTPRoute; Envoy reaches the grpc Service directly by cluster DNS
 │   ├── iam/                           # Reference IAM policy + Terraform snippet (SQS consume-only — see deploy/iam/README.md)
-│   └── monitoring/                    # Prometheus alerting rules + prometheus-adapter config for HPA decision-rate scaling
+│   └── monitoring/                    # Prometheus alerting rules + prometheus-adapter config for HPA decision-rate scaling,
+│                                       # plus an illustrative DLQ CloudWatch-alarm Terraform snippet (see docs/runbook.md)
 ├── scripts/init-localstack.sh         # Creates the 5 queues + their -dlq, with the maxReceiveCount=5 redrive policy
 └── test/
     ├── integration/                   # Real Valkey + LocalStack SQS (build tag `integration`)
@@ -148,7 +164,7 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 | `domain/policy` | `domain` only |
 | `config` | Nothing internal — pure env-var loading |
 | `usecase` | `domain` + `domain/policy` (never a concrete adapter — adapters satisfy `usecase/ports.go` structurally) |
-| `adapter/inbound/*` | `usecase` + `domain` + `domain/policy` |
+| `adapter/inbound/*` | `usecase` + `domain` + `domain/policy`; the one exception is `http`, which additionally imports `api` directly (`asyncapi.go` reads the embedded `api/asyncapi.yaml` — a doc-serving leaf, not the orchestration layer) |
 | `adapter/outbound/*` | `domain` + `domain/policy` only — **never** `usecase` |
 
 ### Storage and messaging
@@ -156,16 +172,68 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 | Concern | Technology | Notes |
 |---------|-----------|-------|
 | **Cache** | Valkey (`go-redis/v9`) | The only persistent-ish state this service touches — no database, no ORM, no migrations |
-| **Sibling service** | Org & Membership (HTTP, mTLS) | I-8 membership rebuild, I-12 tender-ACL, I-14 MFA-freshness — the source of truth behind the cache |
-| **Events (consumed)** | AWS SQS, 5 queues | `platform-events` consumer; DLQ via SQS's own `maxReceiveCount=5` redrive policy, no application code |
+| **Sibling services** | Org & Membership + iam-tender-acl (HTTP, mTLS) | Org & Membership: I-8 membership rebuild, I-14 MFA-freshness. iam-tender-acl: TAC-4 tender-ACL (formerly Org & Membership's I-12, repointed here ADR-0007 Wave 3 Phase 4). Both are the source of truth behind the cache |
+| **Events (consumed)** | AWS SQS, 5 queues | `platform-events` consumer; DLQ via SQS's own `maxReceiveCount=5` redrive policy, no application code. Full contract: [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `/asyncapi` (§ Common commands) |
 | **Events (published)** | None | This service emits nothing to the bus |
 
 ### Shared library dependencies
 
 | Library | Version | Purpose |
 |---------|---------|---------|
-| `platform-gincommon` | v1.2.1 | zap logger, gRPC observability interceptors (panic-recovery/request-id/tracing/metrics/logging), health handler |
+| `platform-gincommon` | v1.3.0 | zap logger, gRPC observability interceptors (panic-recovery/request-id/tracing/metrics/logging), Gin observability middlewares (`/healthz`/`/readyz`), health handler |
 | `platform-events` | v1.4.0 | SQS consumer loop, `Envelope[T]` decoding |
+
+---
+
+## Event architecture
+
+This service is a **pure event consumer** — it subscribes to five SQS queues and publishes **zero** events (no outbox, no SNS/EventBridge producer, no database of any kind to have state changes to announce). Every event received is a cache-invalidation trigger against this service's own Valkey cache, never a domain state mutation of its own.
+
+The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 15 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Realm Provisioner, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
+
+**Envelope shape:** `{id, type, tenant_id, time, data}` — `tenant_id` is a top-level envelope field, never duplicated inside `data`; the `billing-authz-q` events below read only that field, no `data` decode at all.
+
+**Idempotency:** unlike every other IAM service, this service has no database, so there is no `processed_events` table — idempotency is a Valkey `SET NX` on `ae:processed:{event_id}` (7-day TTL). **DLQ:** all five queues use the identical SQS-native `maxReceiveCount=5` redrive (`scripts/init-localstack.sh`), never application code — a DLQ'd message degrades to "this cache entry may be stale until its TTL naturally expires" (5–60s), not a correctness failure requiring replay.
+
+**`membership-authz-q`** (Org & Membership, 6 event types) — all evict the per-user `ae:ctx`/`ae:neg` slice:
+
+| Event type | Consumed field(s) | Effect |
+|---|---|---|
+| `DepartmentMembershipGranted` | `user_id` | Evict `ae:ctx:{tenant}:{user}` + `ae:neg:{tenant}:{user}` |
+| `DepartmentMembershipRevoked` | `user_id` | Same as above |
+| `DepartmentMembershipLevelChanged` | `user_id` | Same as above |
+| `TenantRoleGranted` | `user_id` | Same as above |
+| `TenantRoleRevoked` | `user_id` | Same as above |
+| `MembershipRevoked` | `tenant_id`, `user_id` | Same as above, **plus** best-effort evict every `ae:tender_acl:{tenant}:*:{user}` entry — the whole-membership-removal cascade signal (LLD §16 AE-20); the only event here with a wider eviction, since a full removal leaves per-grant rows inert instead of firing the five events above individually |
+
+**`user-authz-q`** (User Profile, 3 event types):
+
+| Event type | Consumed field(s) | Effect |
+|---|---|---|
+| `UserUpdated` | `user_id`, `changed_fields` | Evict `ae:ctx`/`ae:neg` **only if** `"email"` is in `changed_fields` — the one event in this document with a payload-content filter; every other value is a no-op |
+| `UserAvailabilityChanged` | `user_id` | Evict `ae:ctx:{tenant}:{user}` + `ae:neg:{tenant}:{user}` unconditionally — historically load-bearing for `active_delegations[]`, now a harmless no-op-equivalent eviction since delegation state was extracted (LLD §16 AE-18) |
+| `UserDeleted` | `user_id` | Evict `ae:ctx`/`ae:neg`, plus best-effort evict every `ae:tender_acl:{tenant}:*:{user}` entry |
+
+**`billing-authz-q`** (Billing Service, 3 event types) — all evict the same single tenant-scoped key regardless of which fired, no payload decode beyond the envelope's own `tenant_id`:
+
+| Event type | Consumed field(s) | Effect |
+|---|---|---|
+| `TenantPlanChanged` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
+| `TenantSubscriptionCancelled` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
+| `TenantReactivated` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
+
+**`tenant-authz-q`** (Realm Provisioner, 2 event types) — keep the in-process realm→tenant map fresh for JWT-issuer-based tenant resolution (LLD §8.3); both must be wired, since a direct-paid-signup tenant fires only the second one:
+
+| Event type | Consumed field(s) | Effect |
+|---|---|---|
+| `TenantConverted` | `realm` | Update the realm→tenant map, **plus** evict `ae:tenant:{tenant}` (the realm strategy changed) |
+| `TenantRealmReady` | `realm` | Update the realm→tenant map only — **no** cache eviction |
+
+**`tender-authz-q`** (Tender Service, 1 event type) — flips an in-process fact, not a Valkey write:
+
+| Event type | Consumed field(s) | Effect |
+|---|---|---|
+| `TenderRestricted` | `tender_id` | Mark `(tenant, tender_id)` restricted in the in-process `RestrictedTenderSet` — the §3.1 step-4 tender-ACL overlay only calls out to TAC-4 for a tender this set marks restricted |
 
 ---
 
@@ -173,7 +241,7 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 
 ### Prerequisites
 
-- Go 1.26.5+
+- Go 1.26.6+
 - Docker (for `make docker-up` — Valkey + LocalStack SQS)
 - SSH key or `GO_PRIVATE_TOKEN` registered for `github.com/BCBP-SOLUTIONS-FZC-LLC` (for `platform-gincommon`/`platform-events`)
 
@@ -185,7 +253,7 @@ make docker-up   # start Valkey + LocalStack (SQS) — scripts/init-localstack.s
 make run         # go run ./cmd/server
 ```
 
-`/healthz`, `/readyz`, `/metrics` are served on `APP_PORT` (default `8080`); the `ext_authz` gRPC service listens on `GRPC_PORT` (default `9091`).
+`/healthz`, `/readyz` are served on `APP_PORT` (default `8080`); `/metrics` is served separately on `METRICS_PORT` (default `9090`); the `ext_authz` gRPC service listens on `GRPC_PORT` (default `9091`). `/asyncapi` (HTML event-contract viewer) and `/asyncapi.yaml` (raw spec) are also on `APP_PORT` — always on outside `APP_ENV=production`, opt-in in production via `DOCS_ENABLED` — try `http://localhost:8080/asyncapi` after `make run`.
 
 ### Common commands
 
@@ -250,7 +318,6 @@ cat > mockorg/api/v1/internal/users/alice/memberships <<'EOF'
 {
   "roles": ["tenant_admin"],
   "departments": [{"department_id": "fd72f513-45f0-46ca-a1ed-9183be72484c", "level": "reviewer"}],
-  "active_delegations": [],
   "plan": "pro",
   "feature_flags": ["flag-a"],
   "subscription_status": "active",
@@ -261,8 +328,13 @@ EOF
 (cd mockorg && python3 -m http.server 8081) &
 
 # restart the service pointed at the mock (default 10ms ORG_MEMBERSHIP_TIMEOUT
-# is too tight for Python's dev server — give it real headroom)
-ORG_MEMBERSHIP_BASE_URL=http://localhost:8081 ORG_MEMBERSHIP_TIMEOUT=2s make run
+# is too tight for Python's dev server — give it real headroom). Also point
+# TENDER_ACL_BASE_URL at the same mock server up front — the tender-ACL
+# overlay walkthrough below (TAC-4, formerly I-12) reuses this one server
+# for both, since its paths (/api/v1/internal/users/... vs.
+# /internal/tenants/...) don't collide.
+ORG_MEMBERSHIP_BASE_URL=http://localhost:8081 ORG_MEMBERSHIP_TIMEOUT=2s \
+TENDER_ACL_BASE_URL=http://localhost:8081 TENDER_ACL_TIMEOUT=2s make run
 ```
 
 Re-running the same `grpcurl`/`grpcui` `Check` call from above (`sub: "alice"`, `tenant_id: "tenant-acme"`) now returns `okResponse` with all six headers (`x-tenant-id: tenant-acme`, `x-user-id: alice`, `x-departments: fd72f513-45f0-46ca-a1ed-9183be72484c:reviewer`, `x-tenant-roles: tenant_admin`, `x-plan: pro`, `x-feature-flags: flag-a`) instead of a denial. `department_id` is a UUID here to match the real Org & Membership schema (`departments.id`) — this service passes whatever string the sibling sends straight through as `<department_id>:<level>` (`internal/usecase/check.go`'s `buildHeaders`) without interpreting its format, so the mock could use any string, but a UUID is what production actually looks like.
@@ -276,16 +348,16 @@ From there, edit the JSON file (or the request) to exercise other branches of §
 
 #### Testing the tender-ACL overlay (§3.1 step 4)
 
-This overlay only runs when a request is tender-scoped *and* the tender has been flagged restricted via a real `TenderRestricted` event (§5) — there's no direct way to flip it, by design (§2: this service never invents policy state, it only reacts to events). Add the I-12 mock, then walk through all three states.
+This overlay only runs when a request is tender-scoped *and* the tender has been flagged restricted via a real `TenderRestricted` event (§5) — there's no direct way to flip it, by design (§2: this service never invents policy state, it only reacts to events). Add the TAC-4 mock (formerly I-12 — note the path has **no** `/api/v1` prefix, unlike every Org & Membership mock above: iam-tender-acl registers this route directly under `/internal`, see its LLD §8.3), then walk through all three states.
 
 ```sh
-mkdir -p mockorg/api/v1/internal/tenants/tenant-acme/tenders/tender-1/acl
-cat > mockorg/api/v1/internal/tenants/tenant-acme/tenders/tender-1/acl/alice <<'EOF'
+mkdir -p mockorg/internal/tenants/tenant-acme/tenders/tender-1/acl
+cat > mockorg/internal/tenants/tenant-acme/tenders/tender-1/acl/alice <<'EOF'
 {"has_access": true, "access_level": "approve", "expires_at": "2026-08-12T00:00:00Z"}
 EOF
 ```
 
-**1. Not flagged restricted yet** — the overlay is skipped entirely (default department membership is enough), even with `tender_id`/`required_access_level` set on the request:
+**1. Not flagged restricted yet** — the overlay is skipped entirely (default department membership is enough), even with a `/tenders/{id}` path and `required_access_level` set on the request:
 
 ```sh
 grpcurl -plaintext -d '{
@@ -294,18 +366,18 @@ grpcurl -plaintext -d '{
       "sub": "alice", "iss": "https://kc.example.com/realms/shared-trial", "tenant_id": "tenant-acme"
     }}}},
     "request": { "http": { "method": "GET", "path": "/api/v1/tenders/tender-1" } },
-    "context_extensions": { "tender_id": "tender-1", "required_access_level": "view" }
+    "context_extensions": { "required_access_level": "view" }
   }
 }' localhost:9091 envoy.service.auth.v3.Authorization/Check
 ```
 → `okResponse` (Allow).
 
-**2. Flag it restricted**, then re-run the exact same `Check` call — now it actually calls I-12, gets `access_level: "approve"` (satisfies the required `"view"`), and still allows:
+**2. Flag it restricted**, then re-run the exact same `Check` call — now it actually calls TAC-4 (iam-tender-acl), gets `access_level: "approve"` (satisfies the required `"view"`), and still allows:
 
 ```sh
 EVENT_ID=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
 docker compose exec localstack awslocal sqs send-message \
-  --queue-url http://localhost:4566/000000000000/tender-authz-q \
+  --queue-url http://localhost:4571/000000000000/tender-authz-q \
   --region ap-south-1 \
   --message-body "{
     \"id\": \"$EVENT_ID\", \"type\": \"TenderRestricted\", \"tenant_id\": \"tenant-acme\",
@@ -317,12 +389,12 @@ sleep 2   # let the consumer pick it up before re-running Check
 **3. Flip the mock to an insufficient grant** and re-run `Check` a third time — now `DENY_TENDER_ACL_INSUFFICIENT`:
 
 ```sh
-cat > mockorg/api/v1/internal/tenants/tenant-acme/tenders/tender-1/acl/alice <<'EOF'
+cat > mockorg/internal/tenants/tenant-acme/tenders/tender-1/acl/alice <<'EOF'
 {"has_access": false, "access_level": "", "expires_at": "2026-08-12T00:00:00Z"}
 EOF
 ```
 
-Note `ae:tender_acl:*` caches for 15s (§4.1) — if you flip the mock and re-run within that window against an *already-cached* grant, you'll still see the old cached result. Wait a beat, or just don't worry about it: real I-12 answers never 404 or flap this fast in production.
+Note `ae:tender_acl:*` caches for 15s (§4.1) — if you flip the mock and re-run within that window against an *already-cached* grant, you'll still see the old cached result. Wait a beat, or just don't worry about it: real TAC-4 answers never 404 or flap this fast in production.
 
 #### Testing the MFA-freshness gate (§3.1 step 5)
 
@@ -385,13 +457,13 @@ The five SQS queues are created automatically by `docker compose up` (via `scrip
 
 ```sh
 # Option A: your own AWS CLI (brew install awscli), pointed at LocalStack
-aws --endpoint-url=http://localhost:4566 sqs list-queues --region ap-south-1
+aws --endpoint-url=http://localhost:4571 sqs list-queues --region ap-south-1
 
 # Option B: no install — run it through the container instead
 docker compose exec localstack awslocal sqs list-queues --region ap-south-1
 ```
 
-Every command below works with either CLI — swap `aws --endpoint-url=http://localhost:4566` for `docker compose exec localstack awslocal` if you're using Option B:
+Every command below works with either CLI — swap `aws --endpoint-url=http://localhost:4571` for `docker compose exec localstack awslocal` if you're using Option B:
 
 ```sh
 # 1. Start infrastructure
@@ -410,7 +482,7 @@ make run
 #    nothing gets evicted. That's the dedup contract working, not a bug.
 EVENT_ID=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
 docker compose exec localstack awslocal sqs send-message \
-  --queue-url http://localhost:4566/000000000000/membership-authz-q \
+  --queue-url http://localhost:4571/000000000000/membership-authz-q \
   --region ap-south-1 \
   --message-body "{
     \"id\": \"$EVENT_ID\", \"type\": \"DepartmentMembershipGranted\", \"tenant_id\": \"tenant-acme\",
@@ -431,7 +503,7 @@ done
 # from Org & Membership instead of serving the evicted (now-stale) entry.
 ```
 
-See [`ARCHITECTURE.md` §Event flow](ARCHITECTURE.md#event-flow) for the full consumed-event-type table and the dedup/DLQ contract.
+See [§ Event architecture](#event-architecture) for the full per-queue event-type table, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
 
 ---
 
@@ -457,21 +529,24 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `APP_PORT` / `GRPC_PORT` | `8080` / `9091` | HTTP (health/metrics) and gRPC (`ext_authz`) listen ports |
-| `VALKEY_URL` | `localhost:6379` | `rediss://` for TLS in-transit in prod/staging |
+| `APP_PORT` / `METRICS_PORT` / `GRPC_PORT` | `8080` / `9090` / `9091` | HTTP (health only), metrics (`/metrics`, separate listener), and gRPC (`ext_authz`) listen ports |
+| `VALKEY_URL` | `localhost:6379` | `.env-example` recommends `localhost:6384` for local dev (matches `docker-compose.yml`'s host-mapped port so it doesn't collide with a system-wide Redis/Valkey on the default port); `rediss://` for TLS in-transit in prod/staging |
+| `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=production`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled |
 | `AE_CTX_TTL` / `AE_CTX_JITTER` | `60s` / `6s` | §4.1 — desyncs expiry across replicas |
 | `AE_TENDER_ACL_TTL` / `AE_NEG_TTL` | `15s` / `5s` | Half the sibling's own TTL / negative-cache storm collapse |
 | `AE_STALE_IF_ERROR_MAX_AGE` | `5m` | Hard-capped at 5m regardless of configured value (§7) |
-| `ORG_MEMBERSHIP_BASE_URL` / `_TIMEOUT` | `http://localhost:8081` / `10ms` | Aggressive timeout — headroom inside the 15ms p99 budget |
+| `ORG_MEMBERSHIP_BASE_URL` / `_TIMEOUT` | `http://localhost:8081` / `10ms` | I-8/I-14. Aggressive timeout — headroom inside the 15ms p99 budget |
+| `TENDER_ACL_BASE_URL` / `TENDER_ACL_TIMEOUT` | `http://localhost:8086` / `20ms` | TAC-4 (formerly I-12) against iam-tender-acl, ADR-0007 Wave 3 Phase 4 — sized against that service's own 5ms-hit/20ms-miss SLO, not reused from `ORG_MEMBERSHIP_TIMEOUT` |
 | `SHARED_REALM_ISSUER` | _(empty)_ | Keycloak issuer for the shared trial realm |
 | `REALM_TENANT_MAP_SEED` | `{}` | Startup-only JSON seed for dedicated realms; kept fresh at runtime by events, never re-read |
 | `JWT_METADATA_NAMESPACE` / `JWT_PAYLOAD_KEY` | `envoy.filters.http.jwt_authn` / `trial` | Must match the Envoy `jwt_authn` filter config |
 | `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups |
+| `*_AUTHZ_QUEUE_CONCURRENCY` (5 vars) | `4` each | `events.WithConcurrency` per queue — messages handed to handler goroutines at once, instead of `platform-events`' library default of `1` (fully serial per queue) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `localstack` | AWS credentials (use IRSA in production — reference IAM policy + Terraform snippet under [`deploy/iam/`](deploy/iam/)) |
 | `GRPC_MAX_RECV_MSG_SIZE_BYTES` / `_SEND_` | `262144` (256KiB) | Defense-in-depth, not a real operating limit — `CheckRequest`/`CheckResponse` are small |
 | `GRPC_TLS_CERT_FILE` / `_KEY_FILE` / `_CLIENT_CA_FILE` | _(empty → plaintext)_ | App-level TLS/mTLS for deployments with no service-mesh sidecar or CNI-level encryption — see § Security |
 
-Startup fails fast (not silently) if `ORG_MEMBERSHIP_BASE_URL` is left at its local-dev default (`http://localhost:8081`) outside `APP_ENV=dev` — see `docs/runbook.md`.
+Startup fails fast (not silently) if `ORG_MEMBERSHIP_BASE_URL` or `TENDER_ACL_BASE_URL` is left at its local-dev default (`http://localhost:8081` / `http://localhost:8086`) outside `APP_ENV=dev` — see `docs/runbook.md`.
 
 ---
 
@@ -513,6 +588,24 @@ Pushing a `v*` tag triggers `.github/workflows/release.yml` — validate → bui
 
 ---
 
+## Versioning and releases
+
+| Version bump | When |
+|---|---|
+| **MAJOR** | Breaking change to the runtime contract — `DenyReason` values, the six injected headers, `CheckRequest` field usage, required env vars, `values.yaml` shape |
+| **MINOR** | New backward-compatible capability |
+| **PATCH** | Bug fix, performance improvement, documentation correction |
+
+```bash
+# Tag and push triggers the release workflow automatically.
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+See [VERSIONING.md](VERSIONING.md) for the full SemVer rules, what counts as the runtime contract, supported releases, image-tag/pin scheme, and the complete maintainer release checklist.
+
+---
+
 ## Docker
 
 ```sh
@@ -543,6 +636,9 @@ For local development, running `make docker-up` (Valkey + LocalStack only) and `
 ## See also
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layer model, request-flow/cache/event/failure-handling diagrams, key invariants, threat model.
+- [`docs/lld/iam-lld-authz-enrichment.md`](docs/lld/iam-lld-authz-enrichment.md) — the Low-Level Design: precedence chain, cache-key table, §7 event-invalidation narrative, §9 `DenyReason`/status table, §16 `AE-#` decision register.
+- [`api/asyncapi.yaml`](api/asyncapi.yaml) — the 5-queue/15-event-type consumer contract (see [§ Event architecture](#event-architecture)); also served live at `GET /asyncapi`/`GET /asyncapi.yaml`.
+- [`VERSIONING.md`](VERSIONING.md) — SemVer rules for the runtime contract, image tag scheme, maintainer release checklist.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch naming, PR checklist, commit style, how to extend each layer.
 - [`docs/architecture/`](docs/architecture/) — standalone Mermaid diagram sources.
 - [`docs/runbook.md`](docs/runbook.md) — what to do when each alert fires, and the common failure modes behind them.

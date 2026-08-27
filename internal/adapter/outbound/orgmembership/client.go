@@ -1,9 +1,13 @@
-// Package orgmembership is the outbound HTTP adapter for the three sibling
-// Org & Membership calls (LLD §6): membership rebuild (I-8), tender-ACL
-// check (I-12), and the dedicated MFA-freshness read (I-14). All three run
-// over mTLS within the mesh with an aggressive, single-digit-ms-beyond-Valkey
-// timeout — there's no latency headroom in the 15ms p99 budget to wait on a
-// slow sibling call.
+// Package orgmembership is the outbound HTTP adapter for this service's
+// synchronous sibling calls (LLD §6): membership rebuild (I-8) and the
+// dedicated MFA-freshness read (I-14) against Org & Membership, plus the
+// tender-ACL check (TAC-4, formerly I-12) against iam-tender-acl (ADR-0007
+// Wave 3 Phase 4 — that call moved to a different sibling when
+// tender_acl_entries was extracted into its own service; the package name
+// predates that split and is kept for now to avoid an unrelated rename
+// churning this file's history). All three run over mTLS within the mesh
+// with an aggressive, single-digit-ms-beyond-Valkey timeout — there's no
+// latency headroom in the 15ms p99 budget to wait on a slow sibling call.
 package orgmembership
 
 import (
@@ -28,30 +32,39 @@ var (
 	ErrUnavailable = domain.ErrUnavailable
 )
 
-// Client calls the three Org & Membership internal endpoints.
+// Client calls the three sibling internal endpoints: I-8/I-14 against Org &
+// Membership, and I-12 against iam-tender-acl (ADR-0007 Wave 3 Phase 4 —
+// I-12 moved out of Org & Membership when tender_acl_entries was extracted
+// into its own service; I-8/I-14 were unaffected and stay put). Two
+// independent base URLs/timeouts/http.Clients, not one shared set, since
+// these are now genuinely two different downstream services with two
+// different latency budgets.
 type Client struct {
 	baseURL string
 	http    *http.Client
+
+	tenderACLBaseURL string
+	tenderACLHTTP    *http.Client
 }
 
-// New builds a Client. timeout is applied to every call — per §6, an
-// aggressive timeout that leaves headroom inside the 15ms p99 budget even on
-// a cache miss.
-func New(baseURL string, timeout time.Duration) *Client {
+// New builds a Client. timeout is applied to every Org & Membership call
+// (I-8/I-14) — per §6, an aggressive timeout that leaves headroom inside the
+// 15ms p99 budget even on a cache miss. tenderACLTimeout applies only to
+// GetTenderACL (I-12), sized against iam-tender-acl's own TAC-4 SLO
+// (5ms cache-hit/20ms cache-miss) rather than reused from timeout, since the
+// two downstream services no longer share a latency profile.
+func New(baseURL string, timeout time.Duration, tenderACLBaseURL string, tenderACLTimeout time.Duration) *Client {
 	return &Client{
 		baseURL: baseURL,
 		http:    &http.Client{Timeout: timeout},
+
+		tenderACLBaseURL: tenderACLBaseURL,
+		tenderACLHTTP:    &http.Client{Timeout: tenderACLTimeout},
 	}
 }
 
-// departmentDTO/delegationDTO/membershipsResponse mirror I-8's wire shape.
+// departmentDTO/membershipsResponse mirror I-8's wire shape.
 type departmentDTO struct {
-	DepartmentID string `json:"department_id"`
-	Level        string `json:"level"`
-}
-
-type delegationDTO struct {
-	FromUserID   string `json:"from_user_id"`
 	DepartmentID string `json:"department_id"`
 	Level        string `json:"level"`
 }
@@ -65,7 +78,6 @@ type delegationDTO struct {
 type membershipsResponse struct {
 	Roles               []string        `json:"roles"`
 	Departments         []departmentDTO `json:"departments"`
-	ActiveDelegations   []delegationDTO `json:"active_delegations"`
 	Plan                string          `json:"plan"`
 	FeatureFlags        []string        `json:"feature_flags"`
 	SubscriptionStatus  string          `json:"subscription_status"`
@@ -83,9 +95,6 @@ func (r membershipsResponse) MembershipContext() domain.MembershipContext {
 	}
 	for _, d := range r.Departments {
 		m.Departments = append(m.Departments, domain.Department{DepartmentID: d.DepartmentID, Level: d.Level})
-	}
-	for _, d := range r.ActiveDelegations {
-		m.Delegations = append(m.Delegations, domain.Delegation{FromUserID: d.FromUserID, DepartmentID: d.DepartmentID, Level: d.Level})
 	}
 	return m
 }
@@ -122,17 +131,28 @@ func (c *Client) GetMemberships(ctx context.Context, tenant, user string) (domai
 	return resp.MembershipContext(), resp.TenantContext(), nil
 }
 
-// GetTenderACL calls I-12: GET /api/v1/internal/tenants/:id/tenders/:tender_id/acl/:user_id.
-// domain.TenderACL's json tags already match I-12's wire shape exactly, so no
-// separate DTO is needed for decoding. This endpoint never returns 404 — absence of a grant is HasAccess: false,
-// itself a valid, cacheable answer (§6 point 2). Only network/5xx failures
-// produce ErrUnavailable here.
+// GetTenderACL calls TAC-4 (formerly I-12) on iam-tender-acl: GET
+// /internal/tenants/:id/tenders/:tender_id/acl/:user_id — no /api/v1
+// prefix, unlike every other internal route in this file. This is
+// deliberate, not a typo: iam-tender-acl registers its mesh-only routes
+// directly under /internal (tender-acl-service-lld.md §8.3), whereas Org &
+// Membership nests internal routes under /api/v1/internal. ADR-0007 Wave 3
+// Phase 4 repointed this one call here from Org & Membership's now-retired
+// (410 Gone, pending Phase 6 deletion) I-12 handler.
+//
+// domain.TenderACL's json tags already match the wire shape exactly (both
+// the old I-12 response and the new TAC-4 response — TAC-4 additionally
+// sends expires_at, which I-12 never did, but ExpiresAt is decoded-and-
+// unused by this service regardless, so this is a compatible superset, not
+// a breaking change). This endpoint never returns 404 — absence of a grant
+// is HasAccess: false, itself a valid, cacheable answer (§6 point 2). Only
+// network/5xx failures produce ErrUnavailable here.
 func (c *Client) GetTenderACL(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
-	u := fmt.Sprintf("%s/api/v1/internal/tenants/%s/tenders/%s/acl/%s",
-		c.baseURL, url.PathEscape(tenant), url.PathEscape(tenderID), url.PathEscape(user))
+	u := fmt.Sprintf("%s/internal/tenants/%s/tenders/%s/acl/%s",
+		c.tenderACLBaseURL, url.PathEscape(tenant), url.PathEscape(tenderID), url.PathEscape(user))
 
 	var resp domain.TenderACL
-	if err := c.getJSON(ctx, u, &resp); err != nil {
+	if err := c.getJSONWith(ctx, c.tenderACLHTTP, u, &resp); err != nil {
 		return domain.TenderACL{}, err
 	}
 	return resp, nil
@@ -157,11 +177,19 @@ func (c *Client) GetMFAFreshness(ctx context.Context, tenant string) (time.Durat
 }
 
 func (c *Client) getJSON(ctx context.Context, u string, out any) error {
+	return c.getJSONWith(ctx, c.http, u, out)
+}
+
+// getJSONWith is getJSON parameterized on which http.Client to use — I-8/
+// I-14 (GetMemberships/GetMFAFreshness) go through getJSON's c.http
+// (Org & Membership's timeout); GetTenderACL goes through c.tenderACLHTTP
+// (iam-tender-acl's own timeout) via this method directly.
+func (c *Client) getJSONWith(ctx context.Context, httpClient *http.Client, u string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return fmt.Errorf("%w: build request: %v", ErrUnavailable, err)
 	}
-	resp, err := c.http.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}

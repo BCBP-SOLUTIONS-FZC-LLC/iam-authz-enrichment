@@ -1,11 +1,11 @@
 graph TD
     subgraph cmd["Composition Root  —  cmd/"]
-        main["server/main.go\nwires config → logger → metrics → cache → org client\n→ realm map / restricted-tender set → Checker / Invalidator\n→ gRPC server (ext_authz) + HTTP server (health/metrics) + 5 SQS consumers\ngraceful shutdown order: gRPC → HTTP → consumers → cancel bg work → cache.Close"]
+        main["server/main.go\nwires config → logger → metrics → cache → org client\n→ realm map / restricted-tender set → Checker / Invalidator\n→ gRPC server (ext_authz) + HTTP server (health only) + metrics server (own port)\n+ 5 SQS consumers, each with its own events.WithConcurrency\ngraceful shutdown order: gRPC → HTTP → metrics → consumers → cancel bg work → cache.Close"]
     end
 
     subgraph adapters_in["Inbound Adapters  —  internal/adapter/inbound/"]
-        grpc_a["grpc/\nServer — envoy.service.auth.v3.Authorization\nclaims.go — decodeClaims (Envoy jwt_authn dynamic metadata ONLY,\nnever request headers — §8.2)\nrequestfacts.go — decodeRequestFacts (route ContextExtensions)\nresponse.go — okResponse / deniedResponse (§9 status mapping)"]
-        http_a["http/\nrouter.go — /healthz · /readyz · /metrics only, no business logic\nReadinessProbe reports process-startup, NOT dependency health\n(§7 bypass/stale-if-error modes must stay in rotation)"]
+        grpc_a["grpc/\nServer — envoy.service.auth.v3.Authorization\nclaims.go — decodeClaims (Envoy jwt_authn dynamic metadata ONLY,\nnever request headers — §8.2)\nrequestfacts.go — decodeRequestFacts (route ContextExtensions +\ntenderIDFromPath: tender_id parsed from the raw URL path, never\ncontext_extensions — §5.1/AE-22)\nresponse.go — okResponse / deniedResponse (§9 status mapping)"]
+        http_a["http/\nrouter.go — /healthz · /readyz, plus the DocsConfig-gated AsyncAPI\nviewer (/asyncapi, /asyncapi.yaml — asyncapi.go, api/embed.go)\nno business logic either way; /metrics has its own dedicated listener\nwires gincommon.ObservabilityMiddlewares — same fleet-wide stack\niam-org-membership/iam-user-profile put in front of their Gin routers\nReadinessProbe reports process-startup, NOT dependency health\n(§7 bypass/stale-if-error modes must stay in rotation)"]
         consumer_a["consumer/\n5 SQS consumers: membership · user · billing · tenant · tender\ndedupingHandler — ae:processed SET NX, with EvictProcessed on\nhandler failure so a permanently-bad message still reaches the DLQ"]
     end
 
@@ -19,14 +19,14 @@ graph TD
 
     subgraph domain["Domain  —  internal/domain/ + internal/domain/policy/"]
         decision["decision.go — Decision, DenyReason\n(§9 HTTP-status mapping), the 6 InjectedHeaders names"]
-        context_v["context.go — MembershipContext, TenantContext,\nDepartment, Delegation, TenderACL"]
+        context_v["context.go — MembershipContext, TenantContext,\nDepartment, TenderACL"]
         errs["errors.go — ErrNotFound, ErrUnavailable\n(shared vocabulary between adapters and usecase)"]
         policy_p["policy/ — EvaluateBase, ViolatesReadOnly,\nMeetsDepartmentLevel, RequestFacts\n(pure predicates, zero I/O — §3)"]
     end
 
     subgraph adapters_out["Outbound Adapters  —  internal/adapter/outbound/"]
         valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
-        org_a["orgmembership/\nClient — I-8 memberships · I-12 tender-acl · I-14 mfa-freshness\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
+        org_a["orgmembership/\nClient — I-8 memberships + I-14 mfa-freshness against Org & Membership,\nTAC-4 tender-acl (formerly I-12) against iam-tender-acl since ADR-0007\nWave 3 Phase 4 — two base URLs/timeouts, one Go package\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
         metrics_a["metrics/\nRecorder — Prometheus authz_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
     end
 

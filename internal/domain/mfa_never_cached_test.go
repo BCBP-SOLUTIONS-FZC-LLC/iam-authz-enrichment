@@ -34,7 +34,6 @@ func TestMFAFreshnessSecondsNeverCached(t *testing.T) {
 	membership := domain.MembershipContext{
 		Roles:       []string{"tenant_admin"},
 		Departments: []domain.Department{{DepartmentID: "d1", Level: "approver"}},
-		Delegations: []domain.Delegation{{FromUserID: "u2", DepartmentID: "d1", Level: "approver"}},
 	}
 	b, err := json.Marshal(membership)
 	require.NoError(t, err)

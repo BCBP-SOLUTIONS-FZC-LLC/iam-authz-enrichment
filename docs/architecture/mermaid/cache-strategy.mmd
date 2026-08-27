@@ -1,6 +1,6 @@
 flowchart TD
     subgraph keys["Valkey Key Namespace (§4.1) — every key is tenant-scoped by construction"]
-        k1["ae:ctx:{tenant}:{user} → MembershipContext (roles, departments, delegations)\nsoft TTL 60s ± 6s jitter · physical TTL = soft + 5m grace"]
+        k1["ae:ctx:{tenant}:{user} → MembershipContext (roles, departments)\nsoft TTL 60s ± 6s jitter · physical TTL = soft + 5m grace"]
         k2["ae:tenant:{tenant} → TenantContext (plan, feature_flags, subscription_status, read_only)\nsplit from ae:ctx so a tenant-wide event is ALWAYS a single-key eviction, never a SCAN\nsame soft-TTL/grace envelope as ae:ctx"]
         k3["ae:tender_acl:{tenant}:{tender}:{user} → TenderACL{has_access, access_level}\nflat 15s TTL — half the sibling's own 30s TTL — no stale-if-error branch"]
         k4["ae:neg:{tenant}:{user} → sentinel — subject rebuild returned 404\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
@@ -34,6 +34,7 @@ flowchart TD
 
     subgraph invalidate["Event-driven eviction (§5) — always single-key or tenant-scoped-slice"]
         i1["DepartmentMembership* / TenantRole* → DEL ae:ctx + DEL ae:neg"]
+        i1b["MembershipRevoked (§16 AE-20, whole-membership removal) →\nDEL ae:ctx + DEL ae:neg + best-effort SCAN-DEL ae:tender_acl:*:{user}"]
         i2["UserUpdated(email) / UserAvailabilityChanged → DEL ae:ctx + DEL ae:neg"]
         i3["UserDeleted → DEL ae:ctx + DEL ae:neg + best-effort SCAN-DEL ae:tender_acl:*:{user}"]
         i4["TenantPlanChanged / *SubscriptionCancelled / *Reactivated → DEL ae:tenant ONLY"]

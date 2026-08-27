@@ -5,7 +5,7 @@
 # a Gateway API Route. There is nothing to route to; the grpc Service below
 # is reached by cluster DNS name, same as any other internal gRPC backend.
 
-replicaCount: 3
+replicaCount: 5
 
 image:
   repository: ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment
@@ -20,17 +20,23 @@ serviceAccount:
   # from envFromSecret / secretValues and rely on the pod's ambient IAM role instead.
   annotations: {}
 
-# Two ports: grpc is the actual traffic (Envoy's Authorization.Check calls);
-# http carries only /healthz, /readyz, and /metrics — no business routes.
+# Three ports: grpc is the actual traffic (Envoy's Authorization.Check
+# calls); http carries only /healthz and /readyz — no business routes;
+# metrics is /metrics on its own dedicated port/listener, separate from
+# http — mirrors iam-org-membership's/iam-tender-acl's/iam-user-profile's/
+# iam-catalog-admin's identical split (fleet-wide consistency; http here
+# already carries no business API, so this isn't closing a NetworkPolicy
+# gap the way it does for those services).
 service:
   type: ClusterIP
   grpcPort: 9091
   httpPort: 8080
+  metricsPort: 9090
 
 autoscaling:
   enabled: true
-  minReplicas: 3
-  maxReplicas: 10
+  minReplicas: 5
+  maxReplicas: 20
   targetCPUUtilizationPercentage: 70
   targetMemoryUtilizationPercentage: 75
   # RPS-equivalent: every Check() call produces exactly one authz_decisions_total
@@ -49,6 +55,7 @@ resources:
 env:
   APP_ENV: "production"
   APP_PORT: "8080"
+  METRICS_PORT: "9090"
   GRPC_PORT: "9091"
 
   # §4.1 cache TTLs / jitter and the §7 stale-if-error hard cap. Defaults match
@@ -60,10 +67,16 @@ env:
   AE_PROCESSED_EVENT_TTL: "168h"
   AE_STALE_IF_ERROR_MAX_AGE: "5m"
 
-  # Org & Membership sibling service (§6) — I-8/I-12/I-14. Required: point at
+  # Org & Membership sibling service (§6) — I-8/I-14. Required: point at
   # the real in-cluster service, e.g. http://iam-org-membership.iam.svc.cluster.local:8080.
   ORG_MEMBERSHIP_BASE_URL: ""
   ORG_MEMBERSHIP_TIMEOUT: "10ms"
+
+  # iam-tender-acl sibling service — TAC-4 (formerly I-12), repointed here
+  # from Org & Membership per ADR-0007 Wave 3 Phase 4. Required: point at
+  # the real in-cluster service, e.g. http://iam-tender-acl.iam.svc.cluster.local:8080.
+  TENDER_ACL_BASE_URL: ""
+  TENDER_ACL_TIMEOUT: "20ms"
 
   # Tenant resolution (§2 point 3). SHARED_REALM_ISSUER is required — the
   # Keycloak issuer for the shared trial realm. REALM_TENANT_MAP_SEED is a
@@ -140,8 +153,9 @@ secretValues:
 terminationGracePeriodSeconds: 60
 
 # podDisruptionBudget — ensures at least 2 pods survive voluntary disruptions
-# (node drains, cluster upgrades). Requires replicaCount >= 3 (the default);
-# set enabled: false only when running fewer than 3 replicas (dev/staging scale-down).
+# (node drains, cluster upgrades). Requires replicaCount >= 3 (comfortably
+# true at the default of 5); set enabled: false only when running fewer than
+# 3 replicas (dev/staging scale-down).
 podDisruptionBudget:
   enabled: true
   minAvailable: 2

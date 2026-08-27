@@ -25,10 +25,12 @@ func NewInvalidator(cache Cache, realmMap *RealmMap, restricted *RestrictedTende
 }
 
 // MembershipEventPayload is membership-authz-q's decoded payload —
-// DepartmentMembershipGranted/Revoked/LevelChanged and
-// TenantRoleGranted/Revoked all carry the same shape and all evict the same
-// single key; this service evicts rather than patches, so it doesn't need
-// to know which specific fact changed.
+// DepartmentMembershipGranted/Revoked/LevelChanged, TenantRoleGranted/
+// Revoked, and MembershipRevoked all carry the same {user_id, ...} shape;
+// this service evicts rather than patches, so it doesn't need to know which
+// specific fact changed. MembershipRevoked additionally carries an
+// optional actor_id (LLD §16 AE-20), ignored here like every other unused
+// wire field.
 type MembershipEventPayload struct {
 	UserID string `json:"user_id"`
 }
@@ -47,6 +49,29 @@ func (inv *Invalidator) HandleMembershipEvent(ctx context.Context, tenant string
 	// correctness problem.
 	if err := inv.cache.EvictNegative(ctx, tenant, p.UserID); err != nil {
 		return fmt.Errorf("evict ae:neg: %w", err)
+	}
+	return nil
+}
+
+// HandleMembershipRevoked evicts ae:ctx/ae:neg plus every ae:tender_acl
+// entry for the user, best-effort (LLD §16 AE-20). MembershipRevoked is Org
+// & Membership's per-user removal cascade signal: a full member removal
+// soft-deletes the tenant_memberships row and leaves the user's role/dept
+// grants inert rather than firing per-grant *Revoked events, so this is the
+// only membership-authz-q event that fires on a whole-membership removal —
+// without it, ae:ctx would serve a stale Allow until its 60s TTL. Same
+// best-effort tender-ACL semantics as HandleUserDeleted: a partial scan
+// failure degrades to "stale until its 15s TTL expires", not a correctness
+// failure requiring retry.
+func (inv *Invalidator) HandleMembershipRevoked(ctx context.Context, tenant string, p MembershipEventPayload) error {
+	if err := inv.cache.EvictMembershipContext(ctx, tenant, p.UserID); err != nil {
+		return fmt.Errorf("evict ae:ctx: %w", err)
+	}
+	if err := inv.cache.EvictNegative(ctx, tenant, p.UserID); err != nil {
+		return fmt.Errorf("evict ae:neg: %w", err)
+	}
+	if err := inv.cache.EvictTenderACLForUser(ctx, tenant, p.UserID); err != nil {
+		inv.log.Warn("best-effort tender-acl eviction failed on MembershipRevoked", map[string]interface{}{"error": err.Error()})
 	}
 	return nil
 }

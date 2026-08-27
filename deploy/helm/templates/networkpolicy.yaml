@@ -33,7 +33,11 @@ spec:
         - port: {{ .Values.service.grpcPort }}
           protocol: TCP
 
-    # Allow Prometheus to scrape /metrics — restricted to the monitoring namespace.
+    # Allow Prometheus to scrape :9090/metrics — restricted to the
+    # monitoring namespace. Metrics live on their own port, separate from
+    # both grpc (the real traffic) and http (healthz/readyz only) — mirrors
+    # the sibling fleet's identical split, for consistency, though here
+    # http already carried no business API to protect.
     {{- if .Values.networkPolicy.metricsIngress.enabled }}
     - from:
         - namespaceSelector:
@@ -43,7 +47,7 @@ spec:
             matchLabels:
               {{- toYaml .Values.networkPolicy.metricsIngress.podSelector | nindent 14 }}
       ports:
-        - port: {{ .Values.service.httpPort }}
+        - port: {{ .Values.service.metricsPort }}
           protocol: TCP
     {{- end }}
 
@@ -74,9 +78,11 @@ spec:
         - port: 4317
           protocol: TCP
 
-    # Org & Membership (ORG_MEMBERSHIP_BASE_URL) has no fixed port convention
-    # the way Valkey/AWS do — add a rule for it via additionalEgressRules,
-    # e.g. the in-cluster port that service actually listens on.
+    # Org & Membership (ORG_MEMBERSHIP_BASE_URL) and iam-tender-acl
+    # (TENDER_ACL_BASE_URL, ADR-0007 Wave 3 Phase 4) have no fixed port
+    # convention the way Valkey/AWS do — add a rule for each via
+    # additionalEgressRules, e.g. the in-cluster port each service actually
+    # listens on.
     {{- with .Values.networkPolicy.additionalEgressRules }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

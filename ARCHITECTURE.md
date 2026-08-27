@@ -2,7 +2,7 @@
 
 This document describes the internal structure, dependency rules, and runtime data flows of `iam-authz-enrichment`.
 
-`iam-authz-enrichment` is a **private, stateless Go service** (`github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment`, Go 1.26.5+) deployed as a containerised microservice (5–20 replicas, HPA on RPS). It implements Envoy's `ext_authz` v3 gRPC interface — the Policy Decision Point for every authenticated request on the platform. It owns no durable database: it is a Valkey-backed read-through cache in front of the Org & Membership service, plus policy logic expressed as plain Go predicate functions (no OPA/Rego, §3).
+`iam-authz-enrichment` is a **private, stateless Go service** (`github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment`, Go 1.26.6+) deployed as a containerised microservice (5–20 replicas, HPA on RPS). It implements Envoy's `ext_authz` v3 gRPC interface — the Policy Decision Point for every authenticated request on the platform. It owns no durable database: it is a Valkey-backed read-through cache in front of the Org & Membership service, plus policy logic expressed as plain Go predicate functions (no OPA/Rego, §3).
 
 ---
 
@@ -15,12 +15,12 @@ The service is organised in concentric Clean Architecture layers. Inner layers h
 ```mermaid
 graph TD
     subgraph cmd["Composition Root  —  cmd/"]
-        main["server/main.go\nwires config → logger → metrics → cache → org client\n→ realm map / restricted-tender set → Checker / Invalidator\n→ gRPC server (ext_authz) + HTTP server (health/metrics) + 5 SQS consumers\ngraceful shutdown order: gRPC → HTTP → consumers → cancel bg work → cache.Close"]
+        main["server/main.go\nwires config → logger → metrics → cache → org client\n→ realm map / restricted-tender set → Checker / Invalidator\n→ gRPC server (ext_authz) + HTTP server (health only) + metrics server (own port)\n+ 5 SQS consumers, each with its own events.WithConcurrency\ngraceful shutdown order: gRPC → HTTP → metrics → consumers → cancel bg work → cache.Close"]
     end
 
     subgraph adapters_in["Inbound Adapters  —  internal/adapter/inbound/"]
-        grpc_a["grpc/\nServer — envoy.service.auth.v3.Authorization\nclaims.go — decodeClaims (Envoy jwt_authn dynamic metadata ONLY,\nnever request headers — §8.2)\nrequestfacts.go — decodeRequestFacts (route ContextExtensions)\nresponse.go — okResponse / deniedResponse (§9 status mapping)"]
-        http_a["http/\nrouter.go — /healthz · /readyz · /metrics only, no business logic\nReadinessProbe reports process-startup, NOT dependency health\n(§7 bypass/stale-if-error modes must stay in rotation)"]
+        grpc_a["grpc/\nServer — envoy.service.auth.v3.Authorization\nclaims.go — decodeClaims (Envoy jwt_authn dynamic metadata ONLY,\nnever request headers — §8.2)\nrequestfacts.go — decodeRequestFacts (route ContextExtensions +\ntenderIDFromPath: tender_id parsed from the raw URL path, never\ncontext_extensions — §5.1/AE-22)\nresponse.go — okResponse / deniedResponse (§9 status mapping)"]
+        http_a["http/\nrouter.go — /healthz · /readyz, plus the DocsConfig-gated AsyncAPI\nviewer (/asyncapi, /asyncapi.yaml — asyncapi.go, api/embed.go)\nno business logic either way; /metrics has its own dedicated listener\nwires gincommon.ObservabilityMiddlewares — same fleet-wide stack\niam-org-membership/iam-user-profile put in front of their Gin routers\nReadinessProbe reports process-startup, NOT dependency health\n(§7 bypass/stale-if-error modes must stay in rotation)"]
         consumer_a["consumer/\n5 SQS consumers: membership · user · billing · tenant · tender\ndedupingHandler — ae:processed SET NX, with EvictProcessed on\nhandler failure so a permanently-bad message still reaches the DLQ"]
     end
 
@@ -34,14 +34,14 @@ graph TD
 
     subgraph domain["Domain  —  internal/domain/ + internal/domain/policy/"]
         decision["decision.go — Decision, DenyReason\n(§9 HTTP-status mapping), the 6 InjectedHeaders names"]
-        context_v["context.go — MembershipContext, TenantContext,\nDepartment, Delegation, TenderACL"]
+        context_v["context.go — MembershipContext, TenantContext,\nDepartment, TenderACL"]
         errs["errors.go — ErrNotFound, ErrUnavailable\n(shared vocabulary between adapters and usecase)"]
         policy_p["policy/ — EvaluateBase, ViolatesReadOnly,\nMeetsDepartmentLevel, RequestFacts\n(pure predicates, zero I/O — §3)"]
     end
 
     subgraph adapters_out["Outbound Adapters  —  internal/adapter/outbound/"]
         valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
-        org_a["orgmembership/\nClient — I-8 memberships · I-12 tender-acl · I-14 mfa-freshness\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
+        org_a["orgmembership/\nClient — I-8 memberships + I-14 mfa-freshness against Org & Membership,\nTAC-4 tender-acl (formerly I-12) against iam-tender-acl since ADR-0007\nWave 3 Phase 4 — two base URLs/timeouts, one Go package\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
         metrics_a["metrics/\nRecorder — Prometheus authz_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
     end
 
@@ -98,6 +98,7 @@ graph LR
     policy(["domain/policy"])
     domain(["domain"])
     config(["config"])
+    api(["api"])
 
     cmd --> grpc & http & consumer
     cmd --> valkey & orgmembership & metrics
@@ -105,7 +106,7 @@ graph LR
 
     grpc --> usecase & policy & domain
     consumer --> usecase & policy & domain
-    http --> domain
+    http --> api
 
     usecase --> policy & domain
 
@@ -118,7 +119,7 @@ graph LR
     config --- config_note["no internal deps — pure env-var loading"]
 ```
 
-`domain` is the dependency sink — it imports nothing from this module (`internal/domain/errors.go`, `decision.go`, `context.go`). `domain/policy` imports only `domain`. `config` imports nothing internal at all.
+`domain` is the dependency sink — it imports nothing from this module (`internal/domain/errors.go`, `decision.go`, `context.go`). `domain/policy` imports only `domain`. `config` imports nothing internal at all. `api` (the embedded `api/asyncapi.yaml`, via `api/embed.go`) is a second, unrelated leaf — a pure `//go:embed`'d `[]byte` with zero internal imports of its own; `http` is the only package that depends on it, to serve the spec at `/asyncapi`/`/asyncapi.yaml` (`internal/adapter/inbound/http/asyncapi.go`).
 
 ---
 
@@ -135,12 +136,13 @@ sequenceDiagram
     participant Checker
     participant Cache as Valkey Cache
     participant Org as Org & Membership
+    participant TenderACL as iam-tender-acl
     participant Policy as domain/policy
 
     Envoy ->> Server: Check(CheckRequest)
     Note over Envoy,Server: jwt_authn already validated the JWT — Server never<br/>re-validates it, and never reads request headers for identity (§8.2)
 
-    Server ->> Server: decodeClaims(MetadataContext)<br/>decodeRequestFacts(ContextExtensions)
+    Server ->> Server: decodeClaims(MetadataContext)<br/>decodeRequestFacts(ContextExtensions + tender_id from URL path)
 
     alt claims.Subject is empty
         Server -->> Envoy: Denied 401 DENY_MALFORMED_IDENTITY
@@ -199,8 +201,8 @@ sequenceDiagram
                     opt tender-scoped and flagged restricted
                         Checker ->> Cache: GetTenderACL
                         alt cache miss
-                            Checker ->> Org: GetTenderACL(tenant, tender, user)
-                            Org -->> Checker: grant or ErrUnavailable
+                            Checker ->> TenderACL: GetTenderACL(tenant, tender, user)
+                            TenderACL -->> Checker: grant or ErrUnavailable
                             alt call fails
                                 Checker -->> Server: Denied — DENY_TENDER_ACL_INSUFFICIENT
                                 Note over Checker: §7 row 4 — fails closed for THIS<br/>overlay only, never 503
@@ -252,7 +254,7 @@ All decisions read Valkey first. A single jittered-TTL envelope backs both the n
 ```mermaid
 flowchart TD
     subgraph keys["Valkey Key Namespace (§4.1) — every key is tenant-scoped by construction"]
-        k1["ae:ctx:{tenant}:{user} → MembershipContext (roles, departments, delegations)\nsoft TTL 60s ± 6s jitter · physical TTL = soft + 5m grace"]
+        k1["ae:ctx:{tenant}:{user} → MembershipContext (roles, departments)\nsoft TTL 60s ± 6s jitter · physical TTL = soft + 5m grace"]
         k2["ae:tenant:{tenant} → TenantContext (plan, feature_flags, subscription_status, read_only)\nsplit from ae:ctx so a tenant-wide event is ALWAYS a single-key eviction, never a SCAN\nsame soft-TTL/grace envelope as ae:ctx"]
         k3["ae:tender_acl:{tenant}:{tender}:{user} → TenderACL{has_access, access_level}\nflat 15s TTL — half the sibling's own 30s TTL — no stale-if-error branch"]
         k4["ae:neg:{tenant}:{user} → sentinel — subject rebuild returned 404\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
@@ -286,6 +288,7 @@ flowchart TD
 
     subgraph invalidate["Event-driven eviction (§5) — always single-key or tenant-scoped-slice"]
         i1["DepartmentMembership* / TenantRole* → DEL ae:ctx + DEL ae:neg"]
+        i1b["MembershipRevoked (§16 AE-20, whole-membership removal) →\nDEL ae:ctx + DEL ae:neg + best-effort SCAN-DEL ae:tender_acl:*:{user}"]
         i2["UserUpdated(email) / UserAvailabilityChanged → DEL ae:ctx + DEL ae:neg"]
         i3["UserDeleted → DEL ae:ctx + DEL ae:neg + best-effort SCAN-DEL ae:tender_acl:*:{user}"]
         i4["TenantPlanChanged / *SubscriptionCancelled / *Reactivated → DEL ae:tenant ONLY"]
@@ -305,7 +308,7 @@ flowchart TD
 
 ## Event flow
 
-This service **consumes only** — it publishes nothing. Five SQS queues keep the cache honest; DLQ routing is entirely an SQS-native redrive policy, not application code.
+This service **consumes only** — it publishes nothing. Five SQS queues keep the cache honest; DLQ routing is entirely an SQS-native redrive policy, not application code. This section covers the dedup/handler mechanics — for the full per-queue event-type/effect tables, see [`README.md` § Event architecture](README.md#event-architecture) or [the LLD's §7.1–§7.9](docs/lld/iam-lld-authz-enrichment.md), including §7.8's AsyncAPI-contract reference and §7.9's `EVT-#` invariants.
 
 > Source: [`docs/architecture/mermaid/event-flow.mmd`](docs/architecture/mermaid/event-flow.mmd)
 
@@ -356,6 +359,7 @@ sequenceDiagram
 | Queue | Event types | Effect |
 |-------|-------------|--------|
 | `membership-authz-q` | `DepartmentMembershipGranted/Revoked/LevelChanged`, `TenantRoleGranted/Revoked` | Evict `ae:ctx:{tenant}:{user}` + `ae:neg` |
+| `membership-authz-q` | `MembershipRevoked` (§16 AE-20 — Org & Membership's per-user removal cascade signal) | Evict `ae:ctx` + `ae:neg` + best-effort `ae:tender_acl:*:{user}` — the only whole-membership-removal trigger; per-grant rows are left inert rather than individually revoked |
 | `user-authz-q` | `UserUpdated` (email changes only), `UserAvailabilityChanged`, `UserDeleted` | Evict `ae:ctx` + `ae:neg`; `UserDeleted` also best-effort-evicts `ae:tender_acl:*:{user}` |
 | `billing-authz-q` | `TenantPlanChanged`, `TenantSubscriptionCancelled`, `TenantReactivated` | Evict `ae:tenant:{tenant}` (single key) |
 | `tenant-authz-q` | `TenantConverted`, `TenantRealmReady` | Refresh the in-process realm map; `TenantConverted` also evicts `ae:tenant` |
@@ -395,7 +399,7 @@ flowchart TD
 
     subgraph tenderacl["Tender-ACL overlay (§3.1 step 4) — an INDEPENDENT rule"]
         direction TD
-        t1(["I-12 call times out or errors"]) --> t2["Fails closed for THIS overlay ONLY:\nDENY_TENDER_ACL_INSUFFICIENT\n— never escalates to 503, never denies\nnon-tender-scoped aspects of the request"]
+        t1(["TAC-4 call (iam-tender-acl, formerly I-12) times out or errors"]) --> t2["Fails closed for THIS overlay ONLY:\nDENY_TENDER_ACL_INSUFFICIENT\n— never escalates to 503, never denies\nnon-tender-scoped aspects of the request"]
     end
 
     classDef allow fill:#1a7f37,color:#fff;
@@ -413,7 +417,7 @@ flowchart TD
 | **Valkey** | Unreachable, sibling healthy | Latency increases (every request calls the sibling) | Bypass cache, call sibling directly — never fail closed (§7 row 1) |
 | **Org & Membership** | Unreachable, Valkey healthy | Serves stale data for up to the 5-minute grace window | `ae:ctx`/`ae:tenant` entries stay usable past their soft TTL (§7 row 2) |
 | **Both Valkey and Org & Membership** | Unreachable | All requests denied | `DENY_SERVICE_UNAVAILABLE` (503) — distinct from a 403 so operators can tell "degraded" from "not authorized" |
-| **Org & Membership — I-12 (tender-ACL) only** | Times out / errors | Only the tender-scoped aspect of the request is denied | `DENY_TENDER_ACL_INSUFFICIENT` — scoped to the overlay, never escalates |
+| **iam-tender-acl — TAC-4 (tender-ACL, formerly Org & Membership's I-12) only** | Times out / errors | Only the tender-scoped aspect of the request is denied | `DENY_TENDER_ACL_INSUFFICIENT` — scoped to the overlay, never escalates |
 | **Org & Membership — I-14 (MFA-freshness) only** | Times out / errors | Only approver-gated requests affected | `DENY_MFA_STALE` — fails closed; the client's remedy (re-auth) is the same as for a genuinely stale assertion |
 | **One SQS queue / its DLQ** | Consumer or handler failure | That queue's cache facts go stale until the message is redelivered or DLQ'd | SQS's own `maxReceiveCount=5` redrive policy; degrades to "stale until TTL expiry", never a correctness failure requiring replay |
 | **OTel Collector** | Unreachable | Spans not exported | Metrics and logs unaffected; trace IDs still valid but not persisted |
@@ -490,7 +494,7 @@ graph LR
 | Every Valkey key and outbound call is tenant-scoped by construction | Key-builder functions in `internal/adapter/outbound/valkey/keys.go` take `tenant` as a mandatory parameter; there is no unscoped key constructor |
 | Only `sub`/`iss` are ever logged, never `auth_time` or other claims | No log call anywhere in this codebase receives those fields as an argument |
 | The first failing check in the §3.1 precedence order wins | `usecase.Checker.check` evaluates steps 1–5 in a fixed, linear order with no reordering based on cost or code-path convenience |
-| A tender-ACL failure fails closed for that overlay only | `usecase/check.go` returns `DENY_TENDER_ACL_INSUFFICIENT` directly at the I-12 call site, independent of `DecideDependencyOutcome` |
+| A tender-ACL failure fails closed for that overlay only | `usecase/check.go` returns `DENY_TENDER_ACL_INSUFFICIENT` directly at the TAC-4 (formerly I-12) call site, independent of `DecideDependencyOutcome` |
 | Consumer idempotency never double-applies an eviction, and never permanently swallows a bad message | `MarkProcessed` (SET NX) before dispatch; `EvictProcessed` on handler failure so a redelivery is a real retry, not a false-positive dedup skip |
 | DLQ routing is infra-only | No `WithMaxReceiveCount`/`WithDeadLetterHandler` application code — SQS's native redrive policy does the counting (see `scripts/init-localstack.sh`) |
 | Stale-if-error never exceeds its hard cap regardless of configuration | `internal/config/config.go` clamps `AE_STALE_IF_ERROR_MAX_AGE` to 5 minutes even if a higher value is configured |
