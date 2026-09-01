@@ -15,6 +15,10 @@ linters:
     - unconvert
     - unparam
 
+  exclusions:
+    paths:
+      - mock
+
   settings:
     revive:
       rules:

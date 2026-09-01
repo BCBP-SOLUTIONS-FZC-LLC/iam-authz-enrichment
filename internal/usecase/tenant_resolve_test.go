@@ -1,6 +1,8 @@
 package usecase_test
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -65,6 +67,54 @@ func TestResolveTenant_EmptyIssuer_MalformedIdentity(t *testing.T) {
 	realmMap := usecase.NewRealmMap(nil)
 	_, ok := usecase.ResolveTenant(usecase.Claims{Issuer: ""}, realmMap, "")
 	assert.False(t, ok)
+}
+
+// TC-055: RealmMap concurrent reads and writes — no data race.
+// Run with: go test -race ./internal/usecase/...
+func TestRealmMap_ConcurrentReadsAndWrites_NoRace(t *testing.T) {
+	rm := usecase.NewRealmMap(nil)
+	var wg sync.WaitGroup
+
+	for i := range 10 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rm.Set(fmt.Sprintf("realm-%d", i), fmt.Sprintf("tenant-%d", i))
+		}(i)
+	}
+	for i := range 100 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rm.Lookup(fmt.Sprintf("realm-%d", i%10))
+		}(i)
+	}
+	wg.Wait()
+}
+
+// TC-056: RestrictedTenderSet concurrent MarkRestricted + IsRestricted — no
+// data race. A race here means a restricted tender could be treated as open,
+// bypassing the tender-ACL overlay for all authenticated users.
+// Run with: go test -race ./internal/usecase/...
+func TestRestrictedTenderSet_ConcurrentMarkAndCheck_NoRace(t *testing.T) {
+	s := usecase.NewRestrictedTenderSet()
+	var wg sync.WaitGroup
+
+	for i := range 10 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s.MarkRestricted("tenant-1", fmt.Sprintf("tender-%d", i))
+		}(i)
+	}
+	for i := range 100 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s.IsRestricted("tenant-1", fmt.Sprintf("tender-%d", i%10))
+		}(i)
+	}
+	wg.Wait()
 }
 
 func TestRealmMap_SetThenLookup(t *testing.T) {

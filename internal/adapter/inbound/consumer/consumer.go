@@ -16,6 +16,8 @@ package consumer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/url"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 
@@ -102,6 +104,10 @@ func dedupingHandler(deps Deps, handler events.Handler) events.Handler {
 func buildConsumer(queueURL string, deps Deps, handler events.Handler, opts ...events.ConsumerOption) (events.Consumer, error) {
 	if queueURL == "" {
 		return idleConsumer{}, nil
+	}
+	u, err := url.ParseRequestURI(queueURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, fmt.Errorf("sqs: queue URL %q must be an http or https URL", queueURL)
 	}
 	return events.NewSQSConsumerWithClient(events.SQSConfig{
 		QueueURL:    queueURL,

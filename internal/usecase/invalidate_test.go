@@ -249,3 +249,18 @@ func TestInvalidator_TenderRestricted_FlipsInMemoryFact_NoEviction(t *testing.T)
 	assert.True(t, restricted.IsRestricted("tenant-1", "tender-9"))
 	assert.False(t, restricted.IsRestricted("tenant-2", "tender-9"), "restriction is tenant-scoped")
 }
+
+// TC-029: nil ChangedFields in UserUpdated must be a no-op — identical to
+// an empty slice with no "email" entry.
+func TestInvalidator_UserUpdated_NilChangedFields_IsNoOp(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+
+	err := inv.HandleUserUpdated(context.Background(), "tenant-1", usecase.UserEventPayload{
+		UserID: "alice", ChangedFields: nil,
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, cache.SortedCalls(), "nil ChangedFields must produce no cache eviction")
+}

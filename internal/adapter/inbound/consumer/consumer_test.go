@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,6 +102,15 @@ func TestNewXConsumer_IdleAndReal(t *testing.T) {
 	}
 }
 
+// TC-062: a non-empty but syntactically invalid queue URL must fail at
+// buildConsumer time (before any network call), giving a visible startup
+// failure rather than silent per-message errors once the consumer is running.
+func TestBuildConsumer_MalformedQueueURL_ReturnsError(t *testing.T) {
+	t.Parallel()
+	_, err := buildConsumer("not-a-url", testDeps(fixtures.NewFakeCache()), func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
+	require.Error(t, err, "a non-empty malformed queue URL must fail at construction, not silently at runtime")
+}
+
 func TestDedupingHandler_MarkProcessedError_ProcessesAnyway(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
@@ -131,4 +141,31 @@ func TestDedupingHandler_EvictProcessedFailsAfterHandlerError_StillPropagatesHan
 
 	require.Error(t, err)
 	assert.Equal(t, "handler failed", err.Error(), "the original handler error must win even if the best-effort EvictProcessed cleanup also fails")
+}
+
+// TC-057: two goroutines delivering the same event ID concurrently — exactly
+// one handler must run. Redis SET NX atomicity guarantees this in production;
+// FakeCache's mutex guarantees it in tests.
+func TestDedupingHandler_ConcurrentSameEventID_ExactlyOneHandlerRuns(t *testing.T) {
+	cache := fixtures.NewFakeCache()
+	var handlerCount atomic.Int64
+	release := make(chan struct{})
+	inner := func(context.Context, events.Envelope[json.RawMessage]) error {
+		<-release
+		handlerCount.Add(1)
+		return nil
+	}
+	wrapped := dedupingHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
+
+	env := events.Envelope[json.RawMessage]{ID: "concurrent-event-id"}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = wrapped(context.Background(), env) }()
+	go func() { defer wg.Done(); _ = wrapped(context.Background(), env) }()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	assert.Equal(t, int64(1), handlerCount.Load(),
+		"concurrent delivery of the same event ID must run the handler exactly once")
 }

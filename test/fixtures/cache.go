@@ -56,6 +56,7 @@ type FakeCache struct {
 	EvictCtxErr       error
 	EvictNegErr       error
 	EvictTenderACLErr error
+	EvictTenantErr    error
 
 	Calls []string
 }
@@ -175,6 +176,9 @@ func (f *FakeCache) EvictTenantContext(_ context.Context, tenant string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("EvictTenantContext:" + tenant)
+	if f.EvictTenantErr != nil {
+		return f.EvictTenantErr
+	}
 	delete(f.tenant, tenant)
 	return nil
 }

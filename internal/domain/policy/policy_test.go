@@ -133,3 +133,34 @@ func TestMeetsDepartmentLevel(t *testing.T) {
 	assert.False(t, policy.MeetsDepartmentLevel(m, "eng", policy.LevelApprover), "reviewer does not meet approver")
 	assert.False(t, policy.MeetsDepartmentLevel(m, "sales", policy.LevelPreparator), "no membership in that department at all")
 }
+
+// TC-027: same department, two membership rows at different levels — the
+// highest rank (approver > reviewer > preparator) must win, so the effective
+// level is approver and MeetsDepartmentLevel must pass for all three levels.
+func TestMeetsDepartmentLevel_SameDeptTwoLevels_HighestRankWins(t *testing.T) {
+	t.Parallel()
+	m := domain.NewMembershipContext()
+	m.Departments = []domain.Department{
+		{DepartmentID: "dept-eng", Level: "preparator"},
+		{DepartmentID: "dept-eng", Level: "approver"},
+	}
+
+	assert.True(t, policy.MeetsDepartmentLevel(m, "dept-eng", policy.LevelPreparator))
+	assert.True(t, policy.MeetsDepartmentLevel(m, "dept-eng", policy.LevelReviewer), "approver effective level satisfies reviewer requirement")
+	assert.True(t, policy.MeetsDepartmentLevel(m, "dept-eng", policy.LevelApprover), "highest rank across two rows for the same department must win")
+}
+
+// TC-028: an unknown department level string (not preparator/reviewer/approver)
+// carries rank 0 and must never satisfy any named level requirement.
+func TestMeetsDepartmentLevel_UnknownLevel_NeverSatisfies(t *testing.T) {
+	t.Parallel()
+	m := domain.NewMembershipContext()
+	m.Departments = []domain.Department{
+		{DepartmentID: "dept-eng", Level: "superadmin"},
+	}
+
+	assert.False(t, policy.MeetsDepartmentLevel(m, "dept-eng", policy.LevelPreparator),
+		"unknown level must not satisfy even the weakest named rank")
+	assert.False(t, policy.MeetsDepartmentLevel(m, "dept-eng", policy.LevelReviewer))
+	assert.False(t, policy.MeetsDepartmentLevel(m, "dept-eng", policy.LevelApprover))
+}

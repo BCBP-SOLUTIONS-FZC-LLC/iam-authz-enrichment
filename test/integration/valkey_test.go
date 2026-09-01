@@ -114,6 +114,30 @@ func TestValkey_EvictTenderACLForUser_ScansAcrossTenders(t *testing.T) {
 	assert.True(t, hit, "eviction must be scoped to the deleted user only")
 }
 
+// TC-058: ae:tender_acl TTL expiry forces a cache miss — once the fixed
+// TenderACLTTL (200ms in newTestCache) passes, GetTenderACL must return
+// hit=false rather than serving the stale entry. The calling usecase layer
+// treats a miss as "must call the sibling service for a fresh decision".
+func TestValkey_TenderACL_TTLExpiry_ForcesNextCallToMiss(t *testing.T) {
+	ctx := context.Background()
+	cache := newTestCache(t)
+	tenant, user, tender := "it-tenant-5", "it-user-5", "tender-ttl-test"
+
+	acl := domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelEdit}
+	require.NoError(t, cache.SetTenderACL(ctx, tenant, tender, user, acl))
+
+	_, hit, err := cache.GetTenderACL(ctx, tenant, tender, user)
+	require.NoError(t, err)
+	assert.True(t, hit, "entry must be readable immediately after writing")
+
+	// TenderACLTTL in newTestCache is 200ms — sleep 50ms past it.
+	time.Sleep(250 * time.Millisecond)
+
+	_, hit, err = cache.GetTenderACL(ctx, tenant, tender, user)
+	require.NoError(t, err)
+	assert.False(t, hit, "entry must be gone after TenderACLTTL expires — forces a fresh sibling call")
+}
+
 func TestValkey_MarkProcessed_IsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	cache := newTestCache(t)

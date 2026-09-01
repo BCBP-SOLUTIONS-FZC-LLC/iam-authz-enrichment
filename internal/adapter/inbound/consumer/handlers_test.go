@@ -296,3 +296,65 @@ func TestDedupingHandler_SkipsAlreadyProcessedEvent(t *testing.T) {
 
 	assert.Equal(t, 1, calls, "a redelivered event ID must not be processed twice")
 }
+
+// TC-035: EvictTenantContext error from billingHandler must propagate so SQS
+// redelivers the message — the billing event must not be silently acked.
+func TestBillingHandler_EvictTenantContextError_Propagates(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.EvictTenantErr = assert.AnError
+	handler := billingHandler(testDeps(cache))
+
+	err := handler(context.Background(), envelope(t, "TenantPlanChanged", "tenant-1", map[string]string{}))
+
+	require.Error(t, err, "EvictTenantContext failure must propagate — billing event must be redelivered by SQS")
+}
+
+// TC-048: empty event ID produces dedup key ae:processed: — documents that
+// a second empty-ID event is silently skipped (known limitation: all
+// empty-ID messages share one dedup slot).
+func TestDedupingHandler_EmptyEventID_SecondCallDeduplicated(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	var calls int
+	inner := func(context.Context, events.Envelope[json.RawMessage]) error {
+		calls++
+		return nil
+	}
+	deps := Deps{Cache: cache, Log: fixtures.NoopLogger{}}
+	wrapped := dedupingHandler(deps, inner)
+
+	emptyIDEnv := events.Envelope[json.RawMessage]{ID: "", Type: "AnyType", TenantID: "tenant-1"}
+	require.NoError(t, wrapped(context.Background(), emptyIDEnv))
+	require.NoError(t, wrapped(context.Background(), emptyIDEnv))
+
+	assert.Equal(t, 1, calls,
+		"SEC-5: empty event ID creates ae:processed: — all empty-ID events share one dedup key, subsequent ones are silently skipped")
+}
+
+// TC-031..TC-034: every event type routed to HandleMembershipEvent must evict
+// ae:ctx and ae:neg — not just DepartmentMembershipGranted (already covered by
+// TestMembershipHandler_KnownType_Evicts above).
+func TestMembershipHandler_AllNonRevokedEventTypes_Evict(t *testing.T) {
+	eventTypes := []string{
+		"DepartmentMembershipRevoked",      // TC-031
+		"DepartmentMembershipLevelChanged", // TC-032
+		"TenantRoleGranted",                // TC-033
+		"TenantRoleRevoked",                // TC-034
+	}
+	for _, eventType := range eventTypes {
+		t.Run(eventType, func(t *testing.T) {
+			t.Parallel()
+			cache := fixtures.NewFakeCache()
+			handler := membershipHandler(testDeps(cache))
+
+			err := handler(context.Background(), envelope(t, eventType, "tenant-1", map[string]string{"user_id": "alice"}))
+
+			require.NoError(t, err)
+			assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:tenant-1:alice",
+				"%s must evict ae:ctx for the affected user", eventType)
+			assert.Contains(t, cache.SortedCalls(), "EvictNegative:tenant-1:alice",
+				"%s must evict ae:neg for the affected user", eventType)
+		})
+	}
+}

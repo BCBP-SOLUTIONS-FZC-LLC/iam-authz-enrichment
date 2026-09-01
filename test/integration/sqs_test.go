@@ -154,3 +154,141 @@ func TestSQS_DLQ_MessageMovesAfterMaxReceiveCount(t *testing.T) {
 		return err == nil && len(out.Messages) > 0
 	}, 30*time.Second, 500*time.Millisecond, "after 5 failed receives, SQS's own redrive policy must move the message to the DLQ")
 }
+
+// TC-039: user-authz-q end-to-end — UserUpdated with changed_fields=['email']
+// must evict ae:ctx for the affected user.
+func TestSQS_UserConsumer_UserUpdated_EmailChange_EvictsCtx(t *testing.T) {
+	client := newTestSQSClient(t)
+	qURL := queueURL(t, client, "user-authz-q")
+	drainQueue(client, qURL)
+
+	cache := newTestCache(t)
+	tenant, user := "it-sqs-tenant-2", "it-sqs-user-2"
+	require.NoError(t, cache.SetMembershipContext(context.Background(), tenant, user,
+		domain.MembershipContext{Roles: []string{"x"}, Departments: []domain.Department{}}))
+
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+	c, err := consumer.NewUserConsumer(qURL, consumer.Deps{
+		Client: client, Region: "ap-south-1", EndpointURL: endpointURL(), Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv,
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Start(ctx) }()
+	defer func() { _ = c.Stop() }()
+
+	sendEnvelope(t, client, qURL, map[string]any{
+		"id": uuid.NewString(), "type": "UserUpdated", "tenant_id": tenant,
+		"time": time.Now().Format(time.RFC3339),
+		"data": map[string]any{"user_id": user, "changed_fields": []string{"email"}},
+	})
+
+	require.Eventually(t, func() bool {
+		_, result, _ := cache.GetMembershipContext(context.Background(), tenant, user)
+		return result == domain.CacheMiss
+	}, 10*time.Second, 200*time.Millisecond, "UserUpdated with email change must evict ae:ctx")
+}
+
+// TC-040: billing-authz-q end-to-end — TenantPlanChanged must evict
+// ae:tenant for the affected tenant (single-key, tenant-wide eviction).
+func TestSQS_BillingConsumer_TenantPlanChanged_EvictsTenant(t *testing.T) {
+	client := newTestSQSClient(t)
+	qURL := queueURL(t, client, "billing-authz-q")
+	drainQueue(client, qURL)
+
+	cache := newTestCache(t)
+	tenant := "it-sqs-tenant-3"
+	require.NoError(t, cache.SetTenantContext(context.Background(), tenant,
+		domain.TenantContext{Plan: "pro", FeatureFlags: []string{}}))
+
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+	c, err := consumer.NewBillingConsumer(qURL, consumer.Deps{
+		Client: client, Region: "ap-south-1", EndpointURL: endpointURL(), Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv,
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Start(ctx) }()
+	defer func() { _ = c.Stop() }()
+
+	sendEnvelope(t, client, qURL, map[string]any{
+		"id": uuid.NewString(), "type": "TenantPlanChanged", "tenant_id": tenant,
+		"time": time.Now().Format(time.RFC3339), "data": map[string]any{},
+	})
+
+	require.Eventually(t, func() bool {
+		_, result, _ := cache.GetTenantContext(context.Background(), tenant)
+		return result == domain.CacheMiss
+	}, 10*time.Second, 200*time.Millisecond, "TenantPlanChanged must evict ae:tenant")
+}
+
+// TC-041: tenant-authz-q end-to-end — TenantRealmReady must NOT evict any
+// cache key but must update the in-process realm map so subsequent tenant
+// resolution for that realm succeeds.
+func TestSQS_TenantConsumer_TenantRealmReady_UpdatesRealmMap_NoEviction(t *testing.T) {
+	client := newTestSQSClient(t)
+	qURL := queueURL(t, client, "tenant-authz-q")
+	drainQueue(client, qURL)
+
+	cache := newTestCache(t)
+	tenant := "it-sqs-tenant-4"
+	realm := "https://kc.example.com/realms/it-sqs-tenant-4"
+	realmMap := usecase.NewRealmMap(nil)
+
+	inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+	c, err := consumer.NewTenantConsumer(qURL, consumer.Deps{
+		Client: client, Region: "ap-south-1", EndpointURL: endpointURL(), Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv,
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Start(ctx) }()
+	defer func() { _ = c.Stop() }()
+
+	sendEnvelope(t, client, qURL, map[string]any{
+		"id": uuid.NewString(), "type": "TenantRealmReady", "tenant_id": tenant,
+		"time": time.Now().Format(time.RFC3339), "data": map[string]any{"realm": realm},
+	})
+
+	require.Eventually(t, func() bool {
+		got, ok := realmMap.Lookup(realm)
+		return ok && got == tenant
+	}, 10*time.Second, 200*time.Millisecond, "TenantRealmReady must update the realm map")
+}
+
+// TC-042: tender-authz-q end-to-end — TenderRestricted must NOT evict any
+// cache key but must mark the tender as restricted in the in-process set so
+// subsequent Check calls apply the tender-ACL overlay for that tender.
+func TestSQS_TenderConsumer_TenderRestricted_UpdatesRestrictedSet_NoEviction(t *testing.T) {
+	client := newTestSQSClient(t)
+	qURL := queueURL(t, client, "tender-authz-q")
+	drainQueue(client, qURL)
+
+	cache := newTestCache(t)
+	tenant := "it-sqs-tenant-5"
+	tenderID := "tender-sqs-42"
+	restricted := usecase.NewRestrictedTenderSet()
+
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), restricted, fixtures.NoopLogger{})
+	c, err := consumer.NewTenderConsumer(qURL, consumer.Deps{
+		Client: client, Region: "ap-south-1", EndpointURL: endpointURL(), Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv,
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Start(ctx) }()
+	defer func() { _ = c.Stop() }()
+
+	sendEnvelope(t, client, qURL, map[string]any{
+		"id": uuid.NewString(), "type": "TenderRestricted", "tenant_id": tenant,
+		"time": time.Now().Format(time.RFC3339), "data": map[string]any{"tender_id": tenderID},
+	})
+
+	require.Eventually(t, func() bool {
+		return restricted.IsRestricted(tenant, tenderID)
+	}, 10*time.Second, 200*time.Millisecond, "TenderRestricted must mark the tender in the RestrictedTenderSet")
+}

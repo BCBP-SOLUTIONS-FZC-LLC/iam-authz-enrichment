@@ -40,6 +40,7 @@ func TestTenderACL_Satisfies(t *testing.T) {
 		{"view does not satisfy edit", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelView}, domain.AccessLevelEdit, false},
 		{"approve satisfies view", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, domain.AccessLevelView, true},
 		{"approve satisfies edit", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, domain.AccessLevelEdit, true},
+		{"empty required level never satisfies (TC-050)", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelView}, "", false},
 		{"unrecognized granted level never satisfies", domain.TenderACL{HasAccess: true, AccessLevel: "bogus"}, domain.AccessLevelView, false},
 		{"unrecognized required level never satisfies", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, "bogus", false},
 	}

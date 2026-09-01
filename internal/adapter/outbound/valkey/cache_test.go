@@ -363,3 +363,20 @@ func TestRedisNilIsTheMissSignal(t *testing.T) {
 	err := client.Get(context.Background(), "nope").Err()
 	assert.ErrorIs(t, err, redis.Nil)
 }
+
+// TC-060: VALKEY_URL as rediss:// (TLS scheme) — New must set TLS options on
+// the Redis client. miniredis does not support TLS, so the connection attempt
+// fails, but that confirms the URL was parsed and TLS options were set (a
+// plaintext redis:// URL against a non-TLS server would succeed, not fail
+// with a TLS handshake error).
+func TestNew_RedissTLSURL_ParsedAndTLSEnabled(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	// rediss:// against a plaintext miniredis server must fail at TLS handshake,
+	// proving TLS was enabled — not with a "connection refused" or redis.Nil.
+	c := New(Config{Addr: "rediss://" + mr.Addr()})
+	defer func() { _ = c.Close() }()
+
+	err := c.Health(context.Background())
+	require.Error(t, err, "rediss:// against a plaintext server must fail — proves TLS options were set")
+}

@@ -361,3 +361,27 @@ func TestLoad_TenderACLDevDefault_AllowedInDev(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "http://localhost:8086", cfg.TenderACLBaseURL)
 }
+
+// TC-059: REALM_TENANT_MAP_SEED valid JSON but wrong type (array instead of
+// object) — config.Load must fail fast rather than silently ignoring it.
+func TestLoad_RealmTenantMapSeed_ValidJSONWrongType_Fails(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("REALM_TENANT_MAP_SEED", `["realm-a","tenant-a"]`)
+
+	_, err := config.Load()
+
+	require.Error(t, err, "a JSON array is not a valid map[string]string — Load must fail fast")
+}
+
+// TC-063: both sibling URLs at dev defaults in production — Load must fail
+// fast. Currently only the first check fires; this test documents that at
+// least one error is returned (the combined-error case is a usability gap).
+func TestLoad_BothSiblingURLsDevDefault_FailsOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "production")
+	// leave ORG_MEMBERSHIP_BASE_URL and TENDER_ACL_BASE_URL at their dev defaults
+
+	_, err := config.Load()
+
+	require.Error(t, err, "both URLs at dev defaults in production must fail fast")
+}
