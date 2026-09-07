@@ -10,8 +10,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
+
+func TestConstLabelsOrNil(t *testing.T) {
+	t.Parallel()
+	assert.Nil(t, constLabelsOrNil(nil))
+	assert.Nil(t, constLabelsOrNil(prometheus.Labels{}))
+	assert.Equal(t, prometheus.Labels{"service": "s"}, constLabelsOrNil(prometheus.Labels{"service": "s"}))
+}
 
 func histogramSampleCount(t *testing.T, h prometheus.Histogram) uint64 {
 	t.Helper()
@@ -49,6 +58,44 @@ func TestNew_RegistersOnExplicitRegisterer(t *testing.T) {
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
 	assert.NotEmpty(t, mfs, "authz_* metrics should be registered on the explicit registerer")
+}
+
+func TestNew_AppliesGincommonConstLabels(t *testing.T) {
+	// Not t.Parallel: ObservabilityMiddlewares' metrics.Init is process-wide
+	// sync.Once, and this test must run after TestNew_RegistersOnDefaultRegisterer
+	// so that test still exercises gincommonLabels' empty-before-init path.
+	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
+		ServiceName:  "iam-authz-enrichment",
+		BuildVersion: "test",
+	})
+	want := gincommon.MetricsConstLabels()
+	require.Equal(t, "iam-authz-enrichment", want["service"])
+	require.Equal(t, "test", want["version"])
+	require.Equal(t, want, gincommonLabels())
+	require.Equal(t, want, constLabelsOrNil(want))
+
+	reg := prometheus.NewRegistry()
+	r := New(reg)
+	r.ObserveDecision("", true)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() != "authz_decisions_total" {
+			continue
+		}
+		found = true
+		require.NotEmpty(t, mf.GetMetric())
+		labels := map[string]string{}
+		for _, l := range mf.GetMetric()[0].GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		assert.Equal(t, want["service"], labels["service"])
+		assert.Equal(t, want["version"], labels["version"])
+	}
+	assert.True(t, found, "authz_decisions_total must be gathered from the isolated registerer")
 }
 
 func TestObserveDecision_Allow(t *testing.T) {

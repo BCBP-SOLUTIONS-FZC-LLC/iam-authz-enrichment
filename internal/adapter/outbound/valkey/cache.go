@@ -233,11 +233,15 @@ func (c *Cache) EvictNegative(ctx context.Context, tenant, user string) error {
 	return c.client.Del(ctx, negativeKey(tenant, user)).Err()
 }
 
-// MarkProcessed implements consumer idempotency (§5) via SET NX — the
-// functional equivalent of Postgres's INSERT ... ON CONFLICT DO NOTHING for
-// a service with no database. Returns true the first time a given eventID is
-// seen; false (and no error) on every subsequent delivery.
-func (c *Cache) MarkProcessed(ctx context.Context, eventID string) (bool, error) {
+// MarkProcessed implements the platform-events processed_events contract
+// via SET NX — the functional equivalent of Postgres's INSERT ... ON
+// CONFLICT DO NOTHING for a service with no database. Returns true the
+// first time a given eventID is seen; false (and no error) on every
+// subsequent delivery. consumer is accepted for port-parity with
+// iam-org-membership's processed_events (event_id, consumer) key; this
+// process has a single PE-1 identity so the Valkey key stays
+// ae:processed:{event_id} (LLD AE-6 — no key migration on deploy).
+func (c *Cache) MarkProcessed(ctx context.Context, _, eventID string) (bool, error) {
 	ok, err := c.client.SetNX(ctx, processedKey(eventID), "1", c.processedTTL).Result()
 	if err != nil {
 		return false, err
@@ -248,8 +252,41 @@ func (c *Cache) MarkProcessed(ctx context.Context, eventID string) (bool, error)
 // EvictProcessed deletes ae:processed:{eventID} — used when a handler fails
 // after MarkProcessed already claimed the ID, so a redelivery gets a real
 // retry instead of a false-positive dedup skip.
-func (c *Cache) EvictProcessed(ctx context.Context, eventID string) error {
+func (c *Cache) EvictProcessed(ctx context.Context, _, eventID string) error {
 	return c.client.Del(ctx, processedKey(eventID)).Err()
+}
+
+// GetRealm reads ae:realm:{issuer}. No TTL — a dedicated realm is not
+// reassigned once provisioned (LLD EVT-6).
+func (c *Cache) GetRealm(ctx context.Context, realm string) (string, bool, error) {
+	s, err := c.client.Get(ctx, realmKey(realm)).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return s, true, nil
+}
+
+// SetRealm writes ae:realm:{issuer} with no TTL.
+func (c *Cache) SetRealm(ctx context.Context, realm, tenant string) error {
+	return c.client.Set(ctx, realmKey(realm), tenant, 0).Err()
+}
+
+// GetRestricted reports whether ae:restricted:{tenant}:{tender} exists.
+func (c *Cache) GetRestricted(ctx context.Context, tenant, tender string) (bool, error) {
+	n, err := c.client.Exists(ctx, restrictedFactKey(tenant, tender)).Result()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// SetRestricted writes ae:restricted:{tenant}:{tender} with no TTL —
+// TenderRestricted is monotonic (there is no unrestrict event).
+func (c *Cache) SetRestricted(ctx context.Context, tenant, tender string) error {
+	return c.client.Set(ctx, restrictedFactKey(tenant, tender), "1", 0).Err()
 }
 
 // Health pings Valkey.

@@ -30,7 +30,13 @@ type Cache interface {
 	SetNegative(ctx context.Context, tenant, user string) error
 	EvictNegative(ctx context.Context, tenant, user string) error
 
-	MarkProcessed(ctx context.Context, eventID string) (bool, error)
+	// Shared per-replica facts: competing SQS consumers deliver each
+	// TenantConverted / TenantRealmReady / TenderRestricted to one pod.
+	// These keys are how every other replica observes the same fact.
+	GetRealm(ctx context.Context, realm string) (tenant string, ok bool, err error)
+	SetRealm(ctx context.Context, realm, tenant string) error
+	GetRestricted(ctx context.Context, tenant, tender string) (bool, error)
+	SetRestricted(ctx context.Context, tenant, tender string) error
 }
 
 // OrgMembershipClient is the port this layer needs from the sibling Org &

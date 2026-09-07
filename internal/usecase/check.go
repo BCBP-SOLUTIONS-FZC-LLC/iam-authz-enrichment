@@ -83,7 +83,7 @@ func (c *Checker) Check(ctx context.Context, in CheckInput) domain.Decision {
 func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 	// §2 point 3 / §9: tenant resolution. Malformed identity short-circuits
 	// everything — there is no tenant to scope any subsequent call to.
-	tenant, ok := ResolveTenant(in.Claims, c.realmMap, c.cfg.SharedRealmIssuer)
+	tenant, ok := ResolveTenant(ctx, in.Claims, c.realmMap, c.cfg.SharedRealmIssuer)
 	if !ok {
 		return domain.Denied(domain.DenyMalformedIdentity)
 	}
@@ -91,7 +91,7 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 
 	reqFacts := in.Request
 	if reqFacts.TenderID != "" {
-		reqFacts.TenderRestricted = c.restricted.IsRestricted(tenant, reqFacts.TenderID)
+		reqFacts.TenderRestricted = c.restricted.IsRestricted(ctx, tenant, reqFacts.TenderID)
 	}
 
 	// §3.1 step 1: subject resolution. Short-circuits everything else.

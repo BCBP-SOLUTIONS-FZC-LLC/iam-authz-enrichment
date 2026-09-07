@@ -21,7 +21,7 @@ var allEnvVars = []string{
 	"ORG_MEMBERSHIP_BASE_URL", "ORG_MEMBERSHIP_TIMEOUT",
 	"TENDER_ACL_BASE_URL", "TENDER_ACL_TIMEOUT",
 	"SHARED_REALM_ISSUER", "JWT_METADATA_NAMESPACE", "JWT_PAYLOAD_KEY",
-	"AE_CTX_TTL", "AE_CTX_JITTER", "AE_TENDER_ACL_TTL", "AE_NEG_TTL",
+	"AE_CTX_TTL", "AE_CTX_JITTER", "AE_TENDER_ACL_TTL", "AE_NEG_TTL", "AE_RESTRICTED_NEG_TTL", "AE_REALM_NEG_TTL",
 	"AE_PROCESSED_EVENT_TTL", "AE_STALE_IF_ERROR_MAX_AGE",
 	"GRPC_KEEPALIVE_TIME", "GRPC_KEEPALIVE_TIMEOUT", "GRPC_MAX_CONCURRENT_STREAMS",
 	"GRPC_MAX_RECV_MSG_SIZE_BYTES", "GRPC_MAX_SEND_MSG_SIZE_BYTES",
@@ -69,6 +69,8 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 6*time.Second, cfg.AeCtxJitter)
 	assert.Equal(t, 15*time.Second, cfg.TenderACLTTL)
 	assert.Equal(t, 5*time.Second, cfg.NegativeCacheTTL)
+	assert.Equal(t, 5*time.Second, cfg.RestrictedNegativeTTL)
+	assert.Equal(t, 5*time.Second, cfg.RealmNegativeTTL)
 	assert.Equal(t, 7*24*time.Hour, cfg.ProcessedEventTTL)
 	assert.Equal(t, 5*time.Minute, cfg.StaleIfErrorMaxAge)
 	assert.Equal(t, 30*time.Second, cfg.GRPCKeepAliveTime)
@@ -81,7 +83,6 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Empty(t, cfg.GRPCTLSClientCAFile)
 	assert.False(t, cfg.DocsEnabled)
 	assert.Empty(t, cfg.DocsAuthToken)
-	assert.Equal(t, 5, cfg.SQSMaxReceiveCount)
 	assert.Equal(t, "ap-south-1", cfg.AWSRegion)
 	assert.Equal(t, "", cfg.AWSEndpointURL)
 	assert.Empty(t, cfg.MembershipQueueURL)
@@ -120,6 +121,8 @@ func TestLoad_CustomValues(t *testing.T) {
 	t.Setenv("AE_CTX_JITTER", "9s")
 	t.Setenv("AE_TENDER_ACL_TTL", "20s")
 	t.Setenv("AE_NEG_TTL", "10s")
+	t.Setenv("AE_RESTRICTED_NEG_TTL", "11s")
+	t.Setenv("AE_REALM_NEG_TTL", "13s")
 	t.Setenv("AE_PROCESSED_EVENT_TTL", "48h")
 	t.Setenv("AE_STALE_IF_ERROR_MAX_AGE", "1m")
 	t.Setenv("GRPC_KEEPALIVE_TIME", "15s")
@@ -170,6 +173,8 @@ func TestLoad_CustomValues(t *testing.T) {
 	assert.Equal(t, 9*time.Second, cfg.AeCtxJitter)
 	assert.Equal(t, 20*time.Second, cfg.TenderACLTTL)
 	assert.Equal(t, 10*time.Second, cfg.NegativeCacheTTL)
+	assert.Equal(t, 11*time.Second, cfg.RestrictedNegativeTTL)
+	assert.Equal(t, 13*time.Second, cfg.RealmNegativeTTL)
 	assert.Equal(t, 48*time.Hour, cfg.ProcessedEventTTL)
 	assert.Equal(t, time.Minute, cfg.StaleIfErrorMaxAge)
 	assert.Equal(t, 15*time.Second, cfg.GRPCKeepAliveTime)
@@ -182,7 +187,6 @@ func TestLoad_CustomValues(t *testing.T) {
 	assert.Equal(t, "/tls/ca.crt", cfg.GRPCTLSClientCAFile)
 	assert.True(t, cfg.DocsEnabled)
 	assert.Equal(t, "secret-token", cfg.DocsAuthToken)
-	assert.Equal(t, 3, cfg.SQSMaxReceiveCount)
 	assert.Equal(t, "eu-west-1", cfg.AWSRegion)
 	assert.Equal(t, "http://localstack:4566", cfg.AWSEndpointURL)
 	assert.Equal(t, "http://q/membership", cfg.MembershipQueueURL)
@@ -226,7 +230,7 @@ func TestLoad_InvalidDuration_EachField(t *testing.T) {
 	fields := []string{
 		"VALKEY_DIAL_TIMEOUT", "VALKEY_READ_TIMEOUT", "VALKEY_WRITE_TIMEOUT",
 		"ORG_MEMBERSHIP_TIMEOUT", "TENDER_ACL_TIMEOUT", "AE_CTX_TTL", "AE_CTX_JITTER", "AE_TENDER_ACL_TTL",
-		"AE_NEG_TTL", "AE_PROCESSED_EVENT_TTL", "AE_STALE_IF_ERROR_MAX_AGE",
+		"AE_NEG_TTL", "AE_RESTRICTED_NEG_TTL", "AE_REALM_NEG_TTL", "AE_PROCESSED_EVENT_TTL", "AE_STALE_IF_ERROR_MAX_AGE",
 		"GRPC_KEEPALIVE_TIME", "GRPC_KEEPALIVE_TIMEOUT",
 	}
 	for _, field := range fields {
@@ -246,7 +250,7 @@ func TestLoad_InvalidDuration_EachField(t *testing.T) {
 // error-return branch individually.
 func TestLoad_InvalidInt_EachField(t *testing.T) {
 	fields := []string{
-		"GRPC_MAX_CONCURRENT_STREAMS", "SQS_MAX_RECEIVE_COUNT",
+		"GRPC_MAX_CONCURRENT_STREAMS",
 		"GRPC_MAX_RECV_MSG_SIZE_BYTES", "GRPC_MAX_SEND_MSG_SIZE_BYTES",
 		"MEMBERSHIP_AUTHZ_QUEUE_CONCURRENCY", "USER_AUTHZ_QUEUE_CONCURRENCY", "BILLING_AUTHZ_QUEUE_CONCURRENCY",
 		"TENANT_AUTHZ_QUEUE_CONCURRENCY", "TENDER_AUTHZ_QUEUE_CONCURRENCY",
@@ -325,12 +329,72 @@ func TestLoad_OrgMembershipOverridden_PassesOutsideDev(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
 	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8080")
+	setRequiredQueueURLs(t)
 
 	cfg, err := config.Load()
 
 	require.NoError(t, err)
 	assert.Equal(t, "http://org-membership.iam.svc.cluster.local:8080", cfg.OrgMembershipBaseURL)
 	assert.Equal(t, "http://tender-acl.iam.svc.cluster.local:8080", cfg.TenderACLBaseURL)
+}
+
+func setRequiredQueueURLs(t *testing.T) {
+	t.Helper()
+	t.Setenv("MEMBERSHIP_AUTHZ_QUEUE_URL", "http://q/membership")
+	t.Setenv("USER_AUTHZ_QUEUE_URL", "http://q/user")
+	t.Setenv("BILLING_AUTHZ_QUEUE_URL", "http://q/billing")
+	t.Setenv("TENANT_AUTHZ_QUEUE_URL", "http://q/tenant")
+	t.Setenv("TENDER_AUTHZ_QUEUE_URL", "http://q/tender")
+}
+
+func TestLoad_QueueURLRequiredOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
+	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8080")
+	t.Setenv("MEMBERSHIP_AUTHZ_QUEUE_URL", "http://q/membership")
+	t.Setenv("USER_AUTHZ_QUEUE_URL", "http://q/user")
+	t.Setenv("BILLING_AUTHZ_QUEUE_URL", "http://q/billing")
+	t.Setenv("TENANT_AUTHZ_QUEUE_URL", "http://q/tenant")
+	// TENDER_AUTHZ_QUEUE_URL left blank.
+
+	_, err := config.Load()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "TENDER_AUTHZ_QUEUE_URL")
+}
+
+func TestLoad_QueueURLBlankAllowedInDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "dev")
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.Empty(t, cfg.TenderQueueURL)
+}
+
+func TestLoad_DuplicateQueueURL_Fails(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "dev")
+	t.Setenv("MEMBERSHIP_AUTHZ_QUEUE_URL", "http://q/shared")
+	t.Setenv("USER_AUTHZ_QUEUE_URL", "http://q/shared")
+
+	_, err := config.Load()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "MEMBERSHIP_AUTHZ_QUEUE_URL")
+	assert.Contains(t, err.Error(), "USER_AUTHZ_QUEUE_URL")
+}
+
+func TestLoad_DuplicateQueueURL_BlanksExempt(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "dev")
+	// Both left blank — must not be treated as a "duplicate" of each other.
+
+	_, err := config.Load()
+
+	require.NoError(t, err)
 }
 
 // TestLoad_TenderACLDevDefault_FailsOutsideDev / _AllowedInDev /

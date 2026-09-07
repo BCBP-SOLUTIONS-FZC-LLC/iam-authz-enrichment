@@ -109,13 +109,10 @@ func tenantHandler(deps Deps) events.Handler {
 		default:
 			return nil
 		}
-		switch env.Type {
-		case "TenantConverted":
+		if env.Type == "TenantConverted" {
 			return deps.Invalidator.HandleTenantConverted(ctx, env.TenantID, p)
-		case "TenantRealmReady":
-			deps.Invalidator.HandleTenantRealmReady(env.TenantID, p)
 		}
-		return nil
+		return deps.Invalidator.HandleTenantRealmReady(ctx, env.TenantID, p)
 	}
 }
 
@@ -127,7 +124,7 @@ func NewTenantConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption
 // tenderHandler implements tender-authz-q (§5): TenderRestricted — flips an
 // in-memory fact, not a cache eviction.
 func tenderHandler(deps Deps) events.Handler {
-	return func(_ context.Context, env events.Envelope[json.RawMessage]) error {
+	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 		if env.Type != "TenderRestricted" {
 			return nil
 		}
@@ -135,8 +132,7 @@ func tenderHandler(deps Deps) events.Handler {
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
 			return fmt.Errorf("decode %s payload: %w", env.Type, err)
 		}
-		deps.Invalidator.HandleTenderRestricted(env.TenantID, p)
-		return nil
+		return deps.Invalidator.HandleTenderRestricted(ctx, env.TenantID, p)
 	}
 }
 

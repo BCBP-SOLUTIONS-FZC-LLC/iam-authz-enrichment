@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/stretchr/testify/assert"
@@ -54,7 +55,14 @@ func TestBuildConsumer_EmptyQueueURL_ReturnsIdleConsumer(t *testing.T) {
 func TestBuildConsumer_RealQueueURL_RunsAndStops(t *testing.T) {
 	t.Parallel()
 	client := &fakeSQSClient{}
-	deps := Deps{Client: client, Region: "ap-south-1", Cache: fixtures.NewFakeCache(), Log: fixtures.NoopLogger{}}
+	// MaxReceiveCount is set here so the forced-to-0 path in buildConsumer
+	// is exercised — SQS-native redrive must not be overridden in-process.
+	deps := Deps{
+		Client: client,
+		SQS:    config.SQSConfigEnv{MaxReceiveCount: 5, Region: "ap-south-1"},
+		Cache:  fixtures.NewFakeCache(),
+		Log:    fixtures.NoopLogger{},
+	}
 
 	c, err := buildConsumer("http://queue/x", deps, func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
 	require.NoError(t, err)
@@ -87,8 +95,8 @@ func TestNewXConsumer_IdleAndReal(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			cache := fixtures.NewFakeCache()
-			inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
-			deps := Deps{Client: &fakeSQSClient{}, Region: "ap-south-1", Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv}
+			inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+			deps := Deps{Client: &fakeSQSClient{}, Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv}
 
 			idle, err := build("", deps)
 			require.NoError(t, err)
@@ -101,6 +109,16 @@ func TestNewXConsumer_IdleAndReal(t *testing.T) {
 	}
 }
 
+func TestProcessedHandler_EmptyEventID_ReturnsError(t *testing.T) {
+	t.Parallel()
+	wrapped := processedHandler(Deps{Cache: fixtures.NewFakeCache(), Log: fixtures.NoopLogger{}},
+		func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
+
+	err := wrapped(context.Background(), events.Envelope[json.RawMessage]{ID: "", Type: "Any"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing id")
+}
+
 func TestDedupingHandler_MarkProcessedError_ProcessesAnyway(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
@@ -110,12 +128,30 @@ func TestDedupingHandler_MarkProcessedError_ProcessesAnyway(t *testing.T) {
 		called = true
 		return nil
 	}
-	wrapped := dedupingHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
+	wrapped := processedHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
 
 	err := wrapped(context.Background(), events.Envelope[json.RawMessage]{ID: "evt-1"})
 
 	require.NoError(t, err)
 	assert.True(t, called, "when the idempotency check itself fails, the handler must still run rather than block eviction on a soft dependency")
+}
+
+func TestProcessedHandler_AlreadyClaimed_SkipsHandler(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	_, err := cache.MarkProcessed(context.Background(), ConsumerName, "evt-1")
+	require.NoError(t, err)
+	var called bool
+	inner := func(context.Context, events.Envelope[json.RawMessage]) error {
+		called = true
+		return nil
+	}
+	wrapped := processedHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
+
+	err = wrapped(context.Background(), events.Envelope[json.RawMessage]{ID: "evt-1"})
+
+	require.NoError(t, err)
+	assert.False(t, called, "MarkProcessed returning false must skip the handler")
 }
 
 func TestDedupingHandler_EvictProcessedFailsAfterHandlerError_StillPropagatesHandlerError(t *testing.T) {
@@ -125,7 +161,7 @@ func TestDedupingHandler_EvictProcessedFailsAfterHandlerError_StillPropagatesHan
 	inner := func(context.Context, events.Envelope[json.RawMessage]) error {
 		return errors.New("handler failed")
 	}
-	wrapped := dedupingHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
+	wrapped := processedHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
 
 	err := wrapped(context.Background(), events.Envelope[json.RawMessage]{ID: "evt-1"})
 

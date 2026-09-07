@@ -77,9 +77,9 @@ func TestSQS_MembershipConsumer_EndToEnd(t *testing.T) {
 	tenant, user := "it-sqs-tenant-1", "it-sqs-user-1"
 	require.NoError(t, cache.SetMembershipContext(context.Background(), tenant, user, domain.MembershipContext{Roles: []string{"x"}}))
 
-	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 	c, err := consumer.NewMembershipConsumer(qURL, consumer.Deps{
-		Client: client, Region: "ap-south-1", EndpointURL: endpointURL(), Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv,
+		Client: client, Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv,
 	})
 	require.NoError(t, err)
 
@@ -106,11 +106,11 @@ func TestSQS_Consumer_Idempotency_SkipsRedeliveredEvent(t *testing.T) {
 	cache := newTestCache(t)
 	eventID := uuid.NewString()
 
-	first, err := cache.MarkProcessed(context.Background(), eventID)
+	first, err := cache.MarkProcessed(context.Background(), "iam-authz-enrichment", eventID)
 	require.NoError(t, err)
 	assert.True(t, first)
 
-	second, err := cache.MarkProcessed(context.Background(), eventID)
+	second, err := cache.MarkProcessed(context.Background(), "iam-authz-enrichment", eventID)
 	require.NoError(t, err)
 	assert.False(t, second)
 }
@@ -136,9 +136,9 @@ func TestSQS_DLQ_MessageMovesAfterMaxReceiveCount(t *testing.T) {
 	})
 
 	cache := newTestCache(t)
-	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 	c, err := consumer.NewTenderConsumer(qURL, consumer.Deps{
-		Client: client, Region: "ap-south-1", EndpointURL: endpointURL(), Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv,
+		Client: client, Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv,
 	}, events.WithVisibilityTimeout(1*time.Second))
 	require.NoError(t, err)
 

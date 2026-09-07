@@ -55,6 +55,19 @@ type Config struct {
 	ProcessedEventTTL  time.Duration
 	StaleIfErrorMaxAge time.Duration
 
+	// RestrictedNegativeTTL bounds how long RestrictedTenderSet's L1 cache
+	// trusts a "not restricted" result before re-checking Valkey — separate
+	// from NegativeCacheTTL (a subject-rebuild performance knob) because
+	// this one bounds a security-relevant propagation delay (how fast a
+	// replica notices another replica's TenderRestricted event) and must
+	// be tunable independently.
+	RestrictedNegativeTTL time.Duration
+	// RealmNegativeTTL is the same kind of knob as RestrictedNegativeTTL,
+	// for RealmMap: how long a "no such dedicated realm" L1 result is
+	// trusted before re-checking Valkey for another replica's Set (a
+	// TenantConverted event it consumed first).
+	RealmNegativeTTL time.Duration
+
 	GRPCMaxConcurrentStreams uint32
 	GRPCKeepAliveTime        time.Duration
 	GRPCKeepAliveTimeout     time.Duration
@@ -88,7 +101,6 @@ type Config struct {
 	BillingQueueURL    string
 	TenantQueueURL     string
 	TenderQueueURL     string
-	SQSMaxReceiveCount int
 
 	// *QueueConcurrency sets events.WithConcurrency per queue — the number
 	// of messages each consumer hands to a handler goroutine at once,
@@ -200,6 +212,12 @@ func Load() (Config, error) {
 	if cfg.NegativeCacheTTL, err = envDuration("AE_NEG_TTL", 5*time.Second); err != nil {
 		return Config{}, err
 	}
+	if cfg.RestrictedNegativeTTL, err = envDuration("AE_RESTRICTED_NEG_TTL", 5*time.Second); err != nil {
+		return Config{}, err
+	}
+	if cfg.RealmNegativeTTL, err = envDuration("AE_REALM_NEG_TTL", 5*time.Second); err != nil {
+		return Config{}, err
+	}
 	if cfg.ProcessedEventTTL, err = envDuration("AE_PROCESSED_EVENT_TTL", 7*24*time.Hour); err != nil {
 		return Config{}, err
 	}
@@ -231,10 +249,6 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.GRPCMaxSendMsgSizeBytes, err = envInt("GRPC_MAX_SEND_MSG_SIZE_BYTES", 256*1024); err != nil {
-		return Config{}, err
-	}
-
-	if cfg.SQSMaxReceiveCount, err = envInt("SQS_MAX_RECEIVE_COUNT", 5); err != nil {
 		return Config{}, err
 	}
 
@@ -287,6 +301,39 @@ func Load() (Config, error) {
 			"TENDER_ACL_BASE_URL is left at its local-dev default (%s) with APP_ENV=%q — set it to the real iam-tender-acl service address",
 			devTenderACLBaseURL, cfg.AppEnv,
 		)
+	}
+
+	// Blank queue URLs start idle consumers. Outside dev that looks
+	// healthy (/readyz ok) while cache never evicts and restricted/realm
+	// facts never apply. Fail fast the same way sibling URLs do.
+	queueURLs := []struct{ name, url string }{
+		{"MEMBERSHIP_AUTHZ_QUEUE_URL", cfg.MembershipQueueURL},
+		{"USER_AUTHZ_QUEUE_URL", cfg.UserQueueURL},
+		{"BILLING_AUTHZ_QUEUE_URL", cfg.BillingQueueURL},
+		{"TENANT_AUTHZ_QUEUE_URL", cfg.TenantQueueURL},
+		{"TENDER_AUTHZ_QUEUE_URL", cfg.TenderQueueURL},
+	}
+	if cfg.AppEnv != "dev" {
+		for _, q := range queueURLs {
+			if q.url == "" {
+				return Config{}, fmt.Errorf("%s is required when APP_ENV=%q — blank starts an idle consumer and this process will never see that queue's events", q.name, cfg.AppEnv)
+			}
+		}
+	}
+	// A copy-pasted queue URL shared between two of the five vars would
+	// silently corrupt the receive-error watchdog's per-URL streak
+	// tracking (cmd/server/receive_watchdog.go) in addition to being a
+	// real dispatch mistake, so guard it unconditionally — blank values
+	// are exempt (checked, or intentionally allowed idle, above).
+	seen := make(map[string]string, len(queueURLs))
+	for _, q := range queueURLs {
+		if q.url == "" {
+			continue
+		}
+		if other, dup := seen[q.url]; dup {
+			return Config{}, fmt.Errorf("%s and %s are both set to the same queue URL (%s) — each of the five queues must be distinct", other, q.name, q.url)
+		}
+		seen[q.url] = q.name
 	}
 
 	return cfg, nil

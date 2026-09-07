@@ -64,6 +64,8 @@ env:
   AE_CTX_JITTER: "6s"
   AE_TENDER_ACL_TTL: "15s"
   AE_NEG_TTL: "5s"
+  AE_RESTRICTED_NEG_TTL: "5s"
+  AE_REALM_NEG_TTL: "5s"
   AE_PROCESSED_EVENT_TTL: "168h"
   AE_STALE_IF_ERROR_MAX_AGE: "5m"
 
@@ -99,8 +101,9 @@ env:
   GRPC_MAX_RECV_MSG_SIZE_BYTES: "262144"
   GRPC_MAX_SEND_MSG_SIZE_BYTES: "262144"
 
-  # AWS — five inbound SQS queues, zero outbound (§5). Required: leave a
-  # *_QUEUE_URL blank only to intentionally start that consumer idle.
+  # AWS — five inbound SQS queues, zero outbound (§5). Required outside
+  # APP_ENV=dev: a blank URL fails startup (idle consumers look healthy
+  # while cache never evicts). Override every URL for production.
   AWS_REGION: "ap-south-1"
   AWS_ENDPOINT_URL: ""   # blank → real AWS SQS; only set for LocalStack-backed environments
   MEMBERSHIP_AUTHZ_QUEUE_URL: ""
@@ -108,7 +111,14 @@ env:
   BILLING_AUTHZ_QUEUE_URL: ""
   TENANT_AUTHZ_QUEUE_URL: ""
   TENDER_AUTHZ_QUEUE_URL: ""
+  # Loaded by platform-events LoadSQS, then forced to 0 in-process so a
+  # failing handler leaves the message for the queue's own RedrivePolicy
+  # (maxReceiveCount=5 on the SQS resource). Do not use this to configure
+  # in-app DLQ deletion.
   SQS_MAX_RECEIVE_COUNT: "5"
+  SQS_MAX_MESSAGES: "10"
+  SQS_WAIT_SECONDS: "20"
+  SQS_VISIBILITY_TIMEOUT: "30s"
 
   # Read directly from process env by platform-gincommon (not this service's
   # own internal/config) — see that library's internal/config/env.go.
@@ -142,14 +152,9 @@ secretValues:
   AWS_ACCESS_KEY_ID: ""
   AWS_SECRET_ACCESS_KEY: ""
 
-# gRPC GracefulStop (fast — in-flight Check() calls are sub-100ms) + HTTP
-# Shutdown (30s ctx timeout, cmd/server/main.go) + 5 SQS consumers stopped
-# SEQUENTIALLY, each with up to a 30s drain + 5s margin (platform-events
-# default) if a handler is genuinely in flight. 60s covers the realistic
-# case; it does NOT cover the pathological worst case of all 5 consumers
-# simultaneously blocked for their full drain window (~175s) — that would
-# require parallelizing consumer shutdown in main.go, which this chart
-# cannot fix. Raise this if consumer-stop latency shows up in shutdown logs.
+# gRPC GracefulStop (in-flight Check() is sub-100ms) + HTTP Shutdown (30s)
+# + 5 SQS consumers Stop()'d concurrently (one drain window, not 5×).
+# 60s covers a stuck handler at the platform-events default drain (30s+5s).
 terminationGracePeriodSeconds: 60
 
 # podDisruptionBudget — ensures at least 2 pods survive voluntary disruptions

@@ -849,13 +849,16 @@ components:
             data:
               realm: "acme-corp"
       x-consumer-schema-dependency:
-        # No published asyncapi.yaml was available for the producer (Realm
-        # Provisioner) in this workspace to verify against. Reflects only
-        # usecase.TenantRealmEventPayload, the shape this service's own
-        # code (HandleTenantConverted) actually decodes.
+        # Confirmed against Realm Provisioner's own api/asyncapi.yaml
+        # (TenantConvertedPayload: realm: {type: string}) — this field's
+        # name and type match exactly. Only `realm` is listed here since
+        # it's the only field usecase.TenantRealmEventPayload/
+        # HandleTenantConverted actually decodes; that payload also
+        # carries tenant_id/plan/users_migrated/direct_signup/
+        # billing_subscription_id, all ignored by this service.
         depends-on-shape:
           realm: "string — the dedicated realm identifier, used as the JWT iss claim for tenant resolution (LLD §8.3)"
-        producer-lifecycle-status: unknown
+        producer-lifecycle-status: stable
 
     TenantRealmReady:
       name: TenantRealmReady
@@ -877,9 +880,13 @@ components:
             data:
               realm: "acme-corp"
       x-consumer-schema-dependency:
+        # Confirmed against Realm Provisioner's own api/asyncapi.yaml
+        # (TenantRealmReadyPayload: realm: {type: string}) — matches
+        # exactly. That payload also carries tenant_id/keycloak_shard/
+        # oidc_clients, all ignored by this service.
         depends-on-shape:
           realm: "string — the dedicated realm identifier, used as the JWT iss claim for tenant resolution (LLD §8.3)"
-        producer-lifecycle-status: unknown
+        producer-lifecycle-status: stable
 
     TenderRestricted:
       name: TenderRestricted

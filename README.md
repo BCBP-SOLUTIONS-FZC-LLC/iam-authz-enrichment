@@ -189,7 +189,7 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 
 This service is a **pure event consumer** — it subscribes to five SQS queues and publishes **zero** events (no outbox, no SNS/EventBridge producer, no database of any kind to have state changes to announce). Every event received is a cache-invalidation trigger against this service's own Valkey cache, never a domain state mutation of its own.
 
-The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 15 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Realm Provisioner, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
+The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 15 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile, Realm Provisioner) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
 
 **Envelope shape:** `{id, type, tenant_id, time, data}` — `tenant_id` is a top-level envelope field, never duplicated inside `data`; the `billing-authz-q` events below read only that field, no `data` decode at all.
 
@@ -317,7 +317,7 @@ mkdir -p mockorg/api/v1/internal/users/alice
 cat > mockorg/api/v1/internal/users/alice/memberships <<'EOF'
 {
   "roles": ["tenant_admin"],
-  "departments": [{"department_id": "fd72f513-45f0-46ca-a1ed-9183be72484c", "level": "reviewer"}],
+  "departments": [{"department_id": "fd72f513-45f0-46ca-a1ed-9183be72484c", "role_level": "reviewer"}],
   "plan": "pro",
   "feature_flags": ["flag-a"],
   "subscription_status": "active",
@@ -534,13 +534,14 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=production`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled |
 | `AE_CTX_TTL` / `AE_CTX_JITTER` | `60s` / `6s` | §4.1 — desyncs expiry across replicas |
 | `AE_TENDER_ACL_TTL` / `AE_NEG_TTL` | `15s` / `5s` | Half the sibling's own TTL / negative-cache storm collapse |
+| `AE_RESTRICTED_NEG_TTL` / `AE_REALM_NEG_TTL` | `5s` each | L1 negative-cache TTLs for `RestrictedTenderSet`/`RealmMap` — separate from `AE_NEG_TTL` since each bounds a distinct security-propagation delay (how fast a replica notices another replica's write), not a shared performance knob |
 | `AE_STALE_IF_ERROR_MAX_AGE` | `5m` | Hard-capped at 5m regardless of configured value (§7) |
 | `ORG_MEMBERSHIP_BASE_URL` / `_TIMEOUT` | `http://localhost:8081` / `10ms` | I-8/I-14. Aggressive timeout — headroom inside the 15ms p99 budget |
 | `TENDER_ACL_BASE_URL` / `TENDER_ACL_TIMEOUT` | `http://localhost:8086` / `20ms` | TAC-4 (formerly I-12) against iam-tender-acl, ADR-0007 Wave 3 Phase 4 — sized against that service's own 5ms-hit/20ms-miss SLO, not reused from `ORG_MEMBERSHIP_TIMEOUT` |
 | `SHARED_REALM_ISSUER` | _(empty)_ | Keycloak issuer for the shared trial realm |
 | `REALM_TENANT_MAP_SEED` | `{}` | Startup-only JSON seed for dedicated realms; kept fresh at runtime by events, never re-read |
 | `JWT_METADATA_NAMESPACE` / `JWT_PAYLOAD_KEY` | `envoy.filters.http.jwt_authn` / `trial` | Must match the Envoy `jwt_authn` filter config |
-| `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups |
+| `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups (`APP_ENV=dev` only — required, and must be pairwise distinct, outside dev; `config.Load()` fails fast otherwise) |
 | `*_AUTHZ_QUEUE_CONCURRENCY` (5 vars) | `4` each | `events.WithConcurrency` per queue — messages handed to handler goroutines at once, instead of `platform-events`' library default of `1` (fully serial per queue) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `localstack` | AWS credentials (use IRSA in production — reference IAM policy + Terraform snippet under [`deploy/iam/`](deploy/iam/)) |
 | `GRPC_MAX_RECV_MSG_SIZE_BYTES` / `_SEND_` | `262144` (256KiB) | Defense-in-depth, not a real operating limit — `CheckRequest`/`CheckResponse` are small |
@@ -567,12 +568,12 @@ Hard invariants — see [`ARCHITECTURE.md` §Threat model](ARCHITECTURE.md#threa
 
 `.github/workflows/ci.yml`:
 
-- **test** — unit (`-race`, coverage) + integration against real Valkey/LocalStack service containers, gated by `.github/scripts/coverage-gate.sh` (fails below 100%).
-- **quality** — `fmt-check`, `vet`, `lint`, `arch-lint`, `mod-verify`, `vuln-check`.
+- **validate-test** — unit (`-race`, coverage) + integration against real Valkey/LocalStack service containers, gated by `.github/scripts/coverage-gate.sh` (fails below 100%).
+- **validate-quality** — `fmt-check`, `vet`, `lint`, `arch-lint`, `mod-verify`, `vuln-check`.
 - **build-image** — Hadolint + Docker build-to-cache (no local load), using the `GO_PRIVATE_TOKEN` secret for `platform-*` module resolution. `trivy` and `smoke` each restore their own copy from the GHA/registry cache rather than sharing a loaded image across jobs.
 - **trivy** — CVE scan (fails on CRITICAL/HIGH/UNKNOWN), SARIF upload to the Security tab (best-effort — doesn't fail if GitHub Advanced Security isn't enabled), and a CycloneDX SBOM artifact.
 - **smoke** — the liveness smoke test (`.github/scripts/smoke-tests.sh`) against the built image.
-- **pr-summary** — posts/updates one status comment on pull requests once `test`/`quality`/`build-image`/`trivy`/`smoke` finish.
+- **pr-summary** — posts/updates one status comment on pull requests once `validate-test`/`validate-quality`/`build-image`/`trivy`/`smoke` finish.
 - **push** — on push to `main`/`master` only: builds (with SBOM + provenance attestations), pushes to `ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment`, and signs the image with Cosign (keyless, via Sigstore OIDC — no signing key to manage). Verify a published image with:
   ```sh
   cosign verify --certificate-identity-regexp "^https://github\.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/.github/workflows/.*@refs/heads/(main|master)$" \
@@ -584,7 +585,7 @@ Hard invariants — see [`ARCHITECTURE.md` §Threat model](ARCHITECTURE.md#threa
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml` — validate → build (CHANGELOG gate + 5-platform binaries) → docker (semver-tagged image, CVE scan, SBOM, SLSA provenance, Cosign sign) → deploy-gate (live Helm deploy + health check, auto-rollback) → publish (GitHub Release with everything attached). See [`CONTRIBUTING.md` § Deployment](CONTRIBUTING.md#deployment) for the full pipeline, required secrets, and the gRPC-specific health query.
 
-`test`/`quality` live in `.github/workflows/validate-test.yml`/`validate-quality.yml` (reusable workflows) so `ci.yml` and `release.yml` share exactly one definition of each gate.
+`validate-test`/`validate-quality` live in `.github/workflows/validate-test.yml`/`validate-quality.yml` (reusable workflows) so `ci.yml` and `release.yml` share exactly one definition of each gate.
 
 ---
 
@@ -623,6 +624,19 @@ For local development, running `make docker-up` (Valkey + LocalStack only) and `
 
 ---
 
+## Dependency posture
+
+Every `Check()` touches at most two synchronous dependencies (Valkey, Org & Membership) plus, on tender-scoped/approver-gated routes, up to two more (iam-tender-acl, Org & Membership's MFA-freshness endpoint). §7's failure matrix (`internal/usecase/failure.go`'s `DecideDependencyOutcome`) governs the first two; the tender-ACL and MFA-freshness calls each have their own independent, narrower fail-closed rule.
+
+| Dependency call | Posture | On failure |
+|---|---|---|
+| Valkey (`ae:ctx`/`ae:tenant` read) | soft — bypass | Org & Membership still reachable → call it directly for this request, skipping the cache (§7 row 1). Correctness is preserved since the sibling is still authoritative. |
+| Org & Membership (I-8, membership/tenant rebuild) | stale-if-error, capped at 5 minutes | Valkey reachable + a stale `ae:ctx`/`ae:tenant` pair exists → serve it (§7 row 2). Otherwise → fail-closed, `DENY_SERVICE_UNAVAILABLE` (§7 row 3) — never conflated with an ordinary `Deny`. |
+| iam-tender-acl (TAC-4, tender-ACL overlay) | fail-closed, scoped to the overlay only | Timeout/error → `DENY_TENDER_ACL_INSUFFICIENT` for the tender-scoped check only (§7 row 4). Never escalates to `DENY_SERVICE_UNAVAILABLE`, and never denies a non-tender-scoped aspect of the same request. |
+| Org & Membership (I-14, MFA-freshness) | fail-closed (judgment call, not in the LLD's §7 table) | Call failure → `DENY_MFA_STALE`, not `DENY_SERVICE_UNAVAILABLE`. Approver-gated actions are exactly the security-sensitive case this service exists to protect, so ambiguity resolves to denial — the client's remedy (re-auth) is the same one a genuinely stale MFA assertion would produce. |
+
+---
+
 ## Out of scope
 
 - Any durable schema, migration, or ORM — no Postgres, no database of any kind.
@@ -635,6 +649,7 @@ For local development, running `make docker-up` (Valkey + LocalStack only) and `
 
 ## See also
 
+- [`.claude/CLAUDE.md`](.claude/CLAUDE.md) — top-level guidance for Claude Code working in this repo.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layer model, request-flow/cache/event/failure-handling diagrams, key invariants, threat model.
 - [`docs/lld/iam-lld-authz-enrichment.md`](docs/lld/iam-lld-authz-enrichment.md) — the Low-Level Design: precedence chain, cache-key table, §7 event-invalidation narrative, §9 `DenyReason`/status table, §16 `AE-#` decision register.
 - [`api/asyncapi.yaml`](api/asyncapi.yaml) — the 5-queue/15-event-type consumer contract (see [§ Event architecture](#event-architecture)); also served live at `GET /asyncapi`/`GET /asyncapi.yaml`.

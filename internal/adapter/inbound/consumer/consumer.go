@@ -1,6 +1,7 @@
-// Package consumer wires the four (five, counting billing separately from
-// membership as the doc's table does) inbound SQS queues from LLD §5 to the
-// usecase.Invalidator. This service consumes only — it publishes nothing.
+// Package consumer wires the five inbound SQS queues from LLD §5 to the
+// usecase.Invalidator through platform-events (pkg/events + pkg/config).
+// This service consumes only — it publishes nothing, so the transactional
+// outbox (pkg/outbox) is not started; see cmd/server's LoadOutbox skip.
 //
 // DLQ handling (§5) is deliberately NOT implemented in application code: the
 // "maxReceiveCount=5 before landing in its own -dlq" behavior is SQS's own
@@ -11,29 +12,20 @@
 // does the counting and the eventual DLQ move on its own. Building a
 // second, application-level DLQ mechanism on top of that would be exactly
 // the "special-case DLQ-replay mechanism" §5 says not to build.
+//
+// Dedup uses Envelope.ID against the sibling processed_events port
+// (IdempotencyStore), backed by Valkey SET NX — LLD AE-6.
 package consumer
 
 import (
 	"context"
 	"encoding/json"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/usecase"
 )
-
-// IdempotencyCache is the port this package needs for consumer dedup (§5):
-// Valkey SET NX keyed by event ID, the functional equivalent of
-// INSERT...ON CONFLICT DO NOTHING for a service with no database.
-type IdempotencyCache interface {
-	MarkProcessed(ctx context.Context, eventID string) (bool, error)
-	// EvictProcessed un-marks an event ID. Called only when the handler for
-	// a just-marked event fails, so a future redelivery gets a real retry
-	// instead of being silently swallowed as "already processed" — without
-	// this, a message that always fails would falsely dedup-ack on its
-	// second delivery and never reach the DLQ after §5's maxReceiveCount.
-	EvictProcessed(ctx context.Context, eventID string) error
-}
 
 // Logger mirrors usecase.Logger's shape (see that type's doc comment for why
 // every IAM service declares its own copy of this interface).
@@ -51,9 +43,8 @@ type SQSClientLike = events.SQSClientLike
 // Deps bundles what every one of the five consumers is built from.
 type Deps struct {
 	Client      SQSClientLike
-	Region      string
-	EndpointURL string
-	Cache       IdempotencyCache
+	SQS         config.SQSConfigEnv
+	Cache       IdempotencyStore
 	Log         Logger
 	Invalidator *usecase.Invalidator
 }
@@ -66,49 +57,33 @@ type idleConsumer struct{}
 func (idleConsumer) Start(context.Context) error { return nil }
 func (idleConsumer) Stop() error                 { return nil }
 
-// dedupingHandler wraps handler with the §5 idempotency check: a message
-// whose event ID has already been marked processed is acknowledged
-// (deleted) without being handled again.
-func dedupingHandler(deps Deps, handler events.Handler) events.Handler {
-	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
-		first, err := deps.Cache.MarkProcessed(ctx, env.ID)
-		if err != nil {
-			// Valkey is unavailable for the dedup check — process anyway
-			// rather than block eviction on a soft dependency. At worst this
-			// re-applies an idempotent eviction, never a correctness issue.
-			deps.Log.Warn("idempotency check failed, processing anyway", map[string]interface{}{
-				"error": err.Error(), "event_id": env.ID, "event_type": env.Type,
-			})
-			return handler(ctx, env)
-		}
-		if !first {
-			return nil
-		}
-		if handlerErr := handler(ctx, env); handlerErr != nil {
-			if evictErr := deps.Cache.EvictProcessed(ctx, env.ID); evictErr != nil {
-				deps.Log.Warn("failed to evict idempotency marker after handler error", map[string]interface{}{
-					"error": evictErr.Error(), "event_id": env.ID, "event_type": env.Type,
-				})
-			}
-			return handlerErr
-		}
-		return nil
-	}
-}
-
 // buildConsumer constructs an SQS consumer for queueURL, or an idleConsumer
-// if queueURL is empty. opts passes through to events.NewSQSConsumerWithClient
-// — mainly used by tests to tune WithVisibilityTimeout for a fast DLQ cycle.
+// if queueURL is empty. Construction goes through platform-events
+// config.SQSConfigFromEnv / SQSConsumerOptions so MaxMessages, WaitSeconds,
+// VisibilityTimeout, and Concurrency come from the same env-derived struct
+// iam-org-membership / iam-user-profile use — not a hand-rolled SQSConfig.
+//
+// MaxReceiveCount is forced to 0: this service's DLQ is SQS-native redrive
+// on the queue resource. Passing SQS_MAX_RECEIVE_COUNT through
+// SQSConsumerOptions would make platform-events delete the message in-process
+// instead of leaving it for the queue's RedrivePolicy.
+//
+// opts passes through to events.NewSQSConsumerWithClient — mainly used by
+// tests to tune WithVisibilityTimeout for a fast DLQ cycle, and by
+// cmd/server for per-queue WithConcurrency.
 func buildConsumer(queueURL string, deps Deps, handler events.Handler, opts ...events.ConsumerOption) (events.Consumer, error) {
 	if queueURL == "" {
 		return idleConsumer{}, nil
 	}
-	return events.NewSQSConsumerWithClient(events.SQSConfig{
-		QueueURL:    queueURL,
-		Region:      deps.Region,
-		EndpointURL: deps.EndpointURL,
-		MaxMessages: 10,
-		WaitSeconds: 20,
-		Logger:      deps.Log,
-	}, deps.Client, dedupingHandler(deps, handler), opts...)
+	env := deps.SQS
+	env.QueueURL = queueURL
+	env.MaxReceiveCount = 0
+	cfg := config.SQSConfigFromEnv(env, deps.Log)
+	built := config.SQSConsumerOptions(env)
+	built = append(built, opts...)
+	return events.NewSQSConsumerWithClient(cfg, deps.Client, processedHandler(deps, handler), built...)
 }
+
+// Keep a compile-time check that handlers still speak platform-events
+// Envelope[json.RawMessage] — the same type org-membership's Handle takes.
+var _ events.Handler = func(context.Context, events.Envelope[json.RawMessage]) error { return nil }

@@ -260,6 +260,8 @@ flowchart TD
         k4["ae:neg:{tenant}:{user} → sentinel — subject rebuild returned 404\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
         k5["ae:processed:{event_id} → SET NX sentinel, 7-day TTL\nconsumer idempotency — the SET-NX equivalent of ON CONFLICT DO NOTHING"]
         k6["mfa_freshness_seconds  →  NEVER CACHED, no key exists (§4.4)\nfetched fresh per approver-gated request from I-14 ONLY —\nfolding it into ae:ctx would delay a tightened MFA window by up to 60s"]
+        k7["ae:realm:{issuer} → tenant_id, no TTL — write-once, never unmapped\nRealmMap's L1: positive entries cached forever; negative entries cached\nfor AE_REALM_NEG_TTL (default 5s) only — a transient store error is\nnever cached, only a confirmed miss"]
+        k8["ae:restricted:{tenant}:{tender} → sentinel, no TTL — write-once, never un-restricted\nRestrictedTenderSet's L1: same positive-forever/negative-for-AE_RESTRICTED_NEG_TTL\nsplit as ae:realm above, same transient-error-not-cached rule"]
     end
 
     subgraph envelope["ae:ctx / ae:tenant envelope — one key serves two purposes"]
@@ -303,6 +305,9 @@ flowchart TD
 - `mfa_freshness_seconds` is never written to any cache key this service owns — see the dedicated regression tests in `internal/domain/mfa_never_cached_test.go` and `internal/usecase/check_test.go`.
 - A tenant-wide event (`TenantPlanChanged`, …) is always a single-key `DEL ae:tenant:{tenant}` — never a `SCAN`, because tenant-scoped facts are split into their own key from per-user membership facts.
 - Jitter (±6s on the 60s `ae:ctx` TTL) desynchronizes expiry across replicas; `singleflight` desynchronizes concurrent callers against the same key at the moment it does expire. There is deliberately no cross-replica distributed lock (§4.5) — the sibling's own capacity headroom makes a worst-case simultaneous-expiry stampede a non-issue.
+- `RealmMap`/`RestrictedTenderSet`'s L1 caches split positive and negative results asymmetrically: a positive result (realm mapped, tender restricted) is trusted forever, since neither fact is ever reversed by an event; a negative result is trusted only for `AE_REALM_NEG_TTL`/`AE_RESTRICTED_NEG_TTL` (default 5s each), so a replica eventually notices another replica's write to the shared L2 key without paying a Valkey round-trip on every request for an issuer/tender that has never resolved.
+- A concurrent write landing in `RealmMap`/`RestrictedTenderSet`'s L1 map while a stale-negative L2 read is still in flight can never be clobbered back to negative — both `lookupStore` (tenant_resolve.go) and `IsRestricted` (restricted_tenders.go) re-check L1 for an existing positive entry immediately before writing their own result. See `TestRealmMap_ConcurrentSetDuringStaleLookup_DoesNotClobber` / `TestRestrictedTenderSet_ConcurrentMarkDuringStaleLookup_DoesNotClobber`.
+- A transient L2 (Valkey) error is never cached as a confirmed negative on either of those two L1 caches — only a genuine "confirmed absent" result (no error) gets a negative TTL entry, so a single Valkey blip cannot extend itself into a multi-second window of wrongly-denied requests. See `TestRealmMap_StoreErrorOnGet_NotCached_RetriesNextCall` / `TestRestrictedTenderSet_StoreErrorOnGet_NotCached_RetriesNextCall`.
 
 ---
 
@@ -501,6 +506,9 @@ graph LR
 | Realm-map freshness survives the direct-paid-signup edge case | Both `TenantConverted` and `TenantRealmReady` update the realm map; only the latter fires for a tenant that never went through conversion |
 | A deployment left pointed at the local-dev Org & Membership URL fails at startup, not silently on every request | `internal/config/config.go`'s `Load()` returns an error when `OrgMembershipBaseURL` is still `http://localhost:8081` and `APP_ENV != "dev"` |
 | The five SQS consumers stop concurrently, not sequentially, on shutdown | `cmd/server/main.go`'s shutdown path uses a `sync.WaitGroup`, bounding worst-case shutdown to one drain window instead of five |
+| A consumer whose `ReceiveMessage` calls fail forever is still detected and restarts the pod | `platform-events`' consumer loop never returns an error for this case — it retries internally, forever, logging only. `cmd/server/receive_watchdog.go` polls `sqs_receive_errors_total` per queue and pushes to `fatalErr` after several minutes of no successful receive, closing a gap `fatalErr` alone could not detect |
+| Two `*_AUTHZ_QUEUE_URL` env vars can never silently point at the same queue | `internal/config/config.go`'s `Load()` fails fast on a duplicate — undetected, it would also corrupt the receive-error watchdog's per-URL streak tracking (two aliases racing to update/reset the same counter every poll) |
+| An unexpected death of the gRPC/HTTP/metrics server itself — not just a consumer — still restarts the pod | `values.yaml`'s liveness/readiness probes are `httpGet` against the HTTP server only, with no `grpc:` probe against the gRPC port's health service; `cmd/server/main.go`'s three server goroutines report any non-graceful `Serve`/`ListenAndServe` exit to the same `fatalErr` channel a stuck consumer feeds, so a dead gRPC server (the entire ext_authz decision path) can't run indefinitely behind a healthy-looking `/healthz` (LLD §16 AE-28) |
 
 ---
 

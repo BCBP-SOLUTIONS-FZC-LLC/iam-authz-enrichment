@@ -34,3 +34,11 @@ func negativeKey(tenant, user string) string {
 func processedKey(eventID string) string {
 	return fmt.Sprintf("ae:processed:%s", eventID)
 }
+
+func realmKey(realm string) string {
+	return fmt.Sprintf("ae:realm:%s", realm)
+}
+
+func restrictedFactKey(tenant, tender string) string {
+	return fmt.Sprintf("ae:restricted:%s:%s", tenant, tender)
+}

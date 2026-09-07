@@ -10,6 +10,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
 
@@ -40,13 +42,13 @@ type Recorder struct {
 }
 
 // New builds and registers all authz_* metrics on reg — the same registry
-// internal/adapter/inbound/http's /metrics route scrapes via
-// promhttp.Handler(). reg is optional (variadic so every existing zero-arg
-// call site keeps compiling) and defaults to prometheus.DefaultRegisterer;
-// cmd/server passes gincommon.MetricsRegisterer() so these collectors are
-// explicitly confirmed to land in the same registry as platform-gincommon's
-// own metrics, rather than assuming DefaultRegisterer and hoping gincommon
-// agrees (same convention as iam-user-profile's metrics.Register).
+// cmd/server's dedicated /metrics listener scrapes via promhttp.Handler().
+// reg is optional (variadic so every existing zero-arg call site keeps
+// compiling) and defaults to prometheus.DefaultRegisterer; cmd/server
+// passes gincommon.MetricsRegisterer() AFTER ObservabilityMiddlewares has
+// run, so these collectors land in the same registry and pick up the same
+// {service, version} const labels as platform-gincommon's own HTTP/gRPC
+// series (same convention as iam-org-membership / iam-user-profile).
 func New(reg ...prometheus.Registerer) *Recorder {
 	registerer := prometheus.DefaultRegisterer
 	if len(reg) > 0 && reg[0] != nil {
@@ -55,64 +57,93 @@ func New(reg ...prometheus.Registerer) *Recorder {
 	return newRecorder(registerer)
 }
 
+// gincommonLabels returns a copy of gincommon's {service, version} const
+// labels so authz_* collectors scrape on the same registry and labels as
+// HTTP/gRPC interceptor metrics. Returns nil when ObservabilityMiddlewares
+// has not run yet, matching prometheus's "no const labels" zero value so
+// unit tests that never bootstrap gincommon still register cleanly.
+func gincommonLabels() prometheus.Labels {
+	return constLabelsOrNil(gincommon.MetricsConstLabels())
+}
+
+func constLabelsOrNil(labels prometheus.Labels) prometheus.Labels {
+	if len(labels) == 0 {
+		return nil
+	}
+	return labels
+}
+
 // newRecorder builds and registers all authz_* metrics on reg. Factored out
 // from New() so tests can pass an isolated prometheus.NewRegistry() instead
 // of colliding on the process-wide default registry when multiple tests (or
 // test files) each want their own Recorder.
 func newRecorder(reg prometheus.Registerer) *Recorder {
 	f := promauto.With(reg)
+	labels := gincommonLabels()
 	return &Recorder{
 		decisionsTotal: f.NewCounterVec(prometheus.CounterOpts{
-			Name: "authz_decisions_total",
-			Help: "Total ext_authz decisions, by decision (allow/deny).",
+			Name:        "authz_decisions_total",
+			Help:        "Total ext_authz decisions, by decision (allow/deny).",
+			ConstLabels: labels,
 		}, []string{"decision"}),
 		denyReasonTotal: f.NewCounterVec(prometheus.CounterOpts{
-			Name: "authz_deny_reason_total",
-			Help: "Total deny decisions, by DenyReason.",
+			Name:        "authz_deny_reason_total",
+			Help:        "Total deny decisions, by DenyReason.",
+			ConstLabels: labels,
 		}, []string{"reason"}),
 		decisionLatency: f.NewHistogram(prometheus.HistogramOpts{
-			Name:    "authz_decision_latency_seconds",
-			Help:    "End-to-end Check() decision latency.",
-			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 16), // 0.5ms .. ~16s
+			Name:        "authz_decision_latency_seconds",
+			Help:        "End-to-end Check() decision latency.",
+			Buckets:     prometheus.ExponentialBuckets(0.0005, 2, 16), // 0.5ms .. ~16s
+			ConstLabels: labels,
 		}),
 		cacheLookups: f.NewCounter(prometheus.CounterOpts{
-			Name: "authz_cache_lookups_total",
-			Help: "Total ae:ctx/ae:tenant lookups. Divide authz_cache_hits_total by this for the hit ratio.",
+			Name:        "authz_cache_lookups_total",
+			Help:        "Total ae:ctx/ae:tenant lookups. Divide authz_cache_hits_total by this for the hit ratio.",
+			ConstLabels: labels,
 		}),
 		cacheHits: f.NewCounter(prometheus.CounterOpts{
-			Name: "authz_cache_hits_total",
-			Help: "ae:ctx/ae:tenant lookups that were a fresh hit.",
+			Name:        "authz_cache_hits_total",
+			Help:        "ae:ctx/ae:tenant lookups that were a fresh hit.",
+			ConstLabels: labels,
 		}),
 		negCacheLookups: f.NewCounter(prometheus.CounterOpts{
-			Name: "authz_negative_cache_lookups_total",
-			Help: "Total ae:neg lookups.",
+			Name:        "authz_negative_cache_lookups_total",
+			Help:        "Total ae:neg lookups.",
+			ConstLabels: labels,
 		}),
 		negCacheHits: f.NewCounter(prometheus.CounterOpts{
-			Name: "authz_negative_cache_hits_total",
-			Help: "ae:neg lookups that hit.",
+			Name:        "authz_negative_cache_hits_total",
+			Help:        "ae:neg lookups that hit.",
+			ConstLabels: labels,
 		}),
 		staleServedTotal: f.NewCounter(prometheus.CounterOpts{
-			Name: "authz_stale_if_error_served_total",
-			Help: "Requests served from a stale ae:ctx entry under §7's stale-if-error rule. A nonzero rate means a live dependency outage is in progress — page on this.",
+			Name:        "authz_stale_if_error_served_total",
+			Help:        "Requests served from a stale ae:ctx entry under §7's stale-if-error rule. A nonzero rate means a live dependency outage is in progress — page on this.",
+			ConstLabels: labels,
 		}),
 		sfCoalescedTotal: f.NewCounter(prometheus.CounterOpts{
-			Name: "authz_singleflight_coalesced_total",
-			Help: "Membership-rebuild calls coalesced by singleflight instead of issued.",
+			Name:        "authz_singleflight_coalesced_total",
+			Help:        "Membership-rebuild calls coalesced by singleflight instead of issued.",
+			ConstLabels: labels,
 		}),
 		i8Latency: f.NewHistogram(prometheus.HistogramOpts{
-			Name:    "authz_i8_call_latency_seconds",
-			Help:    "Org & Membership membership-rebuild (I-8) call latency.",
-			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 16),
+			Name:        "authz_i8_call_latency_seconds",
+			Help:        "Org & Membership membership-rebuild (I-8) call latency.",
+			Buckets:     prometheus.ExponentialBuckets(0.0005, 2, 16),
+			ConstLabels: labels,
 		}),
 		i12Latency: f.NewHistogram(prometheus.HistogramOpts{
-			Name:    "authz_i12_call_latency_seconds",
-			Help:    "iam-tender-acl TAC-4 (formerly Org & Membership's I-12) tender-ACL call latency.",
-			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 16),
+			Name:        "authz_i12_call_latency_seconds",
+			Help:        "iam-tender-acl TAC-4 (formerly Org & Membership's I-12) tender-ACL call latency.",
+			Buckets:     prometheus.ExponentialBuckets(0.0005, 2, 16),
+			ConstLabels: labels,
 		}),
 		i14Latency: f.NewHistogram(prometheus.HistogramOpts{
-			Name:    "authz_i14_call_latency_seconds",
-			Help:    "Org & Membership MFA-freshness (I-14) call latency.",
-			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 16),
+			Name:        "authz_i14_call_latency_seconds",
+			Help:        "Org & Membership MFA-freshness (I-14) call latency.",
+			Buckets:     prometheus.ExponentialBuckets(0.0005, 2, 16),
+			ConstLabels: labels,
 		}),
 	}
 }
