@@ -72,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.0
       - name: Hadolint
-        uses: hadolint/hadolint-action@v3.3.0
+        uses: hadolint/hadolint-action@v3.5.0
         with:
           dockerfile: Dockerfile
       - name: Check .dockerignore exists
