@@ -1,3 +1,20 @@
+# DEPENDABOT VERSION UPDATES ARE CURRENTLY DISABLED.
+#
+# GitHub enables Dependabot version updates purely based on whether
+# .github/dependabot.yml exists (and is valid) on the default branch — there
+# is no separate repo-settings toggle for it (unlike Dependabot alerts /
+# security updates, which are). Renaming this file to `dependabot.yml.disabled`
+# is the reversible way to turn version updates off without losing the config
+# below (grouped minor/patch updates per ecosystem, private-module registry
+# access, etc.) — it was tuned deliberately (see CHANGELOG's "Dependabot
+# opened one PR per individual dependency bump" entry) and shouldn't need to
+# be rebuilt from scratch later.
+#
+# To re-enable: `git mv .github/dependabot.yml.disabled .github/dependabot.yml`,
+# remove this banner comment, and push to the default branch. Already-open
+# Dependabot PRs from before this was disabled are unaffected either way —
+# this only stops new update runs from being scheduled.
+
 version: 2
 
 # Grants Dependabot access to the private github.com/BCBP-SOLUTIONS-FZC-LLC/*
