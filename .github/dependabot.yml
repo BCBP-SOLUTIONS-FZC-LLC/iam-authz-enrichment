@@ -16,6 +16,19 @@ registries:
     username: x-access-token
     password: ${{ secrets.GO_PRIVATE_TOKEN }}
 
+# Every update below is grouped into one PR per ecosystem per week for
+# minor/patch bumps — each Dependabot PR runs this repo's full required
+# pipeline (validate-test with real Valkey/LocalStack service containers,
+# validate-quality, docker build, Trivy, smoke test; six status checks
+# total), so one PR per *dependency* was multiplying CI minutes for no
+# review benefit: github/codeql-action alone was bumped 4 separate times
+# in under a month (4.37.0→4.37.6→4.37.7→4.37.8→4.37.9), each running the
+# entire pipeline for a patch version nobody was reviewing individually.
+# Major bumps are deliberately left ungrouped and opened individually —
+# those can carry real breaking changes or (per the Docker golang image —
+# see its own comment below) require a coordinated change elsewhere in the
+# repo, and are worth a dedicated review rather than being silently
+# bundled into a larger diff.
 updates:
   - package-ecosystem: gomod
     directory: /
@@ -23,19 +36,38 @@ updates:
       - github-bcbp
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels: [dependencies, go]
+    groups:
+      go-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
 
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 2
     labels: [dependencies, docker]
+    groups:
+      docker-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+    # A golang base-image major/minor bump (e.g. 1.26→1.27) is intentionally
+    # NOT grouped or auto-mergeable: go.mod's own `go` directive must move
+    # in lockstep (see CHANGELOG's "Dockerfile's pinned builder image was
+    # one patch version behind go.mod's requirement" fix) — merging the
+    # image bump alone without also bumping go.mod would silently reproduce
+    # that exact bug in the opposite direction (image newer than go.mod
+    # requires is harmless, but the reverse breaks every build).
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels: [dependencies, github-actions]
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
