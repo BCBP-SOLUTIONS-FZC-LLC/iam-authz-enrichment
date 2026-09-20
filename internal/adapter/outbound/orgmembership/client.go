@@ -18,6 +18,8 @@ import (
 	"net/url"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
 
@@ -56,10 +58,25 @@ type Client struct {
 func New(baseURL string, timeout time.Duration, tenderACLBaseURL string, tenderACLTimeout time.Duration) *Client {
 	return &Client{
 		baseURL: baseURL,
-		http:    &http.Client{Timeout: timeout},
+		http:    instrumentedHTTPClient(timeout),
 
 		tenderACLBaseURL: tenderACLBaseURL,
-		tenderACLHTTP:    &http.Client{Timeout: tenderACLTimeout},
+		tenderACLHTTP:    instrumentedHTTPClient(tenderACLTimeout),
+	}
+}
+
+// instrumentedHTTPClient matches iam-org-membership's httpx.NewClient:
+// otelhttp wraps the transport so every I-8/I-12/I-14 call emits a client
+// span and injects W3C traceparent through the TracerProvider
+// gincommon.InitTracingFromEnv installed. Without this, outbound calls
+// start a parentless trace at the sibling.
+func instrumentedHTTPClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 10 * time.Millisecond
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
 }
 

@@ -912,6 +912,16 @@ components:
         # (Tender Service) in this workspace to verify against. Reflects
         # only usecase.TenderRestrictedPayload, the shape this service's
         # own code (HandleTenderRestricted) actually decodes.
+        #
+        # LLD §16 AE-32 (CF-4): this event's existence and its routing to
+        # AuthZ Enrichment ARE confirmed — directly against IAM HLD v1.41
+        # §9.4/§10.3, which catalogs exactly three tender.events types
+        # (TenderRestricted, TenderAccessGranted, TenderSectionApproved)
+        # and assigns only this one here, the other two to Audit Log only.
+        # producer-lifecycle-status stays `unknown` because that flag is
+        # specifically about the PAYLOAD wire-shape below, which still has
+        # no Tender Service asyncapi.yaml to verify against — a narrower,
+        # still-open gap distinct from the event-catalog question CF-4 asked.
         depends-on-shape:
           tender_id: "uuid — the tender being flagged restricted"
         producer-lifecycle-status: unknown

@@ -268,6 +268,48 @@ func TestLoad_InvalidInt_EachField(t *testing.T) {
 	}
 }
 
+// TestLoad_NonPositiveInt_EachField exercises envPositiveInt's fail-fast
+// range check — a zero or negative value for one of these fields would
+// otherwise silently misbehave at runtime instead of failing at startup
+// (a gRPC server with zero concurrent streams allowed, a consumer built
+// with negative concurrency, a message-size cap that permits nothing).
+func TestLoad_NonPositiveInt_EachField(t *testing.T) {
+	fields := []string{
+		"GRPC_MAX_CONCURRENT_STREAMS",
+		"GRPC_MAX_RECV_MSG_SIZE_BYTES", "GRPC_MAX_SEND_MSG_SIZE_BYTES",
+		"MEMBERSHIP_AUTHZ_QUEUE_CONCURRENCY", "USER_AUTHZ_QUEUE_CONCURRENCY", "BILLING_AUTHZ_QUEUE_CONCURRENCY",
+		"TENANT_AUTHZ_QUEUE_CONCURRENCY", "TENDER_AUTHZ_QUEUE_CONCURRENCY",
+	}
+	for _, field := range fields {
+		for _, bad := range []string{"0", "-1"} {
+			t.Run(field+"/"+bad, func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv(field, bad)
+
+				_, err := config.Load()
+
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), field)
+				assert.Contains(t, err.Error(), "positive")
+			})
+		}
+	}
+}
+
+// TestLoad_GRPCMaxConcurrentStreams_ExceedsUint32Range proves a value that
+// would silently wrap via the uint32(streams) narrowing conversion instead
+// fails fast at startup.
+func TestLoad_GRPCMaxConcurrentStreams_ExceedsUint32Range(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GRPC_MAX_CONCURRENT_STREAMS", "4294967296") // math.MaxUint32 + 1
+
+	_, err := config.Load()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GRPC_MAX_CONCURRENT_STREAMS")
+	assert.Contains(t, err.Error(), "exceeds")
+}
+
 func TestLoad_InvalidBool_EachField(t *testing.T) {
 	fields := []string{"DOCS_ENABLED"}
 	for _, field := range fields {

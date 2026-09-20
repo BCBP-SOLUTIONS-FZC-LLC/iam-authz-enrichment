@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -30,17 +31,18 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 
-	eventsconfig "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/grpccommon"
-	gincommonlogger "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/consumer"
 	grpcadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/grpc"
 	httpadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/http"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/outbound/orgmembership"
+	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/outbound/postgres"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/outbound/valkey"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/config"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/usecase"
@@ -49,6 +51,33 @@ import (
 // buildVersion is overridden at build time via -ldflags (see Dockerfile/Makefile).
 var buildVersion = "dev"
 
+// grpcGracefulStopTimeout bounds how long shutdown waits for
+// grpcServer.GracefulStop() to drain in-flight RPCs/connections before
+// forcing a hard Stop(). GracefulStop otherwise blocks unconditionally — a
+// single wedged Envoy connection or a Check() call stuck on a hanging
+// downstream call would stall every shutdown step after it (HTTP shutdown,
+// consumer drain, cache.Close()) until Kubernetes' own
+// terminationGracePeriodSeconds expires and SIGKILLs the pod, skipping the
+// graceful consumer drain entirely instead of just this one step.
+//
+// 10s, not a rounder 30s: it shares deploy/helm/values.yaml's 60s
+// terminationGracePeriodSeconds with httpShutdownTimeout (10s) and the SQS
+// consumers' own drain window (platform-events default 30s+5s margin,
+// stopped concurrently, §11) — 10+10+35 = 55s leaves a 5s margin instead of
+// eating the whole budget on the phase least likely to ever need it (a
+// Check() call is sub-100ms in the overwhelming common case).
+const grpcGracefulStopTimeout = 10 * time.Second
+
+// httpShutdownTimeout bounds the health/readiness/AsyncAPI HTTP server's and
+// the metrics server's Shutdown() calls — see grpcGracefulStopTimeout's
+// comment for why this and the other two shutdown phases are each kept
+// well below terminationGracePeriodSeconds/3 rather than a generic 30s:
+// neither server holds long-lived business connections (probes and scrapes
+// are all sub-millisecond, single-shot requests), so 30s of headroom here
+// was budget taken from the phase that actually needs it — the SQS
+// consumer drain.
+const httpShutdownTimeout = 10 * time.Second
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -56,25 +85,22 @@ func main() {
 }
 
 func run() error {
-	cfg, err := config.Load()
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-
-	// Same convention as iam-org-membership/iam-user-profile: Gin defaults
-	// to debug mode (verbose per-route registration logging on every
-	// startup, plus the framework's own "switch to release mode" warning)
-	// unless told otherwise. Without this, every production pod would run
-	// debug-mode Gin permanently.
-	if cfg.AppEnv != "dev" {
+	// Logger first, matching iam-user-profile / iam-org-membership: Zap via
+	// platform-gincommon so every subsequent startup failure (config, listen,
+	// consumers) goes through the same sink instead of stdlib log.Fatal.
+	appEnv := envOr("APP_ENV", "dev")
+	if appEnv != "dev" {
 		gin.SetMode(gin.ReleaseMode)
 	}
-
-	// 1. Logger — Zap via platform-gincommon (same sink as iam-user-profile
-	// / iam-org-membership).
-	appLog, err := gincommonlogger.NewLogger(cfg.AppEnv)
+	appLog, err := logger.NewLogger(appEnv)
 	if err != nil {
 		return fmt.Errorf("build logger: %w", err)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		appLog.Error("load config", map[string]interface{}{"error": err.Error()})
+		return fmt.Errorf("load config: %w", err)
 	}
 	appLog.Info("starting", map[string]interface{}{
 		"service": cfg.AppName, "version": buildVersion, "env": cfg.AppEnv,
@@ -109,9 +135,11 @@ func run() error {
 	// spans (authz.lookup_cache / i8_call / …) and outbound W3C
 	// traceparent injection get a real provider even when
 	// OTEL_EXPORTER_OTLP_ENDPOINT is unset (dev). Interceptor/middleware
-	// EnsureInitTelemetry is then a no-op. Flush happens via
-	// grpccommon.Shutdown at process exit.
-	_ = gincommon.InitTracingFromEnv()
+	// EnsureInitTelemetry is then a no-op. Flush: shutdownTracing then
+	// grpccommon.Shutdown — same pair as iam-user-profile / iam-org-membership
+	// (those call gincommon.Shutdown; this process is gRPC-primary so it
+	// uses grpccommon.Shutdown, which is the same OTel+Zap flush).
+	shutdownTracing := gincommon.InitTracingFromEnv()
 
 	ginCfg := gincommon.Config{
 		Logger:       appLog,
@@ -137,6 +165,26 @@ func run() error {
 	// as HTTP/gRPC interceptor series).
 	recorder := metrics.New(gincommon.MetricsRegisterer())
 	events.InitWithRegisterer(cfg.AppName, buildVersion, gincommon.MetricsRegisterer())
+	pgmetrics.InitWithRegisterer(cfg.AppName, buildVersion, gincommon.MetricsRegisterer())
+
+	// Database config — same ConfigFromEnv / DSNFromEnv / Zap logger /
+	// gincommon TracerProvider path as iam-user-profile / iam-org-membership.
+	// This service has no schema (HLD §5.4), so NewPool / migrate / outbox
+	// are never started. OpenPool remains the only constructor a future
+	// schema is allowed to use.
+	pgCfg, pgWarnings := pgadapter.PoolConfig(appLog, cfg.AppName)
+	for _, w := range pgWarnings {
+		if pgCfg.DSN == "" && w.Key == "PG_USER/PG_DBNAME" {
+			continue
+		}
+		appLog.Warn("postgres config warning", map[string]interface{}{"key": w.Key, "reason": w.Reason})
+	}
+	if pgCfg.DSN != "" {
+		appLog.Warn("postgres DSN is set but iam-authz-enrichment has no database (HLD §5.4) — platform-pgcommon NewPool / migrate / outbox not started", nil)
+	}
+	if os.Getenv("MIGRATION_DATABASE_URL") != "" || os.Getenv("SYSTEM_DATABASE_URL") != "" {
+		appLog.Warn("MIGRATION_DATABASE_URL/SYSTEM_DATABASE_URL is set but iam-authz-enrichment has no database — migrate / sysPool not started", nil)
+	}
 
 	// 4. Cache.
 	cache := valkey.New(valkey.Config{
@@ -191,6 +239,7 @@ func run() error {
 	if cfg.GRPCTLSCertFile != "" && cfg.GRPCTLSKeyFile != "" {
 		tlsCreds, tlsErr := loadServerTLS(cfg)
 		if tlsErr != nil {
+			appLog.Error("load grpc tls credentials", map[string]interface{}{"error": tlsErr.Error()})
 			return fmt.Errorf("load grpc tls credentials: %w", tlsErr)
 		}
 		serverOpts = append(serverOpts, grpc.Creds(tlsCreds))
@@ -218,6 +267,7 @@ func run() error {
 	var lc net.ListenConfig
 	grpcLis, err := lc.Listen(context.Background(), "tcp", ":"+cfg.GRPCPort)
 	if err != nil {
+		appLog.Error("listen grpc", map[string]interface{}{"error": err.Error()})
 		return fmt.Errorf("listen grpc: %w", err)
 	}
 
@@ -244,7 +294,7 @@ func run() error {
 	// carries no business API to protect from a shared-port NetworkPolicy
 	// grant, since the actual authz decision path is exclusively gRPC).
 	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsMux.Handle("/metrics", metricsScrapeHandler())
 	metricsServer := &http.Server{
 		Addr:              ":" + cfg.MetricsPort,
 		Handler:           metricsMux,
@@ -266,6 +316,7 @@ func run() error {
 	consumers, queueURLs, err := startConsumers(ctx, cfg, cache, invalidator, appLog, fatalErr)
 	if err != nil {
 		cancelBackgroundWork()
+		appLog.Error("start consumers", map[string]interface{}{"error": err.Error()})
 		return fmt.Errorf("start consumers: %w", err)
 	}
 
@@ -328,9 +379,22 @@ func run() error {
 	// Reflects the draining state to anything still checking the native
 	// gRPC health service before GracefulStop finishes rejecting new RPCs.
 	healthServer.SetServingStatus("", healthgrpc.HealthCheckResponse_NOT_SERVING)
-	grpcServer.GracefulStop()
+	gracefulStopDone := make(chan struct{})
+	go func() {
+		grpcServer.GracefulStop()
+		close(gracefulStopDone)
+	}()
+	select {
+	case <-gracefulStopDone:
+	case <-time.After(grpcGracefulStopTimeout):
+		appLog.Warn("grpc graceful stop timed out — forcing hard stop", map[string]interface{}{
+			"timeout": grpcGracefulStopTimeout.String(),
+		})
+		grpcServer.Stop()
+		<-gracefulStopDone // Stop() unblocks the pending GracefulStop() goroutine too.
+	}
 
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), httpShutdownTimeout)
 	defer cancelShutdown()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		appLog.Warn("http shutdown error", map[string]interface{}{"error": err.Error()})
@@ -363,7 +427,30 @@ func run() error {
 		appLog.Warn("cache close error", map[string]interface{}{"error": err.Error()})
 	}
 
+	shutdownTracing()
 	return grpccommon.Shutdown(appLog)
+}
+
+// metricsScrapeHandler serves /metrics from gincommon's registerer — the
+// same registry ObservabilityMiddlewares, authz_* collectors, and
+// platform-events InitWithRegisterer write to. promhttp.Handler() always
+// scrapes prometheus.DefaultGatherer; after ObservabilityMiddlewares that
+// is the same registry, but scraping MetricsRegisterer() keeps this
+// listener correct if gincommon ever switches tests/prod onto an isolated
+// registry (the contract MetricsRegisterer documents).
+func metricsScrapeHandler() http.Handler {
+	reg := gincommon.MetricsRegisterer()
+	if g, ok := reg.(prometheus.Gatherer); ok {
+		return promhttp.HandlerFor(g, promhttp.HandlerOpts{})
+	}
+	return promhttp.Handler()
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 // loadServerTLS builds the gRPC server's TLS credentials from
@@ -417,29 +504,29 @@ func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache,
 		}
 	})
 
-	// Shared SQS knobs (MaxMessages / WaitSeconds / VisibilityTimeout /
-	// Concurrency defaults) come from platform-events pkg/config — the
-	// same LoadSQS / SQSConfigFromEnv / SQSConsumerOptions path
-	// iam-org-membership uses. Per-queue URL and concurrency still come
-	// from this service's config because there are five queues, not one
-	// SQS_QUEUE_URL.
-	sqsEnv := eventsconfig.LoadSQS()
-	eventsconfig.LogWarningsTo(appLog, sqsEnv.Warnings)
-	sqsEnv.Region = cfg.AWSRegion
-	sqsEnv.EndpointURL = cfg.AWSEndpointURL
-
-	// Outbox is Postgres-backed and only exists for services that publish.
-	// This process consumes only (HLD §5.4) — load the env so operators
-	// see the same warnings as siblings, then skip the runner.
-	outboxEnv := eventsconfig.LoadOutbox()
-	eventsconfig.LogWarningsTo(appLog, outboxEnv.Warnings)
-	if outboxEnv.DatabaseURL != "" {
-		appLog.Warn("DATABASE_URL is set but iam-authz-enrichment publishes no events — platform-events outbox runner not started", nil)
+	// Shared SQS / SNS / outbox knobs come from platform-events pkg/config
+	// — the same LoadSQS / LoadSNS / LoadOutbox + SNSConfigFromEnv /
+	// RunnerConfigFromEnv path iam-user-profile / iam-org-membership use.
+	// Per-queue URL and concurrency still come from this service's config
+	// because there are five queues, not one SQS_QUEUE_URL.
+	//
+	// Consume-only (HLD §5.4 / EVT-2): assemble the publisher and runner
+	// configs so operators get the same SNS_* / OUTBOX_* warnings, then
+	// skip NewSNSPublisher, outbox.ApplySchema, and NewRunner. A set
+	// DATABASE_URL already warned at PoolConfig above is also named here
+	// as an outbox skip so the two composition-root decisions stay next
+	// to the helpers that would otherwise start them.
+	plat := consumer.LoadPlatform(appLog, cfg.AWSRegion, cfg.AWSEndpointURL)
+	if reason := consumer.SNSPublisherSkipReason(plat.SNSTopicARN); reason != "" {
+		appLog.Warn(reason, nil)
+	}
+	if reason := consumer.OutboxRunnerSkipReason(plat.OutboxDatabaseURL); reason != "" {
+		appLog.Warn(reason, nil)
 	}
 
 	deps := consumer.Deps{
 		Client:      sqsClient,
-		SQS:         sqsEnv,
+		SQS:         plat.SQS,
 		Cache:       cache,
 		Log:         appLog,
 		Invalidator: inv,

@@ -26,7 +26,7 @@ func membershipHandler(deps Deps) events.Handler {
 		case "DepartmentMembershipGranted", "DepartmentMembershipRevoked", "DepartmentMembershipLevelChanged",
 			"TenantRoleGranted", "TenantRoleRevoked", "MembershipRevoked":
 		default:
-			return nil
+			return ackUnknown(deps.Log, env)
 		}
 		var p usecase.MembershipEventPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
@@ -52,7 +52,7 @@ func userHandler(deps Deps) events.Handler {
 		switch env.Type {
 		case "UserUpdated", "UserAvailabilityChanged", "UserDeleted":
 		default:
-			return nil
+			return ackUnknown(deps.Log, env)
 		}
 		var p usecase.UserEventPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
@@ -83,7 +83,7 @@ func billingHandler(deps Deps) events.Handler {
 		switch env.Type {
 		case "TenantPlanChanged", "TenantSubscriptionCancelled", "TenantReactivated":
 		default:
-			return nil
+			return ackUnknown(deps.Log, env)
 		}
 		return deps.Invalidator.HandleBillingEvent(ctx, env.TenantID)
 	}
@@ -107,7 +107,7 @@ func tenantHandler(deps Deps) events.Handler {
 				return fmt.Errorf("decode %s payload: %w", env.Type, err)
 			}
 		default:
-			return nil
+			return ackUnknown(deps.Log, env)
 		}
 		if env.Type == "TenantConverted" {
 			return deps.Invalidator.HandleTenantConverted(ctx, env.TenantID, p)
@@ -126,7 +126,7 @@ func NewTenantConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption
 func tenderHandler(deps Deps) events.Handler {
 	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 		if env.Type != "TenderRestricted" {
-			return nil
+			return ackUnknown(deps.Log, env)
 		}
 		var p usecase.TenderRestrictedPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {

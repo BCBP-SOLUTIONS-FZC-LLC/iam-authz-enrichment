@@ -15,19 +15,19 @@ services:
       ORG_MEMBERSHIP_BASE_URL: http://host.docker.internal:8081
       TENDER_ACL_BASE_URL: http://host.docker.internal:8086
       AWS_REGION: ap-south-1
-      AWS_ACCESS_KEY_ID: localstack
-      AWS_SECRET_ACCESS_KEY: localstack
-      AWS_ENDPOINT_URL: http://localstack:4566
-      MEMBERSHIP_AUTHZ_QUEUE_URL: http://localstack:4566/000000000000/membership-authz-q
-      USER_AUTHZ_QUEUE_URL: http://localstack:4566/000000000000/user-authz-q
-      BILLING_AUTHZ_QUEUE_URL: http://localstack:4566/000000000000/billing-authz-q
-      TENANT_AUTHZ_QUEUE_URL: http://localstack:4566/000000000000/tenant-authz-q
-      TENDER_AUTHZ_QUEUE_URL: http://localstack:4566/000000000000/tender-authz-q
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://floci:4566
+      MEMBERSHIP_AUTHZ_QUEUE_URL: http://floci:4566/000000000000/membership-authz-q
+      USER_AUTHZ_QUEUE_URL: http://floci:4566/000000000000/user-authz-q
+      BILLING_AUTHZ_QUEUE_URL: http://floci:4566/000000000000/billing-authz-q
+      TENANT_AUTHZ_QUEUE_URL: http://floci:4566/000000000000/tenant-authz-q
+      TENDER_AUTHZ_QUEUE_URL: http://floci:4566/000000000000/tender-authz-q
       SHARED_REALM_ISSUER: https://kc.example.com/realms/shared-trial
     depends_on:
       valkey:
         condition: service_healthy
-      localstack:
+      floci:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
@@ -53,12 +53,18 @@ services:
       timeout: 5s
       retries: 5
 
-  localstack:
-    # Community edition — SQS only, no licence required. This service
-    # consumes only (§1); local dev/integration tests create the five
-    # queues directly (scripts/init-localstack.sh) rather than routing
-    # through SNS, since there's nothing to publish here.
-    image: localstack/localstack:4.4.0
+  floci:
+    # Floci — open-source (MIT), always-free AWS emulator; drop-in
+    # LocalStack replacement (iam-org-membership/iam-delegation use the
+    # same image). This service consumes only (§1) and publishes nothing,
+    # so there's no SNS topic to provision and Glue Schema Registry
+    # (floci includes it free, unlike LocalStack Community's Pro gate) is
+    # unused — scripts/init-floci.sh just creates the five inbound queues
+    # directly, the same shape scripts/init-localstack.sh already did.
+    # NOTE: CI (.github/workflows/validate-test.yml) does not use this
+    # compose file — it runs a bare `localstack` service container and
+    # scripts/init-localstack.sh directly, which stays untouched here.
+    image: floci/floci:2.1.0-compat
     ports:
       # Host-side port only — mapped off the 4566 default because several
       # sibling IAM repos' own docker-compose stacks already claim it
@@ -70,22 +76,51 @@ services:
       # unaffected by this.
       - "4571:4566"
     environment:
-      SERVICES: sqs
-      DEBUG: 0
-      AWS_DEFAULT_REGION: ap-south-1
-      # Optional — Community edition (this image) works fine without it.
-      # Only relevant if you're also using LocalStack Desktop's Pro login;
-      # this service has no feature that actually requires Pro (§ see
-      # README "Testing events locally" — SQS is Community-tier already).
-      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
+      FLOCI_DEFAULT_REGION: ap-south-1
+      FLOCI_DEFAULT_ACCOUNT_ID: "000000000000"
+      # Rewrites the host in SQS QueueUrl responses (e.g. http://floci:4566/...
+      # instead of http://localhost:4566/...) so the floci-ui container
+      # below — which resolves those URLs directly, AWS-SDK-console fashion
+      # — can actually reach them from inside its own container. Without
+      # this, floci-ui's queue list loads fine but every per-queue
+      # attribute (message counts included) silently comes back empty.
+      FLOCI_HOSTNAME: floci
     volumes:
-      - localstack_data:/var/lib/localstack
-      - ./scripts/init-localstack.sh:/etc/localstack/init/ready.d/init-localstack.sh
+      - floci_data:/app/data
+      - ./scripts/init-floci.sh:/etc/floci/init/ready.d/init-floci.sh
     healthcheck:
-      test: ["CMD", "awslocal", "sqs", "list-queues"]
+      # The compat image's AWS CLI defaults to region us-east-1 regardless
+      # of FLOCI_DEFAULT_REGION — floci treats region as an isolation
+      # boundary, so --region must be explicit here.
+      test: ["CMD", "aws", "--region", "ap-south-1", "sqs", "list-queues"]
       interval: 5s
       timeout: 5s
       retries: 10
 
+  floci-ui:
+    # Web console for floci — browse the five SQS queues at
+    # http://localhost:4502 instead of the aws CLI. Talks to `floci` over
+    # the compose network.
+    image: floci/floci-ui:0.5.0
+    ports:
+      # Host 4502 → container 4500. 4500/4501 are claimed by
+      # iam-org-membership's/iam-delegation's own floci-ui instances so
+      # all three can run side-by-side.
+      - "4502:4500"
+    environment:
+      AWS_REGION: ap-south-1
+      AWS_ACCESS_KEY_ID: test
+      # NOT the same as AWS_ENDPOINT_URL below — floci-ui's own
+      # connectivity probe reads this separate, floci-ui-specific var
+      # (upstream default: http://localhost:4566, which from *inside its
+      # own container* means itself, not `floci`).
+      FLOCI_ENDPOINT: http://floci:4566
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://floci:4566
+      PORT: "4500"
+    depends_on:
+      floci:
+        condition: service_healthy
+
 volumes:
-  localstack_data:
+  floci_data:

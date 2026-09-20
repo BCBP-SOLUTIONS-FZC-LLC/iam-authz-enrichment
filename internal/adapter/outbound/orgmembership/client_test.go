@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/outbound/orgmembership"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
@@ -219,6 +221,9 @@ func TestGetMemberships_MalformedJSONResponse_ReturnsErrUnavailable(t *testing.T
 
 func TestGetMemberships_PropagatesTraceparent(t *testing.T) {
 	t.Parallel()
+	shutdown := gincommon.InitTracingFromEnv()
+	t.Cleanup(shutdown)
+
 	var got string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Get("traceparent")
@@ -240,7 +245,9 @@ func TestGetMemberships_PropagatesTraceparent(t *testing.T) {
 	_, _, err := client.GetMemberships(ctx, "tenant-1", "user-1")
 
 	require.NoError(t, err)
-	assert.Equal(t, "00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01", got)
+	require.NotEmpty(t, got, "W3C traceparent must be injected via gincommon's propagator / otelhttp")
+	assert.Contains(t, got, "0102030405060708090a0b0c0d0e0f10",
+		"trace id must propagate; span id may be the otelhttp client span, not the parent")
 }
 
 // Org & Membership's /internal/* routes are gated by an application-level

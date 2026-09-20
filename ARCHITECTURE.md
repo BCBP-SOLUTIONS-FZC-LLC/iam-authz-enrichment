@@ -21,7 +21,7 @@ graph TD
     subgraph adapters_in["Inbound Adapters  —  internal/adapter/inbound/"]
         grpc_a["grpc/\nServer — envoy.service.auth.v3.Authorization\nclaims.go — decodeClaims (Envoy jwt_authn dynamic metadata ONLY,\nnever request headers — §8.2)\nrequestfacts.go — decodeRequestFacts (route ContextExtensions +\ntenderIDFromPath: tender_id parsed from the raw URL path, never\ncontext_extensions — §5.1/AE-22)\nresponse.go — okResponse / deniedResponse (§9 status mapping)"]
         http_a["http/\nrouter.go — /healthz · /readyz, plus the DocsConfig-gated AsyncAPI\nviewer (/asyncapi, /asyncapi.yaml — asyncapi.go, api/embed.go)\nno business logic either way; /metrics has its own dedicated listener\nwires gincommon.ObservabilityMiddlewares — same fleet-wide stack\niam-org-membership/iam-user-profile put in front of their Gin routers\nReadinessProbe reports process-startup, NOT dependency health\n(§7 bypass/stale-if-error modes must stay in rotation)"]
-        consumer_a["consumer/\n5 SQS consumers: membership · user · billing · tenant · tender\ndedupingHandler — ae:processed SET NX, with EvictProcessed on\nhandler failure so a permanently-bad message still reaches the DLQ"]
+        consumer_a["consumer/\n5 SQS consumers: membership · user · billing · tenant · tender\nLoadPlatform — LoadSQS/LoadSNS/LoadOutbox (skip publisher/runner)\nskipDuplicate/ackUnknown — Envelope.ID, Valkey SET NX\nEvictProcessed on handler failure so a permanently-bad message still reaches the DLQ"]
     end
 
     subgraph usecase["Usecase  —  internal/usecase/"]
@@ -43,6 +43,7 @@ graph TD
         valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
         org_a["orgmembership/\nClient — I-8 memberships + I-14 mfa-freshness against Org & Membership,\nTAC-4 tender-acl (formerly I-12) against iam-tender-acl since ADR-0007\nWave 3 Phase 4 — two base URLs/timeouts, one Go package\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
         metrics_a["metrics/\nRecorder — Prometheus authz_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
+        postgres_a["postgres/\nplatform-pgcommon DSN / PoolConfig / Zap logger /\nOTel tracer / OpenPool wrapper — no live pool (HLD §5.4)"]
     end
 
     subgraph config_g["Config  —  internal/config/"]
@@ -50,7 +51,7 @@ graph TD
     end
 
     main --> grpc_a & http_a & consumer_a
-    main --> valkey_a & org_a & metrics_a & config_c
+    main --> valkey_a & org_a & metrics_a & postgres_a & config_c
     main --> checker & invalidator & realmmap
 
     grpc_a --> checker
@@ -75,7 +76,7 @@ graph TD
     metrics_a -.->|"satisfies Recorder\n(structurally — no import)"| ports
 ```
 
-**Rule:** `domain` ← `policy` ← `usecase` ← `adapter` ← `cmd`. Outbound adapters (`valkey`, `orgmembership`, `metrics`) depend only on `domain`/`policy` — they **never** import `usecase`, even though they implement interfaces `usecase/ports.go` declares. That inversion is the whole point: `usecase` owns the contract, adapters satisfy it structurally. Enforced in CI by `go-arch-lint check --project-path .` against `.go-arch-lint.yml`.
+**Rule:** `domain` ← `policy` ← `usecase` ← `adapter` ← `cmd`. Outbound adapters (`valkey`, `orgmembership`, `metrics`, `postgres`) depend only on `domain`/`policy` — they **never** import `usecase`, even though they implement interfaces `usecase/ports.go` declares. That inversion is the whole point: `usecase` owns the contract, adapters satisfy it structurally. Enforced in CI by `go-arch-lint check --project-path .` against `.go-arch-lint.yml`. `postgres` is config-only (no usecase port): it wraps `platform-pgcommon` so a future schema cannot bypass it with a raw `pgxpool`.
 
 ---
 
@@ -94,6 +95,7 @@ graph LR
     valkey(["adapter/outbound/valkey"])
     orgmembership(["adapter/outbound/orgmembership"])
     metrics(["adapter/outbound/metrics"])
+    postgres(["adapter/outbound/postgres"])
     usecase(["usecase"])
     policy(["domain/policy"])
     domain(["domain"])
@@ -101,7 +103,7 @@ graph LR
     api(["api"])
 
     cmd --> grpc & http & consumer
-    cmd --> valkey & orgmembership & metrics
+    cmd --> valkey & orgmembership & metrics & postgres
     cmd --> usecase & policy & domain & config
 
     grpc --> usecase & policy & domain
@@ -427,6 +429,8 @@ flowchart TD
 | **One SQS queue / its DLQ** | Consumer or handler failure | That queue's cache facts go stale until the message is redelivered or DLQ'd | SQS's own `maxReceiveCount=5` redrive policy; degrades to "stale until TTL expiry", never a correctness failure requiring replay |
 | **OTel Collector** | Unreachable | Spans not exported | Metrics and logs unaffected; trace IDs still valid but not persisted |
 | **Panic in `Check()`** | Any panic | The gRPC panic-recovery interceptor returns an error response | Recorded in metrics and logs; other in-flight requests unaffected |
+| **A wedged Envoy connection / in-flight `Check()` during shutdown (SIGTERM)** | Deliberate shutdown, not a runtime dependency failure | Previously unbounded — `grpcServer.GracefulStop()` blocked until every connection drained, stalling every later shutdown step (HTTP shutdown, consumer drain, `cache.Close()`) | Bounded to 10s (`grpcGracefulStopTimeout`), falling back to a hard `Stop()` — the rebalanced shutdown budget (grpc 10s + HTTP/metrics 10s + consumer drain ~35s = 55s) fits `terminationGracePeriodSeconds` (60s) with a 5s margin (LLD §16 AE-33) |
+| **Handler panic in a SQS consumer's `processedHandler`** | Any panic during event handling, after `MarkProcessed` already claimed the ID | Without recovery here, the idempotency marker stays permanently set — `ae:restricted` (no TTL, §8.5.1's overlay fact) is the highest-blast-radius case, since it never self-heals via TTL the way every other cache key does | `processedHandler` recovers, runs the same `EvictProcessed` cleanup the error path uses, then re-panics so `platform-events`' own top-level recovery still runs unchanged (LLD §16 AE-34) |
 
 ---
 

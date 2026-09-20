@@ -18,6 +18,7 @@ Provide a clear description of the changes.
 ## Testing
 - [ ] Unit tests added/updated (`make test`)
 - [ ] Integration tests added/updated (`make test-integration`, requires `make docker-up`)
+- [ ] E2E tests added/updated if the `Check` wire contract, an env var, or the precedence chain changed (`make build && make test-e2e`, requires `make docker-up`)
 - [ ] All tests passing with race detector (`make race`)
 - [ ] Manual `grpcurl`/`grpcui` testing performed (if the `Check` request/response shape changed)
 

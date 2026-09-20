@@ -168,3 +168,34 @@ func TestDedupingHandler_EvictProcessedFailsAfterHandlerError_StillPropagatesHan
 	require.Error(t, err)
 	assert.Equal(t, "handler failed", err.Error(), "the original handler error must win even if the best-effort EvictProcessed cleanup also fails")
 }
+
+func TestProcessedHandler_HandlerPanics_EvictsMarkerAndRepanics(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	inner := func(context.Context, events.Envelope[json.RawMessage]) error {
+		panic("boom")
+	}
+	wrapped := processedHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
+
+	assert.PanicsWithValue(t, "boom", func() {
+		_ = wrapped(context.Background(), events.Envelope[json.RawMessage]{ID: "evt-1"})
+	})
+
+	first, err := cache.MarkProcessed(context.Background(), ConsumerName, "evt-1")
+	require.NoError(t, err)
+	assert.True(t, first, "a handler panic must evict the idempotency marker so a redelivery is retried, not silently skipped forever")
+}
+
+func TestProcessedHandler_HandlerPanics_EvictProcessedAlsoFails_StillRepanics(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.EvictProcessedErr = errors.New("valkey down")
+	inner := func(context.Context, events.Envelope[json.RawMessage]) error {
+		panic("boom")
+	}
+	wrapped := processedHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
+
+	assert.PanicsWithValue(t, "boom", func() {
+		_ = wrapped(context.Background(), events.Envelope[json.RawMessage]{ID: "evt-1"})
+	}, "the original panic must still propagate even if the best-effort EvictProcessed cleanup also fails")
+}

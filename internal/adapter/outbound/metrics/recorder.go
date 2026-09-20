@@ -15,9 +15,9 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
 
-// Recorder implements usecase.Recorder against the default Prometheus
-// registry (the same registry internal/adapter/inbound/http's /metrics
-// route scrapes via promhttp.Handler()).
+// Recorder implements usecase.Recorder against gincommon's Prometheus
+// registerer (the same registry cmd/server's /metrics listener scrapes
+// via metricsScrapeHandler / gincommon.MetricsRegisterer()).
 //
 // authz_cache_hit_ratio and authz_negative_cache_hit_ratio (§10) are each
 // exposed as a hits/lookups counter pair rather than a single ratio gauge —
@@ -42,7 +42,7 @@ type Recorder struct {
 }
 
 // New builds and registers all authz_* metrics on reg — the same registry
-// cmd/server's dedicated /metrics listener scrapes via promhttp.Handler().
+// cmd/server's dedicated /metrics listener scrapes via gincommon.MetricsRegisterer().
 // reg is optional (variadic so every existing zero-arg call site keeps
 // compiling) and defaults to prometheus.DefaultRegisterer; cmd/server
 // passes gincommon.MetricsRegisterer() AFTER ObservabilityMiddlewares has

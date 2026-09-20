@@ -9,6 +9,7 @@ package http
 import (
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -61,11 +62,14 @@ func (d DocsConfig) active() bool {
 // service's HTTP surface instead of falling through gin.Recovery() alone.
 func NewRouter(probe *ReadinessProbe, ginCfg gincommon.Config, docs DocsConfig) *gin.Engine {
 	r := gin.New()
+	// Same stack as iam-user-profile / iam-org-membership: deadline first,
+	// then gincommon's panic-recovery / request-id / tracing / correlation /
+	// metrics / Zap logging. /healthz is gincommon.HealthHandler so the
+	// probe body matches every other IAM service.
+	r.Use(gincommon.TimeoutMiddleware(30 * time.Second))
 	r.Use(gincommon.ObservabilityMiddlewares(ginCfg)...)
 
-	r.GET("/healthz", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
+	r.GET("/healthz", gincommon.HealthHandler())
 	r.GET("/readyz", func(c *gin.Context) {
 		if !probe.Ready() {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "starting"})

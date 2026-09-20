@@ -1,7 +1,12 @@
 // Package consumer wires the five inbound SQS queues from LLD §5 to the
-// usecase.Invalidator through platform-events (pkg/events + pkg/config).
-// This service consumes only — it publishes nothing, so the transactional
-// outbox (pkg/outbox) is not started; see cmd/server's LoadOutbox skip.
+// usecase.Invalidator through platform-events (pkg/events + pkg/config +
+// pkg/outbox). LoadPlatform assembles the same SQS / SNS / outbox Config
+// iam-user-profile / iam-org-membership pass to NewSQSConsumer /
+// NewSNSPublisher / NewRunner; this service consumes only (HLD §5.4 /
+// EVT-2), so cmd/server skips NewSNSPublisher, outbox.ApplySchema, and
+// NewRunner after LoadPlatform. Dedup is Envelope.ID via skipDuplicate /
+// ackUnknown (same helpers as those siblings); the store is Valkey SET NX
+// because there is no processed_events table (LLD AE-6).
 //
 // DLQ handling (§5) is deliberately NOT implemented in application code: the
 // "maxReceiveCount=5 before landing in its own -dlq" behavior is SQS's own
@@ -12,9 +17,6 @@
 // does the counting and the eventual DLQ move on its own. Building a
 // second, application-level DLQ mechanism on top of that would be exactly
 // the "special-case DLQ-replay mechanism" §5 says not to build.
-//
-// Dedup uses Envelope.ID against the sibling processed_events port
-// (IdempotencyStore), backed by Valkey SET NX — LLD AE-6.
 package consumer
 
 import (
@@ -78,8 +80,13 @@ func buildConsumer(queueURL string, deps Deps, handler events.Handler, opts ...e
 	env := deps.SQS
 	env.QueueURL = queueURL
 	env.MaxReceiveCount = 0
-	cfg := config.SQSConfigFromEnv(env, deps.Log)
-	built := config.SQSConsumerOptions(env)
+	cfg := config.SQSConfigFromEnv(env, eventsLogger{deps.Log})
+	// NoopCodec is the identity events.Codec siblings pass when Glue is
+	// unset (WithConsumerCodec). Decode only runs when Envelope.SchemaID
+	// is non-empty; inbound IAM events are plain JSON, so this is the
+	// library hook with no wire-format change.
+	built := []events.ConsumerOption{events.WithConsumerCodec(events.NoopCodec{})}
+	built = append(built, config.SQSConsumerOptions(env)...)
 	built = append(built, opts...)
 	return events.NewSQSConsumerWithClient(cfg, deps.Client, processedHandler(deps, handler), built...)
 }

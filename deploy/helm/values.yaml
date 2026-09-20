@@ -152,9 +152,13 @@ secretValues:
   AWS_ACCESS_KEY_ID: ""
   AWS_SECRET_ACCESS_KEY: ""
 
-# gRPC GracefulStop (in-flight Check() is sub-100ms) + HTTP Shutdown (30s)
-# + 5 SQS consumers Stop()'d concurrently (one drain window, not 5×).
-# 60s covers a stuck handler at the platform-events default drain (30s+5s).
+# gRPC GracefulStop (10s cap, falling back to a hard Stop() — cmd/server/
+# main.go's grpcGracefulStopTimeout) + HTTP+metrics Shutdown (10s cap,
+# httpShutdownTimeout) + 5 SQS consumers Stop()'d concurrently (one drain
+# window, not 5x — platform-events default 30s+5s margin). Worst case
+# 10+10+35 = 55s, a 5s margin under the 60s below rather than eating the
+# whole budget on the two phases (an in-flight Check() call, a health/
+# metrics HTTP request) least likely to ever need more than a few ms.
 terminationGracePeriodSeconds: 60
 
 # podDisruptionBudget — ensures at least 2 pods survive voluntary disruptions

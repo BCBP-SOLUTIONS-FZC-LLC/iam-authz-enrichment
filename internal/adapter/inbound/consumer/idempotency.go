@@ -27,25 +27,24 @@ const ConsumerName = "iam-authz-enrichment"
 // Mark-then-handle (not mark-last): a handler failure Evicts the claim so
 // SQS redelivery is a real retry and the message can still reach the
 // SQS-native DLQ after maxReceiveCount, rather than being silently
-// swallowed as "already processed". MarkProcessed's atomic SET NX is
-// itself the duplicate check — there is no separate check-then-mark step,
-// so this port has no IsProcessed method.
+// swallowed as "already processed". skipDuplicate's MarkProcessed SET NX
+// is itself the duplicate check — there is no separate IsProcessed method.
 type IdempotencyStore interface {
 	MarkProcessed(ctx context.Context, consumer, eventID string) (bool, error)
 	EvictProcessed(ctx context.Context, consumer, eventID string) error
 }
 
 // processedHandler wraps handler with the platform-events processed_events
-// contract: Envelope.ID is the idempotency key. A redelivered ID is
-// acknowledged without being handled again; a handler error releases the
-// claim so the next delivery retries.
+// contract: Envelope.ID is the idempotency key (skipDuplicate / mark-first
+// SET NX). A redelivered ID is acknowledged without being handled again;
+// a handler error releases the claim so the next delivery retries.
 func processedHandler(deps Deps, handler events.Handler) events.Handler {
 	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 		if env.ID == "" {
 			return fmt.Errorf("envelope missing id")
 		}
 
-		first, err := deps.Cache.MarkProcessed(ctx, ConsumerName, env.ID)
+		skip, err := skipDuplicate(ctx, deps.Cache, env.ID)
 		if err != nil {
 			// Dedup store unavailable — process anyway rather than block
 			// eviction on a soft dependency. At worst this re-applies an
@@ -55,9 +54,29 @@ func processedHandler(deps Deps, handler events.Handler) events.Handler {
 			})
 			return handler(ctx, env)
 		}
-		if !first {
+		if skip {
 			return nil
 		}
+		// A handler panic must evict the just-claimed marker before
+		// propagating, the same as a returned error does below — otherwise
+		// the message is left permanently "processed" and any redelivery is
+		// silently skipped. This matters most for tender-authz-q's
+		// TenderRestricted: ae:restricted has no TTL (unlike every other
+		// queue's evictions, which self-heal within their cache's TTL), so a
+		// panic there would disable the tender-ACL overlay for that tender
+		// indefinitely with no automatic recovery. Re-panics afterward so
+		// platform-events' own top-level panic recovery still runs exactly
+		// as it would without this defer.
+		defer func() {
+			if r := recover(); r != nil {
+				if evictErr := deps.Cache.EvictProcessed(ctx, ConsumerName, env.ID); evictErr != nil {
+					deps.Log.Warn("failed to evict idempotency marker after handler panic", map[string]interface{}{
+						"error": evictErr.Error(), "event_id": env.ID, "event_type": env.Type,
+					})
+				}
+				panic(r)
+			}
+		}()
 		if handlerErr := handler(ctx, env); handlerErr != nil {
 			if evictErr := deps.Cache.EvictProcessed(ctx, ConsumerName, env.ID); evictErr != nil {
 				deps.Log.Warn("failed to evict idempotency marker after handler error", map[string]interface{}{
