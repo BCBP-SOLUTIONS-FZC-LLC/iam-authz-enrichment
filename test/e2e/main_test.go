@@ -59,7 +59,7 @@ const (
 )
 
 var (
-	org        *mockOrg
+	org        *fakeOrg
 	grpcClient authv3.AuthorizationClient
 
 	// runID scopes every tenant/user/tender ID this suite constructs (see
@@ -91,7 +91,7 @@ func runMain(m *testing.M) int {
 		return 1
 	}
 
-	org = newMockOrg()
+	org = newFakeOrg()
 	defer org.Close()
 
 	var logs bytes.Buffer
