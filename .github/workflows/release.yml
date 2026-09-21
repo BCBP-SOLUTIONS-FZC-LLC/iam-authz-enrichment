@@ -95,9 +95,12 @@ jobs:
         run: bash .github/scripts/verify-release-tag.sh
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@v6.5.0
         with:
           go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            go.mod
 
       # Block the release if CHANGELOG.md has no entry for this tag.
       # Cut the entry before tagging (see CONTRIBUTING.md).
@@ -147,7 +150,7 @@ jobs:
         run: bash .github/scripts/set-source-date-epoch.sh
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -155,7 +158,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v6.2.0
+        uses: docker/metadata-action@v6.1.0
         with:
           images: ${{ env.IMAGE_NAME }}
           # Produces: vMAJOR.MINOR.PATCH, vMAJOR.MINOR, vMAJOR (non-pre-releases).
@@ -166,11 +169,12 @@ jobs:
             type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }}
             type=raw,value=latest,enable=${{ !contains(env.RELEASE_TAG, '-') }}
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
 
       - name: Build and push
         id: pushed
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.3.0
         with:
           context: .
           file: ./Dockerfile
@@ -199,7 +203,7 @@ jobs:
           # artifact that's actually present.
 
       - name: Cache Trivy DB
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@v6.0.0
         with:
           path: /tmp/trivy-cache
           key: trivy-db-${{ runner.os }}
@@ -222,7 +226,7 @@ jobs:
           cache-dir: /tmp/trivy-cache
 
       - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v4.37.6
+        uses: github/codeql-action/upload-sarif@v4.37.0
         if: always()
         continue-on-error: true
         with:

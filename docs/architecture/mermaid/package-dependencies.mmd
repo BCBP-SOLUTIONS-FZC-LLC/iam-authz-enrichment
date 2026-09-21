@@ -6,6 +6,7 @@ graph LR
     valkey(["adapter/outbound/valkey"])
     orgmembership(["adapter/outbound/orgmembership"])
     metrics(["adapter/outbound/metrics"])
+    postgres(["adapter/outbound/postgres"])
     usecase(["usecase"])
     policy(["domain/policy"])
     domain(["domain"])
@@ -13,7 +14,7 @@ graph LR
     api(["api"])
 
     cmd --> grpc & http & consumer
-    cmd --> valkey & orgmembership & metrics
+    cmd --> valkey & orgmembership & metrics & postgres
     cmd --> usecase & policy & domain & config
 
     grpc --> usecase & policy & domain

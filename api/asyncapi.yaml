@@ -552,14 +552,16 @@ components:
               user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
               tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
               department_id: "fd72f513-45f0-46ca-a1ed-9183be72484c"
-              level: "approver"
+              previous_level: "reviewer"
+              new_level: "approver"
               actor_id: "1a2b3c4d-5555-4e6f-9a0b-000000000003"
       x-consumer-schema-dependency:
         depends-on-shape:
           user_id: uuid
           tenant_id: uuid
           department_id: uuid
-          level: "preparator | reviewer | approver"
+          previous_level: "preparator | reviewer | approver"
+          new_level: "preparator | reviewer | approver"
           actor_id: uuid
         producer-lifecycle-status: stable
 
@@ -847,15 +849,16 @@ components:
             data:
               realm: "acme-corp"
       x-consumer-schema-dependency:
-        # Verified 2026-09-20 against iam-realm-provisioner/api/asyncapi.yaml
-        # TenantConvertedPayload: realm (string, required) confirmed present.
-        # Producer also publishes: tenant_id, plan, billing_subscription_id,
-        # users_migrated, direct_signup — all safely ignored by this service.
+        # Confirmed against Realm Provisioner's own api/asyncapi.yaml
+        # (TenantConvertedPayload: realm: {type: string}) — this field's
+        # name and type match exactly. Only `realm` is listed here since
+        # it's the only field usecase.TenantRealmEventPayload/
+        # HandleTenantConverted actually decodes; that payload also
+        # carries tenant_id/plan/users_migrated/direct_signup/
+        # billing_subscription_id, all ignored by this service.
         depends-on-shape:
           realm: "string — the dedicated realm identifier, used as the JWT iss claim for tenant resolution (LLD §8.3)"
-        producer-lifecycle-status: verified
-        producer-verified-date: "2026-09-20"
-        producer-asyncapi-ref: "iam-realm-provisioner/api/asyncapi.yaml#/components/schemas/TenantConvertedPayload"
+        producer-lifecycle-status: stable
 
     TenantRealmReady:
       name: TenantRealmReady
@@ -877,15 +880,13 @@ components:
             data:
               realm: "acme-corp"
       x-consumer-schema-dependency:
-        # Verified 2026-09-20 against iam-realm-provisioner/api/asyncapi.yaml
-        # TenantRealmReadyPayload: realm (string, required) confirmed present.
-        # Producer also publishes: realm_id, realm_type, keycloak_shard,
-        # oidc_clients — all safely ignored by this service.
+        # Confirmed against Realm Provisioner's own api/asyncapi.yaml
+        # (TenantRealmReadyPayload: realm: {type: string}) — matches
+        # exactly. That payload also carries tenant_id/keycloak_shard/
+        # oidc_clients, all ignored by this service.
         depends-on-shape:
           realm: "string — the dedicated realm identifier, used as the JWT iss claim for tenant resolution (LLD §8.3)"
-        producer-lifecycle-status: verified
-        producer-verified-date: "2026-09-20"
-        producer-asyncapi-ref: "iam-realm-provisioner/api/asyncapi.yaml#/components/schemas/TenantRealmReadyPayload"
+        producer-lifecycle-status: stable
 
     TenderRestricted:
       name: TenderRestricted
@@ -911,6 +912,16 @@ components:
         # (Tender Service) in this workspace to verify against. Reflects
         # only usecase.TenderRestrictedPayload, the shape this service's
         # own code (HandleTenderRestricted) actually decodes.
+        #
+        # LLD §16 AE-32 (CF-4): this event's existence and its routing to
+        # AuthZ Enrichment ARE confirmed — directly against IAM HLD v1.41
+        # §9.4/§10.3, which catalogs exactly three tender.events types
+        # (TenderRestricted, TenderAccessGranted, TenderSectionApproved)
+        # and assigns only this one here, the other two to Audit Log only.
+        # producer-lifecycle-status stays `unknown` because that flag is
+        # specifically about the PAYLOAD wire-shape below, which still has
+        # no Tender Service asyncapi.yaml to verify against — a narrower,
+        # still-open gap distinct from the event-catalog question CF-4 asked.
         depends-on-shape:
           tender_id: "uuid — the tender being flagged restricted"
         producer-lifecycle-status: unknown
@@ -973,7 +984,8 @@ components:
         - user_id
         - tenant_id
         - department_id
-        - level
+        - previous_level
+        - new_level
         - actor_id
       properties:
         user_id:
@@ -986,10 +998,12 @@ components:
         department_id:
           type: string
           format: uuid
-        level:
+        previous_level:
           type: string
           enum: [preparator, reviewer, approver]
-          description: The new (current) department level after the change.
+        new_level:
+          type: string
+          enum: [preparator, reviewer, approver]
         actor_id:
           type: string
           format: uuid

@@ -26,7 +26,7 @@ func membershipHandler(deps Deps) events.Handler {
 		case "DepartmentMembershipGranted", "DepartmentMembershipRevoked", "DepartmentMembershipLevelChanged",
 			"TenantRoleGranted", "TenantRoleRevoked", "MembershipRevoked":
 		default:
-			return nil
+			return ackUnknown(deps.Log, env)
 		}
 		var p usecase.MembershipEventPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
@@ -41,7 +41,7 @@ func membershipHandler(deps Deps) events.Handler {
 
 // NewMembershipConsumer builds the membership-authz-q consumer.
 func NewMembershipConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption) (events.Consumer, error) {
-	return buildConsumer(queueURL, "membership-authz-q", deps, membershipHandler(deps), opts...)
+	return buildConsumer(queueURL, deps, membershipHandler(deps), opts...)
 }
 
 // userHandler implements user-authz-q (§5): UserUpdated (email changes
@@ -52,7 +52,7 @@ func userHandler(deps Deps) events.Handler {
 		switch env.Type {
 		case "UserUpdated", "UserAvailabilityChanged", "UserDeleted":
 		default:
-			return nil
+			return ackUnknown(deps.Log, env)
 		}
 		var p usecase.UserEventPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
@@ -71,7 +71,7 @@ func userHandler(deps Deps) events.Handler {
 
 // NewUserConsumer builds the user-authz-q consumer.
 func NewUserConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption) (events.Consumer, error) {
-	return buildConsumer(queueURL, "user-authz-q", deps, userHandler(deps), opts...)
+	return buildConsumer(queueURL, deps, userHandler(deps), opts...)
 }
 
 // billingHandler implements billing-authz-q (§5): TenantPlanChanged,
@@ -83,7 +83,7 @@ func billingHandler(deps Deps) events.Handler {
 		switch env.Type {
 		case "TenantPlanChanged", "TenantSubscriptionCancelled", "TenantReactivated":
 		default:
-			return nil
+			return ackUnknown(deps.Log, env)
 		}
 		return deps.Invalidator.HandleBillingEvent(ctx, env.TenantID)
 	}
@@ -91,7 +91,7 @@ func billingHandler(deps Deps) events.Handler {
 
 // NewBillingConsumer builds the billing-authz-q consumer.
 func NewBillingConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption) (events.Consumer, error) {
-	return buildConsumer(queueURL, "billing-authz-q", deps, billingHandler(deps), opts...)
+	return buildConsumer(queueURL, deps, billingHandler(deps), opts...)
 }
 
 // tenantHandler implements tenant-authz-q (§5): TenantConverted (evicts +
@@ -107,40 +107,36 @@ func tenantHandler(deps Deps) events.Handler {
 				return fmt.Errorf("decode %s payload: %w", env.Type, err)
 			}
 		default:
-			return nil
+			return ackUnknown(deps.Log, env)
 		}
-		switch env.Type {
-		case "TenantConverted":
+		if env.Type == "TenantConverted" {
 			return deps.Invalidator.HandleTenantConverted(ctx, env.TenantID, p)
-		case "TenantRealmReady":
-			deps.Invalidator.HandleTenantRealmReady(env.TenantID, p)
 		}
-		return nil
+		return deps.Invalidator.HandleTenantRealmReady(ctx, env.TenantID, p)
 	}
 }
 
 // NewTenantConsumer builds the tenant-authz-q consumer.
 func NewTenantConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption) (events.Consumer, error) {
-	return buildConsumer(queueURL, "tenant-authz-q", deps, tenantHandler(deps), opts...)
+	return buildConsumer(queueURL, deps, tenantHandler(deps), opts...)
 }
 
 // tenderHandler implements tender-authz-q (§5): TenderRestricted — flips an
 // in-memory fact, not a cache eviction.
 func tenderHandler(deps Deps) events.Handler {
-	return func(_ context.Context, env events.Envelope[json.RawMessage]) error {
+	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 		if env.Type != "TenderRestricted" {
-			return nil
+			return ackUnknown(deps.Log, env)
 		}
 		var p usecase.TenderRestrictedPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
 			return fmt.Errorf("decode %s payload: %w", env.Type, err)
 		}
-		deps.Invalidator.HandleTenderRestricted(env.TenantID, p)
-		return nil
+		return deps.Invalidator.HandleTenderRestricted(ctx, env.TenantID, p)
 	}
 }
 
 // NewTenderConsumer builds the tender-authz-q consumer.
 func NewTenderConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption) (events.Consumer, error) {
-	return buildConsumer(queueURL, "tender-authz-q", deps, tenderHandler(deps), opts...)
+	return buildConsumer(queueURL, deps, tenderHandler(deps), opts...)
 }

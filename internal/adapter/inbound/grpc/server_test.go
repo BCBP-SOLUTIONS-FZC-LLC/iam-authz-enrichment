@@ -38,8 +38,8 @@ func newTestServer(t *testing.T) *grpcadapter.Server {
 	}, domain.CacheFresh)
 	cache.SeedTenantContext(testTenant, domain.TenantContext{Plan: "pro", FeatureFlags: []string{"flag-a"}}, domain.CacheFresh)
 
-	realmMap := usecase.NewRealmMap(map[string]string{testIssuer: testTenant})
-	checker := usecase.NewChecker(cache, &fixtures.FakeOrgMembershipClient{}, realmMap, usecase.NewRestrictedTenderSet(),
+	realmMap := usecase.NewRealmMap(map[string]string{testIssuer: testTenant}, 5*time.Second)
+	checker := usecase.NewChecker(cache, &fixtures.FakeOrgMembershipClient{}, realmMap, usecase.NewRestrictedTenderSet(5*time.Second),
 		fixtures.NoopLogger{}, usecase.NoopRecorder{}, usecase.CheckerConfig{})
 
 	return grpcadapter.NewServer(checker, grpcadapter.JWTMetadata{Namespace: jwtNamespace, PayloadKey: jwtPayload})
@@ -202,9 +202,9 @@ func TestServer_GracefulStop_InFlightCheckCompletes(t *testing.T) {
 		},
 	}
 
-	realmMap := usecase.NewRealmMap(map[string]string{testIssuer: testTenant})
+	realmMap := usecase.NewRealmMap(map[string]string{testIssuer: testTenant}, 5*time.Second)
 	checker := usecase.NewChecker(
-		fixtures.NewFakeCache(), slowOrg, realmMap, usecase.NewRestrictedTenderSet(),
+		fixtures.NewFakeCache(), slowOrg, realmMap, usecase.NewRestrictedTenderSet(5*time.Second),
 		fixtures.NoopLogger{}, usecase.NoopRecorder{}, usecase.CheckerConfig{},
 	)
 

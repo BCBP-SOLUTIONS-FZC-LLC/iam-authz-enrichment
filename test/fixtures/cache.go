@@ -22,18 +22,20 @@ type tenantEntry struct {
 	result domain.CacheResult
 }
 
-// FakeCache implements usecase.Cache (and consumer.IdempotencyCache) as an
+// FakeCache implements usecase.Cache (and consumer.IdempotencyStore) as an
 // in-memory, call-logging fake. Zero value is a healthy, empty cache — set
 // the Err* fields to simulate a Valkey connection-level failure, and preset
 // the *Preset maps to simulate an existing (Fresh/Stale) entry.
 type FakeCache struct {
 	mu sync.Mutex
 
-	ctx    map[string]ctxEntry
-	tenant map[string]tenantEntry
-	tender map[string]domain.TenderACL
-	neg    map[string]bool
-	proc   map[string]bool
+	ctx        map[string]ctxEntry
+	tenant     map[string]tenantEntry
+	tender     map[string]domain.TenderACL
+	neg        map[string]bool
+	proc       map[string]bool
+	realm      map[string]string
+	restricted map[string]bool
 
 	// Err* simulate a Valkey connection-level failure on the matching
 	// operation family. A non-nil error here is what usecase.DependencyState
@@ -50,13 +52,17 @@ type FakeCache struct {
 	// can make reads succeed while a specific write fails (or vice versa).
 	SetCtxErr         error
 	SetTenantErr      error
+	EvictTenantErr    error
 	SetTenderACLErr   error
 	SetNegErr         error
 	GetTenderACLErr   error
 	EvictCtxErr       error
 	EvictNegErr       error
 	EvictTenderACLErr error
-	EvictTenantErr    error
+	RealmErr          error
+	RestrictedErr     error
+	SetRealmErr       error
+	SetRestrictedErr  error
 
 	Calls []string
 }
@@ -64,11 +70,13 @@ type FakeCache struct {
 // NewFakeCache builds an empty, healthy FakeCache.
 func NewFakeCache() *FakeCache {
 	return &FakeCache{
-		ctx:    map[string]ctxEntry{},
-		tenant: map[string]tenantEntry{},
-		tender: map[string]domain.TenderACL{},
-		neg:    map[string]bool{},
-		proc:   map[string]bool{},
+		ctx:        map[string]ctxEntry{},
+		tenant:     map[string]tenantEntry{},
+		tender:     map[string]domain.TenderACL{},
+		neg:        map[string]bool{},
+		proc:       map[string]bool{},
+		realm:      map[string]string{},
+		restricted: map[string]bool{},
 	}
 }
 
@@ -253,7 +261,7 @@ func (f *FakeCache) EvictNegative(_ context.Context, tenant, user string) error 
 	return nil
 }
 
-func (f *FakeCache) MarkProcessed(_ context.Context, eventID string) (bool, error) {
+func (f *FakeCache) MarkProcessed(_ context.Context, _, eventID string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("MarkProcessed:" + eventID)
@@ -267,7 +275,7 @@ func (f *FakeCache) MarkProcessed(_ context.Context, eventID string) (bool, erro
 	return true, nil
 }
 
-func (f *FakeCache) EvictProcessed(_ context.Context, eventID string) error {
+func (f *FakeCache) EvictProcessed(_ context.Context, _, eventID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("EvictProcessed:" + eventID)
@@ -275,5 +283,54 @@ func (f *FakeCache) EvictProcessed(_ context.Context, eventID string) error {
 		return f.EvictProcessedErr
 	}
 	delete(f.proc, eventID)
+	return nil
+}
+
+func (f *FakeCache) GetRealm(_ context.Context, realm string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("GetRealm:" + realm)
+	if f.RealmErr != nil {
+		return "", false, f.RealmErr
+	}
+	tenant, ok := f.realm[realm]
+	return tenant, ok, nil
+}
+
+func (f *FakeCache) SetRealm(_ context.Context, realm, tenant string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("SetRealm:" + realm)
+	if f.SetRealmErr != nil {
+		return f.SetRealmErr
+	}
+	if f.realm == nil {
+		f.realm = map[string]string{}
+	}
+	f.realm[realm] = tenant
+	return nil
+}
+
+func (f *FakeCache) GetRestricted(_ context.Context, tenant, tender string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("GetRestricted:" + tenant + ":" + tender)
+	if f.RestrictedErr != nil {
+		return false, f.RestrictedErr
+	}
+	return f.restricted[tenant+":"+tender], nil
+}
+
+func (f *FakeCache) SetRestricted(_ context.Context, tenant, tender string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("SetRestricted:" + tenant + ":" + tender)
+	if f.SetRestrictedErr != nil {
+		return f.SetRestrictedErr
+	}
+	if f.restricted == nil {
+		f.restricted = map[string]bool{}
+	}
+	f.restricted[tenant+":"+tender] = true
 	return nil
 }

@@ -314,7 +314,7 @@ func TestMarkProcessed_ConnectionError(t *testing.T) {
 	c, mr := newTestCache(t, 0)
 	mr.Close()
 
-	_, err := c.MarkProcessed(context.Background(), "evt-1")
+	_, err := c.MarkProcessed(context.Background(), "iam-authz-enrichment", "evt-1")
 	assert.Error(t, err)
 }
 
@@ -323,18 +323,51 @@ func TestMarkProcessed_IdempotentThenEvictAllowsRetry(t *testing.T) {
 	c, _ := newTestCache(t, 0)
 	ctx := context.Background()
 
-	first, err := c.MarkProcessed(ctx, "evt-1")
+	first, err := c.MarkProcessed(ctx, "iam-authz-enrichment", "evt-1")
 	require.NoError(t, err)
 	assert.True(t, first)
 
-	second, err := c.MarkProcessed(ctx, "evt-1")
+	second, err := c.MarkProcessed(ctx, "iam-authz-enrichment", "evt-1")
 	require.NoError(t, err)
 	assert.False(t, second)
 
-	require.NoError(t, c.EvictProcessed(ctx, "evt-1"))
-	third, err := c.MarkProcessed(ctx, "evt-1")
+	require.NoError(t, c.EvictProcessed(ctx, "iam-authz-enrichment", "evt-1"))
+	third, err := c.MarkProcessed(ctx, "iam-authz-enrichment", "evt-1")
 	require.NoError(t, err)
 	assert.True(t, third, "after EvictProcessed a retry must be allowed")
+}
+
+func TestRealmAndRestrictedFacts_RoundTripAndConnectionErrors(t *testing.T) {
+	t.Parallel()
+	c, mr := newTestCache(t, 0)
+	ctx := context.Background()
+
+	tenant, ok, err := c.GetRealm(ctx, "realm-1")
+	require.NoError(t, err)
+	assert.False(t, ok)
+	assert.Empty(t, tenant)
+
+	require.NoError(t, c.SetRealm(ctx, "realm-1", "tenant-1"))
+	tenant, ok, err = c.GetRealm(ctx, "realm-1")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "tenant-1", tenant)
+
+	restricted, err := c.GetRestricted(ctx, "tenant-1", "tender-9")
+	require.NoError(t, err)
+	assert.False(t, restricted)
+	require.NoError(t, c.SetRestricted(ctx, "tenant-1", "tender-9"))
+	restricted, err = c.GetRestricted(ctx, "tenant-1", "tender-9")
+	require.NoError(t, err)
+	assert.True(t, restricted)
+
+	mr.Close()
+	_, _, err = c.GetRealm(ctx, "realm-1")
+	assert.Error(t, err)
+	assert.Error(t, c.SetRealm(ctx, "realm-1", "tenant-1"))
+	_, err = c.GetRestricted(ctx, "tenant-1", "tender-9")
+	assert.Error(t, err)
+	assert.Error(t, c.SetRestricted(ctx, "tenant-1", "tender-9"))
 }
 
 func TestHealth_ReportsConnectionFailure(t *testing.T) {

@@ -6,7 +6,7 @@ graph TD
     subgraph adapters_in["Inbound Adapters  —  internal/adapter/inbound/"]
         grpc_a["grpc/\nServer — envoy.service.auth.v3.Authorization\nclaims.go — decodeClaims (Envoy jwt_authn dynamic metadata ONLY,\nnever request headers — §8.2)\nrequestfacts.go — decodeRequestFacts (route ContextExtensions +\ntenderIDFromPath: tender_id parsed from the raw URL path, never\ncontext_extensions — §5.1/AE-22)\nresponse.go — okResponse / deniedResponse (§9 status mapping)"]
         http_a["http/\nrouter.go — /healthz · /readyz, plus the DocsConfig-gated AsyncAPI\nviewer (/asyncapi, /asyncapi.yaml — asyncapi.go, api/embed.go)\nno business logic either way; /metrics has its own dedicated listener\nwires gincommon.ObservabilityMiddlewares — same fleet-wide stack\niam-org-membership/iam-user-profile put in front of their Gin routers\nReadinessProbe reports process-startup, NOT dependency health\n(§7 bypass/stale-if-error modes must stay in rotation)"]
-        consumer_a["consumer/\n5 SQS consumers: membership · user · billing · tenant · tender\ndedupingHandler — ae:processed SET NX, with EvictProcessed on\nhandler failure so a permanently-bad message still reaches the DLQ"]
+        consumer_a["consumer/\n5 SQS consumers: membership · user · billing · tenant · tender\nLoadPlatform — LoadSQS/LoadSNS/LoadOutbox (skip publisher/runner)\nskipDuplicate/ackUnknown — Envelope.ID, Valkey SET NX\nEvictProcessed on handler failure so a permanently-bad message still reaches the DLQ"]
     end
 
     subgraph usecase["Usecase  —  internal/usecase/"]
@@ -27,7 +27,8 @@ graph TD
     subgraph adapters_out["Outbound Adapters  —  internal/adapter/outbound/"]
         valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
         org_a["orgmembership/\nClient — I-8 memberships + I-14 mfa-freshness against Org & Membership,\nTAC-4 tender-acl (formerly I-12) against iam-tender-acl since ADR-0007\nWave 3 Phase 4 — two base URLs/timeouts, one Go package\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
-        metrics_a["metrics/\nRecorder — Prometheus iam_authz_enrichment_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
+        metrics_a["metrics/\nRecorder — Prometheus authz_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
+        postgres_a["postgres/\nplatform-pgcommon DSN / PoolConfig / Zap logger /\nOTel tracer / OpenPool wrapper — no live pool (HLD §5.4)"]
     end
 
     subgraph config_g["Config  —  internal/config/"]
@@ -35,7 +36,7 @@ graph TD
     end
 
     main --> grpc_a & http_a & consumer_a
-    main --> valkey_a & org_a & metrics_a & config_c
+    main --> valkey_a & org_a & metrics_a & postgres_a & config_c
     main --> checker & invalidator & realmmap
 
     grpc_a --> checker

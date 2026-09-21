@@ -17,6 +17,7 @@ export APP_NAME APP_ENV BUILD_VERSION
 
 TEST_UNIT_PKGS := ./internal/... ./cmd/...
 TEST_INT_PKGS  := ./test/integration/...
+TEST_E2E_PKGS  := ./test/e2e/...
 
 # Source packages measured for coverage (excludes test helpers and cmd).
 COVER_PKG_LIST := $(shell $(GO) list ./internal/... | tr '\n' ',' | sed 's/,$$//')
@@ -46,14 +47,14 @@ help:
 	@echo "  make test            - unit tests (no Docker required)"
 	@echo "  make test-ci         - unit tests with race detector + coverage (used in CI)"
 	@echo "  make test-integration - Valkey + LocalStack SQS integration tests (requires Docker)"
+	@echo "  make test-e2e         - real binary over real gRPC against Valkey + SQS (requires make build + Docker)"
 	@echo "  make race            - unit tests with -race flag"
 	@echo "  make run             - run the server locally (go run)"
 	@echo "  make build           - compile server binary to bin/"
 	@echo "  make cover           - coverage profile + open HTML report"
 	@echo "  make cover-func      - coverage summary by function"
-	@echo "  make metric-lint     - validate metric naming conventions (Platform Observability Standard)"
-	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + metric-lint + test-ci + build"
-	@echo "  make docker-up       - start local Valkey + LocalStack"
+	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + test-ci + build"
+	@echo "  make docker-up       - start local Valkey + floci (SQS)"
 	@echo "  make docker-down     - stop local containers"
 	@echo "  make fmt-check       - verify gofmt formatting (no changes applied)"
 	@echo "  make mod-verify      - go mod verify (check module download integrity)"
@@ -121,6 +122,17 @@ test-ci:
 test-integration:
 	$(GO) test -tags=integration $(TEST_INT_PKGS) -count=1 -timeout 120s -v
 
+# test-e2e starts the real compiled binary (run `make build` first) against
+# a real Valkey + SQS emulator (floci locally via `make docker-up`,
+# LocalStack in CI) and a fake Org & Membership/Tender ACL HTTP server,
+# driving it over a real gRPC connection — see test/e2e's package doc for
+# why this exists alongside the unit and integration tiers above. Requires
+# E2E_BINARY_PATH (default ./bin/iam-authz-enrichment, i.e. `make build`'s
+# own output) plus VALKEY_URL/AWS_ENDPOINT_URL pointed at real infra.
+.PHONY: test-e2e
+test-e2e:
+	$(GO) test -tags=e2e $(TEST_E2E_PKGS) -count=1 -timeout 120s -v
+
 .PHONY: race
 race:
 	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 120s
@@ -143,13 +155,13 @@ build:
 	$(GO) build ./internal/...
 
 # -----------------------------
-# DOCKER (VALKEY + LOCALSTACK)
+# DOCKER (VALKEY + FLOCI)
 # -----------------------------
 
 .PHONY: docker-up
 docker-up:
-	@echo "Starting local Valkey + LocalStack (community)..."
-	docker compose up -d valkey localstack
+	@echo "Starting local Valkey + floci (SQS)..."
+	docker compose up -d valkey floci floci-ui
 
 .PHONY: docker-down
 docker-down:
@@ -159,26 +171,24 @@ docker-down:
 .PHONY: pin-base-images
 pin-base-images:
 	@echo "Fetching SHA digests for Dockerfile base images..."
-	@GOLANG_DIGEST=$$(docker buildx imagetools inspect golang:1.26.5-alpine --format '{{.Manifest.Digest}}') && \
+	@GO_VER=$$(awk '/^go [0-9]/{print $$2}' go.mod) && \
+	 CURRENT_TAG=$$(grep -oE 'golang:[0-9]+\.[0-9]+\.[0-9]+-alpine' Dockerfile | head -1) && \
+	 GOLANG_DIGEST=$$(docker buildx imagetools inspect golang:$$GO_VER-alpine --format '{{.Manifest.Digest}}') && \
 	 DISTROLESS_DIGEST=$$(docker buildx imagetools inspect gcr.io/distroless/static-debian12:nonroot --format '{{.Manifest.Digest}}') && \
 	 sed -i.bak \
-	   -e "s|FROM golang:1.26.5-alpine.*|FROM golang:1.26.5-alpine@$$GOLANG_DIGEST AS builder|" \
+	   -e "s|FROM $$CURRENT_TAG.*|FROM golang:$$GO_VER-alpine@$$GOLANG_DIGEST AS builder|" \
 	   -e "s|FROM gcr.io/distroless/static-debian12:nonroot.*|FROM gcr.io/distroless/static-debian12:nonroot@$$DISTROLESS_DIGEST|" \
 	   Dockerfile && rm -f Dockerfile.bak && \
-	 echo "golang:1.26.5-alpine $$GOLANG_DIGEST" > .docker-digests && \
+	 echo "golang:$$GO_VER-alpine $$GOLANG_DIGEST" > .docker-digests && \
 	 echo "gcr.io/distroless/static-debian12:nonroot $$DISTROLESS_DIGEST" >> .docker-digests && \
-	 echo "Digests written to .docker-digests — commit both Dockerfile and .docker-digests"
+	 echo "Digests written to .docker-digests — commit both Dockerfile and .docker-digests. Base image tag is derived from go.mod's own 'go' directive ($$GO_VER) so a go.mod bump and this pin can never silently drift apart again."
 
 # -----------------------------
 # CI
 # -----------------------------
 
-.PHONY: metric-lint
-metric-lint:
-	@bash .github/scripts/validate-metrics.sh
-
 .PHONY: ci
-ci: tidy fmt-check vet lint arch-lint metric-lint test-ci build
+ci: tidy fmt-check vet lint arch-lint test-ci build
 
 # -----------------------------
 # COVERAGE

@@ -47,7 +47,7 @@ func TestIdleConsumer_StartAndStopAreNoOps(t *testing.T) {
 
 func TestBuildConsumer_EmptyQueueURL_ReturnsIdleConsumer(t *testing.T) {
 	t.Parallel()
-	c, err := buildConsumer("", "", testDeps(fixtures.NewFakeCache()), func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
+	c, err := buildConsumer("", testDeps(fixtures.NewFakeCache()), func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
 	require.NoError(t, err)
 	assert.IsType(t, idleConsumer{}, c)
 }
@@ -55,9 +55,9 @@ func TestBuildConsumer_EmptyQueueURL_ReturnsIdleConsumer(t *testing.T) {
 func TestBuildConsumer_RealQueueURL_RunsAndStops(t *testing.T) {
 	t.Parallel()
 	client := &fakeSQSClient{}
-	deps := Deps{Client: client, Region: "ap-south-1", Cache: fixtures.NewFakeCache(), Log: fixtures.NoopLogger{}}
+	deps := Deps{Client: client, Cache: fixtures.NewFakeCache(), Log: fixtures.NoopLogger{}}
 
-	c, err := buildConsumer("http://queue/x", "", deps, func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
+	c, err := buildConsumer("http://queue/x", deps, func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
 	require.NoError(t, err)
 	assert.NotNil(t, c)
 
@@ -88,8 +88,8 @@ func TestNewXConsumer_IdleAndReal(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			cache := fixtures.NewFakeCache()
-			inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
-			deps := Deps{Client: &fakeSQSClient{}, Region: "ap-south-1", Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv}
+			inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+			deps := Deps{Client: &fakeSQSClient{}, Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv}
 
 			idle, err := build("", deps)
 			require.NoError(t, err)
@@ -107,7 +107,7 @@ func TestNewXConsumer_IdleAndReal(t *testing.T) {
 // failure rather than silent per-message errors once the consumer is running.
 func TestBuildConsumer_MalformedQueueURL_ReturnsError(t *testing.T) {
 	t.Parallel()
-	_, err := buildConsumer("not-a-url", "", testDeps(fixtures.NewFakeCache()), func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
+	_, err := buildConsumer("not-a-url", testDeps(fixtures.NewFakeCache()), func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
 	require.Error(t, err, "a non-empty malformed queue URL must fail at construction, not silently at runtime")
 }
 
@@ -120,7 +120,7 @@ func TestDedupingHandler_MarkProcessedError_ProcessesAnyway(t *testing.T) {
 		called = true
 		return nil
 	}
-	wrapped := dedupingHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, "", inner)
+	wrapped := processedHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
 
 	err := wrapped(context.Background(), events.Envelope[json.RawMessage]{ID: "evt-1"})
 
@@ -135,7 +135,7 @@ func TestDedupingHandler_EvictProcessedFailsAfterHandlerError_StillPropagatesHan
 	inner := func(context.Context, events.Envelope[json.RawMessage]) error {
 		return errors.New("handler failed")
 	}
-	wrapped := dedupingHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, "", inner)
+	wrapped := processedHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
 
 	err := wrapped(context.Background(), events.Envelope[json.RawMessage]{ID: "evt-1"})
 
@@ -155,7 +155,7 @@ func TestDedupingHandler_ConcurrentSameEventID_ExactlyOneHandlerRuns(t *testing.
 		handlerCount.Add(1)
 		return nil
 	}
-	wrapped := dedupingHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, "", inner)
+	wrapped := processedHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}}, inner)
 
 	env := events.Envelope[json.RawMessage]{ID: "concurrent-event-id"}
 	var wg sync.WaitGroup

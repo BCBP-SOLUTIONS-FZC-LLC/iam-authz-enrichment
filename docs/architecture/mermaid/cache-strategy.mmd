@@ -6,6 +6,8 @@ flowchart TD
         k4["ae:neg:{tenant}:{user} → sentinel — subject rebuild returned 404\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
         k5["ae:processed:{event_id} → SET NX sentinel, 7-day TTL\nconsumer idempotency — the SET-NX equivalent of ON CONFLICT DO NOTHING"]
         k6["mfa_freshness_seconds  →  NEVER CACHED, no key exists (§4.4)\nfetched fresh per approver-gated request from I-14 ONLY —\nfolding it into ae:ctx would delay a tightened MFA window by up to 60s"]
+        k7["ae:realm:{issuer} → tenant_id, no TTL — write-once, never unmapped\nRealmMap's L1: positive entries cached forever; negative entries cached\nfor AE_REALM_NEG_TTL (default 5s) only — a transient store error is\nnever cached, only a confirmed miss"]
+        k8["ae:restricted:{tenant}:{tender} → sentinel, no TTL — write-once, never un-restricted\nRestrictedTenderSet's L1: same positive-forever/negative-for-AE_RESTRICTED_NEG_TTL\nsplit as ae:realm above, same transient-error-not-cached rule"]
     end
 
     subgraph envelope["ae:ctx / ae:tenant envelope — one key serves two purposes"]

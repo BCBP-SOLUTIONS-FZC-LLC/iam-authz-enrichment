@@ -145,11 +145,11 @@ func TestValkey_MarkProcessed_IsIdempotent(t *testing.T) {
 	// would only pass the first time against a long-lived local Valkey instance.
 	eventID := uuid.NewString()
 
-	first, err := cache.MarkProcessed(ctx, eventID)
+	first, err := cache.MarkProcessed(ctx, "iam-authz-enrichment", eventID)
 	require.NoError(t, err)
 	assert.True(t, first)
 
-	second, err := cache.MarkProcessed(ctx, eventID)
+	second, err := cache.MarkProcessed(ctx, "iam-authz-enrichment", eventID)
 	require.NoError(t, err)
 	assert.False(t, second, "SET NX must reject the second mark for the same event ID")
 }

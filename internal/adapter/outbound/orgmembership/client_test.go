@@ -10,6 +10,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/outbound/orgmembership"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
@@ -190,6 +193,18 @@ func TestGetMemberships_MalformedBaseURL_RequestBuildError(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrUnavailable)
 }
 
+func TestGetTenderACL_MalformedBaseURL_RequestBuildError(t *testing.T) {
+	t.Parallel()
+	// Mirrors TestGetMemberships_MalformedBaseURL_RequestBuildError above,
+	// but for getJSONWith's own "build request" branch (GetTenderACL is
+	// the only caller that goes through getJSONWith directly rather than
+	// getJSON).
+	client := orgmembership.New("http://%zz", time.Second, "http://%zz", time.Second)
+	_, err := client.GetTenderACL(context.Background(), "tenant-1", "tender-1", "user-1")
+
+	assert.ErrorIs(t, err, domain.ErrUnavailable)
+}
+
 func TestGetMemberships_MalformedJSONResponse_ReturnsErrUnavailable(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -202,6 +217,106 @@ func TestGetMemberships_MalformedJSONResponse_ReturnsErrUnavailable(t *testing.T
 	_, _, err := client.GetMemberships(context.Background(), "tenant-1", "user-1")
 
 	assert.ErrorIs(t, err, domain.ErrUnavailable)
+}
+
+func TestGetMemberships_PropagatesTraceparent(t *testing.T) {
+	t.Parallel()
+	shutdown := gincommon.InitTracingFromEnv()
+	t.Cleanup(shutdown)
+
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("traceparent")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan":"pro","subscription_status":"active","read_only":false,"mfa_freshness_seconds":300}`))
+	}))
+	defer srv.Close()
+
+	traceID, _ := trace.TraceIDFromHex("0102030405060708090a0b0c0d0e0f10")
+	spanID, _ := trace.SpanIDFromHex("1112131415161718")
+	ctx := trace.ContextWithSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+		Remote:     true,
+	}))
+
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
+	_, _, err := client.GetMemberships(ctx, "tenant-1", "user-1")
+
+	require.NoError(t, err)
+	require.NotEmpty(t, got, "W3C traceparent must be injected via gincommon's propagator / otelhttp")
+	assert.Contains(t, got, "0102030405060708090a0b0c0d0e0f10",
+		"trace id must propagate; span id may be the otelhttp client span, not the parent")
+}
+
+// Org & Membership's /internal/* routes are gated by an application-level
+// RequireSystemRole check requiring these three headers — without them,
+// every real GetMemberships/GetMFAFreshness call 403s before ever reaching
+// the handler, regardless of network/mTLS trust. This is the same
+// "iam-system" convention every one of that service's own outbound
+// sibling clients (catalogadmin, groupmappingclient, delegationcheck,
+// workflow, realmprovisioner) uses.
+func TestGetMemberships_SetsOrgMembershipInternalIdentityHeaders(t *testing.T) {
+	t.Parallel()
+	var userID, tenantID, tenantRoles string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userID = r.Header.Get("x-user-id")
+		tenantID = r.Header.Get("x-tenant-id")
+		tenantRoles = r.Header.Get("x-tenant-roles")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan":"pro","subscription_status":"active","read_only":false,"mfa_freshness_seconds":300}`))
+	}))
+	defer srv.Close()
+
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
+	_, _, err := client.GetMemberships(context.Background(), "tenant-acme", "alice")
+
+	require.NoError(t, err)
+	assert.Equal(t, "iam-system", userID)
+	assert.Equal(t, "tenant-acme", tenantID)
+	assert.Equal(t, "iam-system", tenantRoles)
+}
+
+func TestGetMFAFreshness_SetsOrgMembershipInternalIdentityHeaders(t *testing.T) {
+	t.Parallel()
+	var userID, tenantID, tenantRoles string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userID = r.Header.Get("x-user-id")
+		tenantID = r.Header.Get("x-tenant-id")
+		tenantRoles = r.Header.Get("x-tenant-roles")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"mfa_freshness_seconds":300}`))
+	}))
+	defer srv.Close()
+
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
+	_, err := client.GetMFAFreshness(context.Background(), "tenant-acme")
+
+	require.NoError(t, err)
+	assert.Equal(t, "iam-system", userID)
+	assert.Equal(t, "tenant-acme", tenantID)
+	assert.Equal(t, "iam-system", tenantRoles)
+}
+
+// GetTenderACL (TAC-4) is mesh-only/no-RBAC on iam-tender-acl's side — it
+// must NOT send these headers, so a future change can't accidentally imply
+// TAC-4 has the same RBAC requirement Org & Membership's internal routes do.
+func TestGetTenderACL_DoesNotSetOrgMembershipInternalIdentityHeaders(t *testing.T) {
+	t.Parallel()
+	var sawAny bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAny = r.Header.Get("x-user-id") != "" || r.Header.Get("x-tenant-roles") != ""
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"has_access":false}`))
+	}))
+	defer srv.Close()
+
+	client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
+	_, err := client.GetTenderACL(context.Background(), "tenant-acme", "tender-1", "alice")
+
+	require.NoError(t, err)
+	assert.False(t, sawAny, "TAC-4 is mesh-only/no-RBAC — it must never receive Org & Membership's internal-identity headers")
 }
 
 func TestGetMFAFreshness_DecodesSeconds(t *testing.T) {

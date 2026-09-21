@@ -132,11 +132,12 @@ iam-authz-enrichment/
 │   │   ├── inbound/
 │   │   │   ├── grpc/                  # ext_authz v3 server — claims/request-facts decode, response encode
 │   │   │   ├── http/                  # /healthz · /readyz · /asyncapi · /asyncapi.yaml — no business logic; /metrics has its own dedicated listener (see cmd/server)
-│   │   │   └── consumer/              # 5 SQS consumers, one per §5 queue
+│   │   │   └── consumer/              # 5 SQS consumers, one per §5 queue — LoadPlatform (SQS/SNS/outbox config), skipDuplicate/ackUnknown
 │   │   └── outbound/
 │   │       ├── valkey/                # Cache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed
 │   │       ├── orgmembership/         # HTTP client — I-8 memberships (Org & Membership), TAC-4/I-12 tender-acl (iam-tender-acl), I-14 mfa-freshness (Org & Membership)
-│   │       └── metrics/               # Prometheus iam_authz_enrichment_* series (§10)
+│   │       ├── postgres/              # platform-pgcommon DSN/pool config, Zap logger adapter, OTel tracer — no live pool (HLD §5.4)
+│   │       └── metrics/               # Prometheus authz_* series (§10)
 │   └── config/                        # Load() — env vars only, no hot-reload (§11)
 ├── docs/
 │   ├── lld/iam-lld-authz-enrichment.md  # Low-Level Design — precedence chain, cache-key table, §16 AE-# register
@@ -147,9 +148,13 @@ iam-authz-enrichment/
 │   ├── iam/                           # Reference IAM policy + Terraform snippet (SQS consume-only — see deploy/iam/README.md)
 │   └── monitoring/                    # Prometheus alerting rules + prometheus-adapter config for HPA decision-rate scaling,
 │                                       # plus an illustrative DLQ CloudWatch-alarm Terraform snippet (see docs/runbook.md)
-├── scripts/init-localstack.sh         # Creates the 5 queues + their -dlq, with the maxReceiveCount=5 redrive policy
+├── scripts/
+│   ├── init-localstack.sh              # CI only (.github/workflows/validate-test.yml) — creates the 5 queues + their
+│   │                                    # -dlq, maxReceiveCount=5 redrive policy, against a bare LocalStack service container
+│   └── init-floci.sh                   # docker-compose/local dev only — identical 5 queues + DLQs, via floci (§ Local development)
 └── test/
-    ├── integration/                   # Real Valkey + LocalStack SQS (build tag `integration`)
+    ├── integration/                   # Real Valkey + real SQS — floci locally, LocalStack in CI (build tag `integration`)
+    ├── e2e/                           # Real compiled binary over a real gRPC connection (build tag `e2e`) — see § Testing
     ├── load/                          # Manual 500 RPS / cache-miss harness — not run in CI
     └── fixtures/                      # Hand-written fakes (FakeCache, FakeOrgMembershipClient) — no gomock/mockery
 ```
@@ -181,19 +186,20 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 | Library | Version | Purpose |
 |---------|---------|---------|
 | `platform-gincommon` | v1.3.0 | zap logger, gRPC observability interceptors (panic-recovery/request-id/tracing/metrics/logging), Gin observability middlewares (`/healthz`/`/readyz`), health handler |
-| `platform-events` | v1.4.0 | SQS consumer loop, `Envelope[T]` decoding |
+| `platform-events` | v1.4.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]`), SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table) |
+| `platform-pgcommon` | v1.3.0 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, OTel query tracer, `pgmetrics` — same wiring as iam-user-profile / iam-org-membership. **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox |
 
 ---
 
 ## Event architecture
 
-This service is a **pure event consumer** — it subscribes to five SQS queues and publishes **zero** events (no outbox, no SNS/EventBridge producer, no database of any kind to have state changes to announce). Every event received is a cache-invalidation trigger against this service's own Valkey cache, never a domain state mutation of its own.
+This service is a **pure event consumer** — it subscribes to five SQS queues and publishes **zero** events. `cmd/server` still loads platform-events SNS and outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) so operators see the same `SNS_*` / `OUTBOX_*` warnings as iam-user-profile / iam-org-membership, then skips `NewSNSPublisher`, `outbox.ApplySchema`, and `NewRunner` (HLD §5.4 / EVT-2). Every event received is a cache-invalidation trigger against this service's own Valkey cache, never a domain state mutation of its own.
 
-The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 15 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Realm Provisioner, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
+The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 15 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile, Realm Provisioner) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
 
 **Envelope shape:** `{id, type, tenant_id, time, data}` — `tenant_id` is a top-level envelope field, never duplicated inside `data`; the `billing-authz-q` events below read only that field, no `data` decode at all.
 
-**Idempotency:** unlike every other IAM service, this service has no database, so there is no `processed_events` table — idempotency is a Valkey `SET NX` on `ae:processed:{event_id}` (7-day TTL). **DLQ:** all five queues use the identical SQS-native `maxReceiveCount=5` redrive (`scripts/init-localstack.sh`), never application code — a DLQ'd message degrades to "this cache entry may be stale until its TTL naturally expires" (5–60s), not a correctness failure requiring replay.
+**Idempotency:** platform-events has no processed-events API — the library contract is `Envelope.ID` as the idempotency key, the same `skipDuplicate` / `ackUnknown` helpers iam-org-membership / iam-user-profile use. Those siblings persist that to a Postgres `processed_events` table (`INSERT … ON CONFLICT DO NOTHING`). This service has no database, so the store is a Valkey `SET NX` on `ae:processed:{event_id}` (7-day TTL). **DLQ:** all five queues use the identical SQS-native `maxReceiveCount=5` redrive (`scripts/init-localstack.sh` in CI, `scripts/init-floci.sh` for local dev), never application code — a DLQ'd message degrades to "this cache entry may be stale until its TTL naturally expires" (5–60s), not a correctness failure requiring replay.
 
 **`membership-authz-q`** (Org & Membership, 6 event types) — all evict the per-user `ae:ctx`/`ae:neg` slice:
 
@@ -242,14 +248,14 @@ The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) �
 ### Prerequisites
 
 - Go 1.26.6+
-- Docker (for `make docker-up` — Valkey + LocalStack SQS)
-- SSH key or `GO_PRIVATE_TOKEN` registered for `github.com/BCBP-SOLUTIONS-FZC-LLC` (for `platform-gincommon`/`platform-events`)
+- Docker (for `make docker-up` — Valkey + floci SQS, plus floci-ui, a web console for floci)
+- SSH key or `GO_PRIVATE_TOKEN` registered for `github.com/BCBP-SOLUTIONS-FZC-LLC` (for `platform-gincommon`/`platform-events`/`platform-pgcommon`)
 
 ### Setup
 
 ```sh
 make setup       # copy .env-example to .env
-make docker-up   # start Valkey + LocalStack (SQS) — scripts/init-localstack.sh creates the 5 queues + DLQs
+make docker-up   # start Valkey + floci (SQS) + floci-ui — scripts/init-floci.sh creates the 5 queues + DLQs
 make run         # go run ./cmd/server
 ```
 
@@ -262,7 +268,8 @@ Run `make help` for the full list.
 ```sh
 make build            # compile bin/iam-authz-enrichment
 make test             # unit tests — fakes only, no Docker required
-make test-integration # real Valkey + LocalStack SQS (requires make docker-up first)
+make test-integration # real Valkey + floci SQS (requires make docker-up first)
+make test-e2e         # real binary over a real gRPC connection (requires make build + make docker-up first)
 make lint              # golangci-lint
 make arch-lint          # enforce .go-arch-lint.yml component boundaries
 make cover              # coverage profile + open HTML report
@@ -317,7 +324,7 @@ mkdir -p mockorg/api/v1/internal/users/alice
 cat > mockorg/api/v1/internal/users/alice/memberships <<'EOF'
 {
   "roles": ["tenant_admin"],
-  "departments": [{"department_id": "fd72f513-45f0-46ca-a1ed-9183be72484c", "level": "reviewer"}],
+  "departments": [{"department_id": "fd72f513-45f0-46ca-a1ed-9183be72484c", "role_level": "reviewer"}],
   "plan": "pro",
   "feature_flags": ["flag-a"],
   "subscription_status": "active",
@@ -376,8 +383,8 @@ grpcurl -plaintext -d '{
 
 ```sh
 EVENT_ID=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
-docker compose exec localstack awslocal sqs send-message \
-  --queue-url http://localhost:4571/000000000000/tender-authz-q \
+docker compose exec floci aws sqs send-message \
+  --queue-url http://floci:4566/000000000000/tender-authz-q \
   --region ap-south-1 \
   --message-body "{
     \"id\": \"$EVENT_ID\", \"type\": \"TenderRestricted\", \"tenant_id\": \"tenant-acme\",
@@ -453,24 +460,24 @@ go run ./test/load -addr=localhost:9091 -rps=5 -duration=5s -mode=hit \
 
 ### Testing events locally
 
-The five SQS queues are created automatically by `docker compose up` (via `scripts/init-localstack.sh`, mounted as a LocalStack ready-hook). To drive one manually you need an AWS CLI — either your own, or the `awslocal` wrapper already baked into the LocalStack container (no local install required):
+The five SQS queues are created automatically by `docker compose up` (via `scripts/init-floci.sh`, mounted as a [floci](https://github.com/floci-io/floci) ready-hook — an open-source, always-free LocalStack-compatible AWS emulator, the same image `iam-org-membership`/`iam-delegation` use for their own local dev). To drive one manually you need an AWS CLI — either your own, or the one already baked into the floci container (no local install required):
 
 ```sh
-# Option A: your own AWS CLI (brew install awscli), pointed at LocalStack
+# Option A: your own AWS CLI (brew install awscli), pointed at floci
 aws --endpoint-url=http://localhost:4571 sqs list-queues --region ap-south-1
 
 # Option B: no install — run it through the container instead
-docker compose exec localstack awslocal sqs list-queues --region ap-south-1
+docker compose exec floci aws --region ap-south-1 sqs list-queues
 ```
 
-Every command below works with either CLI — swap `aws --endpoint-url=http://localhost:4571` for `docker compose exec localstack awslocal` if you're using Option B:
+Every command below works with either CLI — swap `aws --endpoint-url=http://localhost:4571` for `docker compose exec floci aws --region ap-south-1` if you're using Option B:
 
 ```sh
 # 1. Start infrastructure
 make docker-up
 
 # 2. Verify the queues exist
-docker compose exec localstack awslocal sqs list-queues --region ap-south-1
+docker compose exec floci aws --region ap-south-1 sqs list-queues
 
 # 3. Start the service (separate terminal)
 make run
@@ -481,8 +488,8 @@ make run
 #    is correctly treated as a duplicate — the handler is skipped and
 #    nothing gets evicted. That's the dedup contract working, not a bug.
 EVENT_ID=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
-docker compose exec localstack awslocal sqs send-message \
-  --queue-url http://localhost:4571/000000000000/membership-authz-q \
+docker compose exec floci aws sqs send-message \
+  --queue-url http://floci:4566/000000000000/membership-authz-q \
   --region ap-south-1 \
   --message-body "{
     \"id\": \"$EVENT_ID\", \"type\": \"DepartmentMembershipGranted\", \"tenant_id\": \"tenant-acme\",
@@ -503,6 +510,16 @@ done
 # from Org & Membership instead of serving the evicted (now-stale) entry.
 ```
 
+#### Verify queue state in the browser (floci-ui)
+
+`make docker-up` also starts **floci-ui**, a web console for floci, at **http://localhost:4502**. It's a faster way to confirm an event landed on the right queue — and that its DLQ redrive is behaving — than shelling into the CLI each time:
+
+1. Open **http://localhost:4502** → sidebar → **Integration → SQS**. You'll see all ten queues `init-floci.sh` provisioned (`membership-authz-q`/`membership-authz-q-dlq`, `user-authz-q`/`-dlq`, `billing-authz-q`/`-dlq`, `tenant-authz-q`/`-dlq`, `tender-authz-q`/`-dlq`), each with a **Messages** column.
+2. Run step 4 above (or the tender-ACL overlay's `TenderRestricted` send-message, above) and watch the target queue's **Messages** count — it should go to `1` immediately, then back to `0` once the running service's consumer picks it up (§5's idempotent `MarkProcessed`/`EvictProcessed` handler).
+3. **Not (yet) shown by floci-ui**: message bodies — it reports queue metadata (message counts, ARN, retention) only, no message browser. Use `docker compose exec floci aws --region ap-south-1 sqs receive-message --queue-url http://floci:4566/000000000000/<queue> --wait-time-seconds 1` for that (be aware this competes with the running service's own long-poll consumer for the same message — stop `make run` first if you want a guaranteed read).
+
+This service publishes nothing (§1: five inbound queues, zero outbound), so unlike `iam-org-membership`'s/`iam-delegation`'s own floci-ui walkthroughs there's no SNS topic/subscription view to check here — the SQS tab above is the whole picture.
+
 See [§ Event architecture](#event-architecture) for the full per-queue event-type table, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
 
 ---
@@ -510,12 +527,14 @@ See [§ Event architecture](#event-architecture) for the full per-queue event-ty
 ## Testing
 
 - **Unit** (`internal/.../*_test.go`) — hand-written fakes (`test/fixtures`), no gomock/mockery, no Docker. Includes the §12 acceptance checklist: contract tests, one eviction test per event type, tenant-resolution edge cases, one test per §7 failure-matrix row, the `mfa_freshness_seconds`-never-cached regression, the header-spoofing regression, precedence-order tests, and the convergence-without-events vs. stale-if-error distinction test.
-- **Integration** (`test/integration`, build tag `integration`) — real Valkey (via `miniredis` is unit-only; this tier uses the actual `docker-compose` Valkey) + real LocalStack SQS, including an end-to-end DLQ test that waits for 5 real redeliveries.
-- **Load** (`test/load`) — manual 500 RPS harness against a running instance, both `-mode=hit` (95%+ cache-hit target) and `-mode=miss` (100% cache-miss latency floor). Not run in CI. Run once locally (Valkey + LocalStack up, a generic mock Org & Membership responder on `:8081`, `make run`) at 500 RPS/30s each: **hit** p50=0.82ms p95=1.29ms p99=1.68ms; **miss** p50=0.83ms p95=1.65ms p99=3.18ms — comfortably inside the documented 15ms/50ms budgets. **Caveat that matters**: this was a single-machine loopback-network test against a trivial Python mock, not a real network hop to a real Org & Membership instance on real cluster hardware — treat these as a sanity check that the harness and the code path work, not as validated production SLO evidence. Re-run against a real staging deployment before trusting the `AuthzEnrichmentDecisionLatencySLOBreach` alert's 50ms threshold on a new cluster.
+- **Integration** (`test/integration`, build tag `integration`) — real Valkey (via `miniredis` is unit-only; this tier uses the actual `docker-compose` Valkey) + real SQS via floci (§ Testing events locally, above), including an end-to-end DLQ test that waits for 5 real redeliveries.
+- **E2E** (`test/e2e`, build tag `e2e`) — the one tier that starts the actual compiled binary and drives it over a real gRPC connection, rather than exercising one adapter directly against a fake. Catches what the two tiers above structurally can't: a wiring/config regression that only shows up when every real dependency is reachable at once (an env var renamed but not propagated to the Helm chart, a `context_extensions` key that stops round-tripping through the real wire format). Covers the full §3.1 precedence chain end to end, including a real `DepartmentMembershipGranted` event proving cache eviction actually happens over the wire and a real `TenderRestricted` event driving the tender-ACL overlay through all three states. Requires the binary built first (`make build`) and real Valkey/SQS up (`make docker-up`).
+- **Load** (`test/load`) — manual 500 RPS harness against a running instance, both `-mode=hit` (95%+ cache-hit target) and `-mode=miss` (100% cache-miss latency floor). Not run in CI. Run once locally (Valkey + floci up, a generic mock Org & Membership responder on `:8081`, `make run`) at 500 RPS/30s each: **hit** p50=0.82ms p95=1.29ms p99=1.68ms; **miss** p50=0.83ms p95=1.65ms p99=3.18ms — comfortably inside the documented 15ms/50ms budgets. **Caveat that matters**: this was a single-machine loopback-network test against a trivial Python mock, not a real network hop to a real Org & Membership instance on real cluster hardware — treat these as a sanity check that the harness and the code path work, not as validated production SLO evidence. Re-run against a real staging deployment before trusting the `AuthzEnrichmentDecisionLatencySLOBreach` alert's 50ms threshold on a new cluster.
 
 ```sh
 make test              # unit
 make docker-up && make test-integration
+make build && make test-e2e
 make load-test         # manual — see test/load
 ```
 
@@ -534,15 +553,18 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=production`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled |
 | `AE_CTX_TTL` / `AE_CTX_JITTER` | `60s` / `6s` | §4.1 — desyncs expiry across replicas |
 | `AE_TENDER_ACL_TTL` / `AE_NEG_TTL` | `15s` / `5s` | Half the sibling's own TTL / negative-cache storm collapse |
+| `AE_RESTRICTED_NEG_TTL` / `AE_REALM_NEG_TTL` | `5s` each | L1 negative-cache TTLs for `RestrictedTenderSet`/`RealmMap` — separate from `AE_NEG_TTL` since each bounds a distinct security-propagation delay (how fast a replica notices another replica's write), not a shared performance knob |
 | `AE_STALE_IF_ERROR_MAX_AGE` | `5m` | Hard-capped at 5m regardless of configured value (§7) |
 | `ORG_MEMBERSHIP_BASE_URL` / `_TIMEOUT` | `http://localhost:8081` / `10ms` | I-8/I-14. Aggressive timeout — headroom inside the 15ms p99 budget |
 | `TENDER_ACL_BASE_URL` / `TENDER_ACL_TIMEOUT` | `http://localhost:8086` / `20ms` | TAC-4 (formerly I-12) against iam-tender-acl, ADR-0007 Wave 3 Phase 4 — sized against that service's own 5ms-hit/20ms-miss SLO, not reused from `ORG_MEMBERSHIP_TIMEOUT` |
 | `SHARED_REALM_ISSUER` | _(empty)_ | Keycloak issuer for the shared trial realm |
 | `REALM_TENANT_MAP_SEED` | `{}` | Startup-only JSON seed for dedicated realms; kept fresh at runtime by events, never re-read |
 | `JWT_METADATA_NAMESPACE` / `JWT_PAYLOAD_KEY` | `envoy.filters.http.jwt_authn` / `trial` | Must match the Envoy `jwt_authn` filter config |
-| `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups |
+| `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups (`APP_ENV=dev` only — required, and must be pairwise distinct, outside dev; `config.Load()` fails fast otherwise) |
 | `*_AUTHZ_QUEUE_CONCURRENCY` (5 vars) | `4` each | `events.WithConcurrency` per queue — messages handed to handler goroutines at once, instead of `platform-events`' library default of `1` (fully serial per queue) |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `localstack` | AWS credentials (use IRSA in production — reference IAM policy + Terraform snippet under [`deploy/iam/`](deploy/iam/)) |
+| `DATABASE_URL` / `PG_*` / `PG_STATEMENT_TIMEOUT` | _(empty)_ | Loaded via `platform-pgcommon` `ConfigFromEnv` / `DSNFromEnv` / `PoolConfig` — same path as iam-user-profile / iam-org-membership. **Leave unset**: this service has no schema; `cmd/server` never calls `NewPool` / migrate |
+| `SNS_TOPIC_ARN` / `OUTBOX_*` | _(empty)_ | Loaded via `platform-events` `LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv` — same path as siblings. **Leave unset**: this service publishes nothing; `cmd/server` never calls `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner` |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `test` | Dummy floci credentials (use IRSA in production — reference IAM policy + Terraform snippet under [`deploy/iam/`](deploy/iam/)) |
 | `GRPC_MAX_RECV_MSG_SIZE_BYTES` / `_SEND_` | `262144` (256KiB) | Defense-in-depth, not a real operating limit — `CheckRequest`/`CheckResponse` are small |
 | `GRPC_TLS_CERT_FILE` / `_KEY_FILE` / `_CLIENT_CA_FILE` | _(empty → plaintext)_ | App-level TLS/mTLS for deployments with no service-mesh sidecar or CNI-level encryption — see § Security |
 
@@ -567,12 +589,12 @@ Hard invariants — see [`ARCHITECTURE.md` §Threat model](ARCHITECTURE.md#threa
 
 `.github/workflows/ci.yml`:
 
-- **test** — unit (`-race`, coverage) + integration against real Valkey/LocalStack service containers, gated by `.github/scripts/coverage-gate.sh` (fails below 100%).
-- **quality** — `fmt-check`, `vet`, `lint`, `arch-lint`, `mod-verify`, `vuln-check`.
+- **validate-test** — two parallel jobs, each with its own real Valkey/LocalStack service containers: `test` (unit `-race`+coverage, gated by `.github/scripts/coverage-gate.sh` at 100%, plus integration) and `e2e` (builds the binary, then runs it over a real gRPC connection). `ci.yml`'s downstream jobs (`smoke`/`trivy`) gate on the whole `validate-test` workflow, so both must pass.
+- **validate-quality** — `fmt-check`, `vet`, `lint`, `arch-lint`, `mod-verify`, `vuln-check`.
 - **build-image** — Hadolint + Docker build-to-cache (no local load), using the `GO_PRIVATE_TOKEN` secret for `platform-*` module resolution. `trivy` and `smoke` each restore their own copy from the GHA/registry cache rather than sharing a loaded image across jobs.
 - **trivy** — CVE scan (fails on CRITICAL/HIGH/UNKNOWN), SARIF upload to the Security tab (best-effort — doesn't fail if GitHub Advanced Security isn't enabled), and a CycloneDX SBOM artifact.
 - **smoke** — the liveness smoke test (`.github/scripts/smoke-tests.sh`) against the built image.
-- **pr-summary** — posts/updates one status comment on pull requests once `test`/`quality`/`build-image`/`trivy`/`smoke` finish.
+- **pr-summary** — posts/updates one status comment on pull requests once `validate-test`/`validate-quality`/`build-image`/`trivy`/`smoke` finish.
 - **push** — on push to `main`/`master` only: builds (with SBOM + provenance attestations), pushes to `ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment`, and signs the image with Cosign (keyless, via Sigstore OIDC — no signing key to manage). Verify a published image with:
   ```sh
   cosign verify --certificate-identity-regexp "^https://github\.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/.github/workflows/.*@refs/heads/(main|master)$" \
@@ -584,7 +606,7 @@ Hard invariants — see [`ARCHITECTURE.md` §Threat model](ARCHITECTURE.md#threa
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml` — validate → build (CHANGELOG gate + 5-platform binaries) → docker (semver-tagged image, CVE scan, SBOM, SLSA provenance, Cosign sign) → deploy-gate (live Helm deploy + health check, auto-rollback) → publish (GitHub Release with everything attached). See [`CONTRIBUTING.md` § Deployment](CONTRIBUTING.md#deployment) for the full pipeline, required secrets, and the gRPC-specific health query.
 
-`test`/`quality` live in `.github/workflows/validate-test.yml`/`validate-quality.yml` (reusable workflows) so `ci.yml` and `release.yml` share exactly one definition of each gate.
+`validate-test`/`validate-quality` live in `.github/workflows/validate-test.yml`/`validate-quality.yml` (reusable workflows) so `ci.yml` and `release.yml` share exactly one definition of each gate.
 
 ---
 
@@ -609,7 +631,7 @@ See [VERSIONING.md](VERSIONING.md) for the full SemVer rules, what counts as the
 ## Docker
 
 ```sh
-make docker-up     # Valkey + LocalStack (SQS) only
+make docker-up     # Valkey + floci (SQS) + floci-ui only
 make docker-down
 ```
 
@@ -619,13 +641,27 @@ The bundled `docker-compose.yml`'s `app` service builds this repo's own image �
 docker build --secret id=go_private_token,env=GO_PRIVATE_TOKEN -t iam-authz-enrichment .
 ```
 
-For local development, running `make docker-up` (Valkey + LocalStack only) and `make run` (the binary directly on the host) avoids needing that token at all — the Go module cache already has `platform-gincommon`/`platform-events` once fetched once with a valid token or SSH key.
+For local development, running `make docker-up` (Valkey + floci only) and `make run` (the binary directly on the host) avoids needing that token at all — the Go module cache already has `platform-gincommon`/`platform-events`/`platform-pgcommon` once fetched once with a valid token or SSH key.
+
+---
+
+## Dependency posture
+
+Every `Check()` touches at most two synchronous dependencies (Valkey, Org & Membership) plus, on tender-scoped/approver-gated routes, up to two more (iam-tender-acl, Org & Membership's MFA-freshness endpoint). §7's failure matrix (`internal/usecase/failure.go`'s `DecideDependencyOutcome`) governs the first two; the tender-ACL and MFA-freshness calls each have their own independent, narrower fail-closed rule.
+
+| Dependency call | Posture | On failure |
+|---|---|---|
+| Valkey (`ae:ctx`/`ae:tenant` read) | soft — bypass | Org & Membership still reachable → call it directly for this request, skipping the cache (§7 row 1). Correctness is preserved since the sibling is still authoritative. |
+| Org & Membership (I-8, membership/tenant rebuild) | stale-if-error, capped at 5 minutes | Valkey reachable + a stale `ae:ctx`/`ae:tenant` pair exists → serve it (§7 row 2). Otherwise → fail-closed, `DENY_SERVICE_UNAVAILABLE` (§7 row 3) — never conflated with an ordinary `Deny`. |
+| iam-tender-acl (TAC-4, tender-ACL overlay) | fail-closed, scoped to the overlay only | Timeout/error → `DENY_TENDER_ACL_INSUFFICIENT` for the tender-scoped check only (§7 row 4). Never escalates to `DENY_SERVICE_UNAVAILABLE`, and never denies a non-tender-scoped aspect of the same request. |
+| Org & Membership (I-14, MFA-freshness) | fail-closed (judgment call, not in the LLD's §7 table) | Call failure → `DENY_MFA_STALE`, not `DENY_SERVICE_UNAVAILABLE`. Approver-gated actions are exactly the security-sensitive case this service exists to protect, so ambiguity resolves to denial — the client's remedy (re-auth) is the same one a genuinely stale MFA assertion would produce. |
 
 ---
 
 ## Out of scope
 
-- Any durable schema, migration, or ORM — no Postgres, no database of any kind.
+- Any durable schema, migration, or ORM — no live Postgres pool. `platform-pgcommon` is wired for DSN/config/logger/tracer parity with siblings; `NewPool` is not called.
+- Publishing events — `platform-events` SNS/outbox config is loaded for env-warning parity; `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner` are not called.
 - JWT issuance, MFA enrollment, realm/tenant provisioning, the Keycloak Admin API.
 - A policy-authoring UI — policies are Go code, compiled in, redeployed to change.
 - Active session/token revocation (best-effort, owned elsewhere) — this service only bounds the *passive* cutoff via its own cache TTL.
@@ -633,50 +669,9 @@ For local development, running `make docker-up` (Valkey + LocalStack only) and `
 
 ---
 
-## Cross-service dependencies
-
-### 1. Outbound synchronous calls (this service → other services)
-
-| Service | What it calls | Adapter package | Failure posture |
-|---|---|---|---|
-| **Org & Membership** | `GET /api/v1/internal/users/:id/memberships` (I-8) — full membership projection | `outbound/orgmembership/` | §7 failure matrix — stale-if-error from cache envelope; after soft-TTL miss maps to `DENY_SERVICE_UNAVAILABLE` |
-| **Org & Membership** | `GET /api/v1/internal/tenants/:id/mfa-freshness` (I-14) — authoritative MFA window | `outbound/orgmembership/` | Failure maps to `DENY_MFA_STALE` (not `DENY_SERVICE_UNAVAILABLE`) — a sibling outage on this check is treated as "can't confirm freshness" |
-| **iam-tender-acl** | `GET /internal/tenants/:id/tenders/:tender_id/acl/:user_id` (TAC-4) — tender ACL check | `outbound/orgmembership/` | Fail-closed — a TAC-4 failure denies the tender-scoped request (`DENY_TENDER_ACL_INSUFFICIENT`) |
-
-### 2. Inbound callers (other services → this service)
-
-| Caller | Interface | Purpose |
-|---|---|---|
-| **Envoy** | `envoy.service.auth.v3.Authorization/Check` (gRPC, mTLS) | Every authenticated request proxied by the gateway — the sole inbound interface |
-
-This service exposes no REST API. Envoy is the only caller of the primary interface; the HTTP server serves only `/healthz`, `/readyz`, `/asyncapi`, and `/metrics`.
-
-### 3. Async event dependencies (this service consumes)
-
-This service is a **pure consumer** — it publishes no events.
-
-| Queue | Producer | Events consumed | Cache keys evicted |
-|---|---|---|---|
-| `membership-authz-q` | **Org & Membership** | `DepartmentMembershipGranted`, `DepartmentMembershipRevoked`, `DepartmentMembershipLevelChanged`, `TenantRoleGranted`, `TenantRoleRevoked`, `MembershipRevoked` | `ae:ctx:{tenant}:{user}` + `ae:tender_acl:{tenant}:{user}:*` on `MembershipRevoked` |
-| `user-authz-q` | **User Profile** | `UserDeleted` | `ae:ctx:{tenant}:{user}` + `ae:tender_acl:{tenant}:{user}:*` (best-effort wider eviction) |
-| `billing-authz-q` | **Billing** | `TenantPlanChanged`, `TenantSubscriptionCancelled`, `TenantReactivated` | Evict `ae:tenant:{tenant}` (envelope `tenant_id` only, no payload decode) |
-| `tenant-authz-q` | **Realm Provisioner** | `TenantConverted`, `TenantRealmReady` | Update in-process `RealmMap` (realm→tenant); `TenantConverted` also evicts `ae:tenant:{tenant}` |
-| `tender-authz-q` | **Tender Service** | `TenderRestricted`, `TenderUnrestricted` | `RestrictedTenderSet` in-process + `ae:tender_acl:{tenant}:{user}:{tender}` |
-
-Dedup: every event is idempotent-marked in Valkey (`ae:processed:{event_id}`) before handling; the mark is rolled back on handler failure so retries are not silently swallowed.
-
-### 4. Infrastructure dependencies
-
-| System | Role |
-|---|---|
-| **Valkey** (Redis-compatible, `go-redis/v9`) | Primary runtime state — `ae:ctx`, `ae:tenant`, `ae:tender_acl`, `ae:neg`, `ae:processed` key families; single-envelope trick serving both fresh-read and §7 stale-if-error paths |
-| **AWS SQS** | 5 inbound queues (one per producer domain); each with a `-dlq` handled entirely at the SQS redrive-policy level — this service never publishes to DLQs |
-| **Envoy / service mesh** | Calls this service over mTLS; validates JWTs via `jwt_authn` before the `ext_authz` call — identity arrives in `MetadataContext`, never in headers |
-
----
-
 ## See also
 
+- [`.claude/CLAUDE.md`](.claude/CLAUDE.md) — top-level guidance for Claude Code working in this repo.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layer model, request-flow/cache/event/failure-handling diagrams, key invariants, threat model.
 - [`docs/lld/iam-lld-authz-enrichment.md`](docs/lld/iam-lld-authz-enrichment.md) — the Low-Level Design: precedence chain, cache-key table, §7 event-invalidation narrative, §9 `DenyReason`/status table, §16 `AE-#` decision register.
 - [`api/asyncapi.yaml`](api/asyncapi.yaml) — the 5-queue/15-event-type consumer contract (see [§ Event architecture](#event-architecture)); also served live at `GET /asyncapi`/`GET /asyncapi.yaml`.

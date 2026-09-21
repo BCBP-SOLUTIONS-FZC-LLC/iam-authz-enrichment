@@ -1,0 +1,90 @@
+# DEPENDABOT VERSION UPDATES ARE CURRENTLY DISABLED.
+#
+# GitHub enables Dependabot version updates purely based on whether
+# .github/dependabot.yml exists (and is valid) on the default branch — there
+# is no separate repo-settings toggle for it (unlike Dependabot alerts /
+# security updates, which are). Renaming this file to `dependabot.yml.disabled`
+# is the reversible way to turn version updates off without losing the config
+# below (grouped minor/patch updates per ecosystem, private-module registry
+# access, etc.) — it was tuned deliberately (see CHANGELOG's "Dependabot
+# opened one PR per individual dependency bump" entry) and shouldn't need to
+# be rebuilt from scratch later.
+#
+# To re-enable: `git mv .github/dependabot.yml.disabled .github/dependabot.yml`,
+# remove this banner comment, and push to the default branch. Already-open
+# Dependabot PRs from before this was disabled are unaffected either way —
+# this only stops new update runs from being scheduled.
+
+version: 2
+
+# Grants Dependabot access to the private github.com/BCBP-SOLUTIONS-FZC-LLC/*
+# Go modules (platform-events, platform-gincommon). Without this, Dependabot
+# cannot resolve the full module graph for ANY gomod update (even unrelated
+# public deps), failing with git_dependencies_not_reachable.
+#
+# Requires a Dependabot secret named GO_PRIVATE_TOKEN — a PAT (classic or
+# fine-grained) with read access to BCBP-SOLUTIONS-FZC-LLC private repos.
+# Set it under Settings → Secrets and variables → Dependabot (NOT Actions —
+# these are separate secret stores even when reusing the same name/value).
+registries:
+  github-bcbp:
+    type: git
+    url: https://github.com
+    username: x-access-token
+    password: ${{ secrets.GO_PRIVATE_TOKEN }}
+
+# Every update below is grouped into one PR per ecosystem per week for
+# minor/patch bumps — each Dependabot PR runs this repo's full required
+# pipeline (validate-test with real Valkey/LocalStack service containers,
+# validate-quality, docker build, Trivy, smoke test; six status checks
+# total), so one PR per *dependency* was multiplying CI minutes for no
+# review benefit: github/codeql-action alone was bumped 4 separate times
+# in under a month (4.37.0→4.37.6→4.37.7→4.37.8→4.37.9), each running the
+# entire pipeline for a patch version nobody was reviewing individually.
+# Major bumps are deliberately left ungrouped and opened individually —
+# those can carry real breaking changes or (per the Docker golang image —
+# see its own comment below) require a coordinated change elsewhere in the
+# repo, and are worth a dedicated review rather than being silently
+# bundled into a larger diff.
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    registries:
+      - github-bcbp
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    labels: [dependencies, go]
+    groups:
+      go-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    labels: [dependencies, docker]
+    groups:
+      docker-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+    # A golang base-image major/minor bump (e.g. 1.26→1.27) is intentionally
+    # NOT grouped or auto-mergeable: go.mod's own `go` directive must move
+    # in lockstep (see CHANGELOG's "Dockerfile's pinned builder image was
+    # one patch version behind go.mod's requirement" fix) — merging the
+    # image bump alone without also bumping go.mod would silently reproduce
+    # that exact bug in the opposite direction (image newer than go.mod
+    # requires is harmless, but the reverse breaks every build).
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    labels: [dependencies, github-actions]
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]

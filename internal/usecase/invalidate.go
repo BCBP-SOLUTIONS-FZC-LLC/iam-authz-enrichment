@@ -9,9 +9,9 @@ import (
 // Handle* method corresponds to one row of that section's table — the
 // consumer adapter (internal/adapter/inbound/consumer) decodes an
 // Envelope[json.RawMessage] payload into the matching *EventPayload type
-// below and calls the matching method, after its own idempotency check
-// (Cache.MarkProcessed) has confirmed this event hasn't already been
-// applied.
+// below and calls the matching method, after the consumer adapter's
+// platform-events processed_events check (IdempotencyStore / Envelope.ID)
+// has confirmed this event hasn't already been applied.
 type Invalidator struct {
 	cache      Cache
 	realmMap   *RealmMap
@@ -147,15 +147,20 @@ type TenantRealmEventPayload struct {
 // HandleTenantConverted: realm strategy changed, everything's stale — evict
 // the tenant-scoped slice AND refresh the realm map.
 func (inv *Invalidator) HandleTenantConverted(ctx context.Context, tenant string, p TenantRealmEventPayload) error {
-	inv.realmMap.Set(p.Realm, tenant)
+	if err := inv.realmMap.Set(ctx, p.Realm, tenant); err != nil {
+		return fmt.Errorf("persist realm map: %w", err)
+	}
 	return inv.cache.EvictTenantContext(ctx, tenant)
 }
 
 // HandleTenantRealmReady: NO ae:ctx eviction — refresh the realm map only.
 // Wiring this (not just TenantConverted) matters: a newly-dedicated realm
 // created via direct-paid signup fires only TenantRealmReady (§5).
-func (inv *Invalidator) HandleTenantRealmReady(tenant string, p TenantRealmEventPayload) {
-	inv.realmMap.Set(p.Realm, tenant)
+func (inv *Invalidator) HandleTenantRealmReady(ctx context.Context, tenant string, p TenantRealmEventPayload) error {
+	if err := inv.realmMap.Set(ctx, p.Realm, tenant); err != nil {
+		return fmt.Errorf("persist realm map: %w", err)
+	}
+	return nil
 }
 
 // TenderRestrictedPayload is tender-authz-q's decoded payload.
@@ -163,8 +168,11 @@ type TenderRestrictedPayload struct {
 	TenderID string `json:"tender_id"`
 }
 
-// HandleTenderRestricted flips the in-memory restricted-tender fact. Not a
-// cache eviction (§5).
-func (inv *Invalidator) HandleTenderRestricted(tenant string, p TenderRestrictedPayload) {
-	inv.restricted.MarkRestricted(tenant, p.TenderID)
+// HandleTenderRestricted flips the restricted-tender fact (L1 + shared
+// Valkey). Not a cache eviction (§5).
+func (inv *Invalidator) HandleTenderRestricted(ctx context.Context, tenant string, p TenderRestrictedPayload) error {
+	if err := inv.restricted.MarkRestricted(ctx, tenant, p.TenderID); err != nil {
+		return fmt.Errorf("persist restricted tender: %w", err)
+	}
+	return nil
 }

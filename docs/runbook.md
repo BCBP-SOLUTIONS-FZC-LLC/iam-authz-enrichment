@@ -118,6 +118,58 @@ stale beyond its intended TTL.
    its own within any timeframe you should wait for
    (`MessageRetentionPeriod` is measured in days).
 
+## Log line: `sqs receive-error watchdog: consumer appears stuck` (pod restart)
+
+One of the 5 SQS consumers has failed every `ReceiveMessage` call for
+several minutes straight (`cmd/server/receive_watchdog.go` — `staleAfter`
+consecutive polls, default 6 × 30s ≈ 3 minutes, with no successful receive
+in between). This exists because `platform-events`' consumer loop never
+returns an error for a persistently failing receive loop — it retries
+forever internally and only logs `sqs: receive message failed` — so
+without this watchdog a broken consumer would silently stop evicting that
+queue's cache entries forever while `/healthz`/`/readyz` stayed green.
+
+The watchdog pushes to `fatalErr`, which shuts the process down so
+the orchestrator restarts the pod (same log line as
+`AuthzEnrichmentDown`/`AuthzEnrichmentAvailabilitySLOBreach` above). A
+plain restart does **not** fix the underlying cause — it only restores
+visibility (the alerts above will fire again immediately if the cause is
+still present) and forces a fresh IAM/queue-config resolution.
+
+1. Check the `queue` field on the log line to identify which of the 5
+   queues is affected, then check the same `sqs_receive_errors_total{queue=...}`
+   metric this watchdog itself polls.
+2. Most likely cause: the queue was deleted, or this pod's IAM role/policy
+   no longer grants `sqs:ReceiveMessage` on it (a permissions change is not
+   fixed by restarting — fix the permission/queue, not the pod).
+3. If the pod keeps crash-looping on this after the underlying cause is
+   fixed, confirm `AWS_REGION`/`AWS_ENDPOINT_URL` and the affected
+   `*_AUTHZ_QUEUE_URL` are still correct for this environment.
+
+## Log line: `grpc server exited` / `http server exited` / `metrics server exited`
+
+One of the three servers `cmd/server/main.go` runs (gRPC ext_authz, HTTP
+health/readiness, or `/metrics`) exited unexpectedly — not via this
+process's own deliberate shutdown. This is immediately followed by `fatal
+error — shutting down so the orchestrator restarts this pod`: unlike a
+stuck SQS consumer (which only degrades one fact class to stale-per-TTL),
+a dead gRPC server means **100% of Envoy's ext_authz traffic is failing**,
+so this always triggers an immediate restart rather than a lengthy
+detection window — see LLD §16 AE-28 for why this needed fixing at all
+(`livenessProbe`/`readinessProbe` are `httpGet`-only, §12/`values.yaml`,
+so they cannot see a dead gRPC server on their own).
+
+1. Check which server exited (`grpc`/`http`/`metrics` in the log line) and
+   the accompanying `error` field — this is almost always the actual root
+   cause (a listener-level failure, not application logic).
+2. If the pod keeps crash-looping on this immediately after restart, check
+   for a port conflict, a resource limit being hit (file descriptors), or
+   a `GRPC_TLS_CERT_FILE`/`_KEY_FILE` pointing at a certificate that
+   rotated to something the running pod can no longer read.
+3. A single occurrence with no recurrence is expected on some
+   underlying-infrastructure blips (e.g. a CNI-level listener reset) — the
+   restart itself is the fix in that case.
+
 ## Startup fails immediately with `load config: ORG_MEMBERSHIP_BASE_URL ...`
 
 The deployment left `ORG_MEMBERSHIP_BASE_URL` at its local-dev default
@@ -125,6 +177,15 @@ outside `APP_ENV=dev` — `internal/config/config.go` fails fast on this
 rather than starting and silently failing every non-cache-hit request. Set
 `ORG_MEMBERSHIP_BASE_URL` to the real Org & Membership service address for
 this environment.
+
+## Startup fails immediately with `... and ... are both set to the same queue URL`
+
+Two of the five `*_AUTHZ_QUEUE_URL` env vars were set to an identical
+value — almost always a copy-paste mistake in the deployment config. Left
+uncaught, this would also silently corrupt the receive-error watchdog's
+per-URL streak tracking above (two aliases racing to update/reset the same
+counter every poll), permanently masking a stuck consumer on that URL.
+Fix the duplicated env var to point at its own distinct queue.
 
 ## Log line: `no tenant-resolution path configured` (warning, at startup)
 

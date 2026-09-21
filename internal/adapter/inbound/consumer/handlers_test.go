@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/stretchr/testify/assert"
@@ -14,7 +15,7 @@ import (
 )
 
 func testDeps(cache *fixtures.FakeCache) Deps {
-	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 	return Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv}
 }
 
@@ -173,23 +174,23 @@ func TestTenantHandler_DecodeError(t *testing.T) {
 func TestTenantHandler_UnknownType_NoOp(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
-	realmMap := usecase.NewRealmMap(nil)
-	inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+	realmMap := usecase.NewRealmMap(nil, 5*time.Second)
+	inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 	handler := tenantHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
 
 	err := handler(context.Background(), envelope(t, "SomeUnrelatedEvent", "tenant-1", map[string]string{"realm": "realm-1"}))
 
 	require.NoError(t, err)
 	assert.Empty(t, cache.SortedCalls())
-	_, ok := realmMap.Lookup("realm-1")
+	_, ok := realmMap.Lookup(context.Background(), "realm-1")
 	assert.False(t, ok)
 }
 
 func TestTenantHandler_TenantConverted_EvictsAndRefreshesRealmMap(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
-	realmMap := usecase.NewRealmMap(nil)
-	inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+	realmMap := usecase.NewRealmMap(nil, 5*time.Second)
+	inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 	deps := Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv}
 	handler := tenantHandler(deps)
 
@@ -197,7 +198,7 @@ func TestTenantHandler_TenantConverted_EvictsAndRefreshesRealmMap(t *testing.T) 
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls())
-	tenant, ok := realmMap.Lookup("realm-1")
+	tenant, ok := realmMap.Lookup(context.Background(), "realm-1")
 	assert.True(t, ok)
 	assert.Equal(t, "tenant-1", tenant)
 }
@@ -205,8 +206,8 @@ func TestTenantHandler_TenantConverted_EvictsAndRefreshesRealmMap(t *testing.T) 
 func TestTenantHandler_TenantRealmReady_NoEviction(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
-	realmMap := usecase.NewRealmMap(nil)
-	inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{})
+	realmMap := usecase.NewRealmMap(nil, 5*time.Second)
+	inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 	deps := Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv}
 	handler := tenantHandler(deps)
 
@@ -214,7 +215,7 @@ func TestTenantHandler_TenantRealmReady_NoEviction(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Empty(t, cache.SortedCalls())
-	tenant, ok := realmMap.Lookup("realm-direct-paid")
+	tenant, ok := realmMap.Lookup(context.Background(), "realm-direct-paid")
 	assert.True(t, ok)
 	assert.Equal(t, "tenant-direct-paid", tenant)
 }
@@ -222,8 +223,8 @@ func TestTenantHandler_TenantRealmReady_NoEviction(t *testing.T) {
 func TestTenderHandler_TenderRestricted_FlipsFact(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
-	restricted := usecase.NewRestrictedTenderSet()
-	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), restricted, fixtures.NoopLogger{})
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), restricted, fixtures.NoopLogger{})
 	deps := Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv}
 	handler := tenderHandler(deps)
 
@@ -231,20 +232,20 @@ func TestTenderHandler_TenderRestricted_FlipsFact(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Empty(t, cache.SortedCalls())
-	assert.True(t, restricted.IsRestricted("tenant-1", "tender-9"))
+	assert.True(t, restricted.IsRestricted(context.Background(), "tenant-1", "tender-9"))
 }
 
 func TestTenderHandler_UnknownType_NoOp(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
-	restricted := usecase.NewRestrictedTenderSet()
-	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil), restricted, fixtures.NoopLogger{})
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), restricted, fixtures.NoopLogger{})
 	handler := tenderHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
 
 	err := handler(context.Background(), envelope(t, "SomeUnrelatedEvent", "tenant-1", map[string]string{"tender_id": "tender-9"}))
 
 	require.NoError(t, err)
-	assert.False(t, restricted.IsRestricted("tenant-1", "tender-9"))
+	assert.False(t, restricted.IsRestricted(context.Background(), "tenant-1", "tender-9"))
 }
 
 func TestTenderHandler_DecodeError(t *testing.T) {
@@ -268,7 +269,7 @@ func TestDedupingHandler_RetriesAfterHandlerFailure(t *testing.T) {
 		return nil
 	}
 	deps := Deps{Cache: cache, Log: fixtures.NoopLogger{}}
-	wrapped := dedupingHandler(deps, "", inner)
+	wrapped := processedHandler(deps, inner)
 
 	env := envelope(t, "AnyType", "tenant-1", map[string]string{})
 	err := wrapped(context.Background(), env)
@@ -288,7 +289,7 @@ func TestDedupingHandler_SkipsAlreadyProcessedEvent(t *testing.T) {
 		return nil
 	}
 	deps := Deps{Cache: cache, Log: fixtures.NoopLogger{}}
-	wrapped := dedupingHandler(deps, "", inner)
+	wrapped := processedHandler(deps, inner)
 
 	env := envelope(t, "AnyType", "tenant-1", map[string]string{})
 	require.NoError(t, wrapped(context.Background(), env))
@@ -310,10 +311,11 @@ func TestBillingHandler_EvictTenantContextError_Propagates(t *testing.T) {
 	require.Error(t, err, "EvictTenantContext failure must propagate — billing event must be redelivered by SQS")
 }
 
-// TC-048: empty event ID produces dedup key ae:processed: — documents that
-// a second empty-ID event is silently skipped (known limitation: all
-// empty-ID messages share one dedup slot).
-func TestDedupingHandler_EmptyEventID_SecondCallDeduplicated(t *testing.T) {
+// TC-048: empty event ID is rejected immediately — processedHandler requires
+// a non-empty Envelope.ID to write the idempotency key. An empty ID cannot
+// be safely deduplicated (all empty-ID messages would share one slot) so
+// we fail-fast instead of silently allowing them through.
+func TestDedupingHandler_EmptyEventID_ReturnsError(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
 	var calls int
@@ -322,14 +324,11 @@ func TestDedupingHandler_EmptyEventID_SecondCallDeduplicated(t *testing.T) {
 		return nil
 	}
 	deps := Deps{Cache: cache, Log: fixtures.NoopLogger{}}
-	wrapped := dedupingHandler(deps, "", inner)
+	wrapped := processedHandler(deps, inner)
 
 	emptyIDEnv := events.Envelope[json.RawMessage]{ID: "", Type: "AnyType", TenantID: "tenant-1"}
-	require.NoError(t, wrapped(context.Background(), emptyIDEnv))
-	require.NoError(t, wrapped(context.Background(), emptyIDEnv))
-
-	assert.Equal(t, 1, calls,
-		"SEC-5: empty event ID creates ae:processed: — all empty-ID events share one dedup key, subsequent ones are silently skipped")
+	require.Error(t, wrapped(context.Background(), emptyIDEnv))
+	assert.Equal(t, 0, calls, "handler must not be called for an empty event ID")
 }
 
 // TC-031..TC-034: every event type routed to HandleMembershipEvent must evict

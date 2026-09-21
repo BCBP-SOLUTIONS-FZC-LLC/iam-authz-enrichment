@@ -24,9 +24,9 @@ const (
 )
 
 func newTestChecker(cache usecase.Cache, org usecase.OrgMembershipClient, restricted *usecase.RestrictedTenderSet) *usecase.Checker {
-	realmMap := usecase.NewRealmMap(map[string]string{dedicatedIssuer: tenant})
+	realmMap := usecase.NewRealmMap(map[string]string{dedicatedIssuer: tenant}, 5*time.Second)
 	if restricted == nil {
-		restricted = usecase.NewRestrictedTenderSet()
+		restricted = usecase.NewRestrictedTenderSet(5 * time.Second)
 	}
 	return usecase.NewChecker(cache, org, realmMap, restricted, fixtures.NoopLogger{}, usecase.NoopRecorder{}, usecase.CheckerConfig{
 		SharedRealmIssuer: sharedRealmIssuer,
@@ -182,8 +182,8 @@ func TestCheck_Precedence_RoleInsufficientWinsOverTenderACL(t *testing.T) {
 	cache := fixtures.NewFakeCache()
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
 	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
-	restricted := usecase.NewRestrictedTenderSet()
-	restricted.MarkRestricted(tenant, "tender-1")
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{
 		GetTenderACLFunc: func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
 			return domain.TenderACL{}, nil // no grant -> would deny at step 4 too
@@ -208,8 +208,8 @@ func TestCheck_Precedence_TenderACLWinsOverMFA(t *testing.T) {
 	cache := fixtures.NewFakeCache()
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
 	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
-	restricted := usecase.NewRestrictedTenderSet()
-	restricted.MarkRestricted(tenant, "tender-1")
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{
 		GetTenderACLFunc: func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
 			return domain.TenderACL{}, nil // insufficient -> denies at step 4
@@ -236,8 +236,8 @@ func TestCheck_TenderACL_CacheHit_SkipsSiblingCall(t *testing.T) {
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
 	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
 	require.NoError(t, cache.SetTenderACL(context.Background(), tenant, "tender-1", user, domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}))
-	restricted := usecase.NewRestrictedTenderSet()
-	restricted.MarkRestricted(tenant, "tender-1")
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{}
 	checker := newTestChecker(cache, org, restricted)
 
@@ -256,8 +256,8 @@ func TestCheck_TenderACL_SetCacheFails_StillAllowsOnGrant(t *testing.T) {
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
 	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
 	cache.SetTenderACLErr = errors.New("valkey down")
-	restricted := usecase.NewRestrictedTenderSet()
-	restricted.MarkRestricted(tenant, "tender-1")
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{
 		GetTenderACLFunc: func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
 			return domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, nil
@@ -279,8 +279,8 @@ func TestCheck_TenderACL_GetCacheErrors_FallsThroughToSibling(t *testing.T) {
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
 	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
 	cache.GetTenderACLErr = errors.New("valkey down")
-	restricted := usecase.NewRestrictedTenderSet()
-	restricted.MarkRestricted(tenant, "tender-1")
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{
 		GetTenderACLFunc: func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
 			return domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, nil
@@ -302,8 +302,8 @@ func TestCheck_TenderACL_Allow_WhenSufficientGrant(t *testing.T) {
 	cache := fixtures.NewFakeCache()
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
 	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
-	restricted := usecase.NewRestrictedTenderSet()
-	restricted.MarkRestricted(tenant, "tender-1")
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{
 		GetTenderACLFunc: func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
 			return domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, nil
@@ -343,8 +343,8 @@ func TestCheck_TenderACLFailure_FailsClosedForOverlayOnly(t *testing.T) {
 	cache := fixtures.NewFakeCache()
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
 	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
-	restricted := usecase.NewRestrictedTenderSet()
-	restricted.MarkRestricted(tenant, "tender-1")
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{
 		GetTenderACLFunc: func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
 			return domain.TenderACL{}, domain.ErrUnavailable
@@ -683,8 +683,8 @@ func TestCheck_TenderACL_ContextDeadlineExceeded_FailsClosed(t *testing.T) {
 	cache := fixtures.NewFakeCache()
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
 	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
-	restricted := usecase.NewRestrictedTenderSet()
-	restricted.MarkRestricted(tenant, "tender-1")
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{
 		GetTenderACLFunc: func(ctx context.Context, _, _, _ string) (domain.TenderACL, error) {
 			return domain.TenderACL{}, context.DeadlineExceeded
@@ -891,9 +891,9 @@ func TestCheck_MFA_ExactWindowEdge_Allows(t *testing.T) {
 func TestCheck_SharedRealmIssuerEmpty_UnknownIssuerDenies(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
-	realmMap := usecase.NewRealmMap(map[string]string{dedicatedIssuer: tenant})
+	realmMap := usecase.NewRealmMap(map[string]string{dedicatedIssuer: tenant}, 5*time.Second)
 	checker := usecase.NewChecker(cache, &fixtures.FakeOrgMembershipClient{}, realmMap,
-		usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{}, usecase.NoopRecorder{},
+		usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{}, usecase.NoopRecorder{},
 		usecase.CheckerConfig{SharedRealmIssuer: ""},
 	)
 
@@ -1000,8 +1000,8 @@ func TestCheck_SEC_TenantIDWithColon_HeaderReflectsResolvedTenant(t *testing.T) 
 				domain.NewTenantContext(), nil
 		},
 	}
-	realmMap := usecase.NewRealmMap(nil)
-	checker := usecase.NewChecker(cache, org, realmMap, usecase.NewRestrictedTenderSet(),
+	realmMap := usecase.NewRealmMap(nil, 5*time.Second)
+	checker := usecase.NewChecker(cache, org, realmMap, usecase.NewRestrictedTenderSet(5*time.Second),
 		fixtures.NoopLogger{}, usecase.NoopRecorder{},
 		usecase.CheckerConfig{SharedRealmIssuer: sharedRealmIssuer},
 	)
@@ -1022,9 +1022,9 @@ func TestCheck_SEC_TenantIDWithColon_HeaderReflectsResolvedTenant(t *testing.T) 
 func TestCheck_SEC_UnknownIssuer_DeniesRegardlessOfTenantIDClaim(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
-	realmMap := usecase.NewRealmMap(map[string]string{dedicatedIssuer: tenant})
+	realmMap := usecase.NewRealmMap(map[string]string{dedicatedIssuer: tenant}, 5*time.Second)
 	checker := usecase.NewChecker(cache, &fixtures.FakeOrgMembershipClient{}, realmMap,
-		usecase.NewRestrictedTenderSet(), fixtures.NoopLogger{}, usecase.NoopRecorder{},
+		usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{}, usecase.NoopRecorder{},
 		usecase.CheckerConfig{SharedRealmIssuer: sharedRealmIssuer},
 	)
 

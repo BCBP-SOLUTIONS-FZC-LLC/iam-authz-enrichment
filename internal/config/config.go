@@ -7,6 +7,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"time"
@@ -55,6 +56,19 @@ type Config struct {
 	ProcessedEventTTL  time.Duration
 	StaleIfErrorMaxAge time.Duration
 
+	// RestrictedNegativeTTL bounds how long RestrictedTenderSet's L1 cache
+	// trusts a "not restricted" result before re-checking Valkey — separate
+	// from NegativeCacheTTL (a subject-rebuild performance knob) because
+	// this one bounds a security-relevant propagation delay (how fast a
+	// replica notices another replica's TenderRestricted event) and must
+	// be tunable independently.
+	RestrictedNegativeTTL time.Duration
+	// RealmNegativeTTL is the same kind of knob as RestrictedNegativeTTL,
+	// for RealmMap: how long a "no such dedicated realm" L1 result is
+	// trusted before re-checking Valkey for another replica's Set (a
+	// TenantConverted event it consumed first).
+	RealmNegativeTTL time.Duration
+
 	GRPCMaxConcurrentStreams uint32
 	GRPCKeepAliveTime        time.Duration
 	GRPCKeepAliveTimeout     time.Duration
@@ -88,7 +102,6 @@ type Config struct {
 	BillingQueueURL    string
 	TenantQueueURL     string
 	TenderQueueURL     string
-	SQSMaxReceiveCount int
 
 	// *QueueConcurrency sets events.WithConcurrency per queue — the number
 	// of messages each consumer hands to a handler goroutine at once,
@@ -200,6 +213,12 @@ func Load() (Config, error) {
 	if cfg.NegativeCacheTTL, err = envDuration("AE_NEG_TTL", 5*time.Second); err != nil {
 		return Config{}, err
 	}
+	if cfg.RestrictedNegativeTTL, err = envDuration("AE_RESTRICTED_NEG_TTL", 5*time.Second); err != nil {
+		return Config{}, err
+	}
+	if cfg.RealmNegativeTTL, err = envDuration("AE_REALM_NEG_TTL", 5*time.Second); err != nil {
+		return Config{}, err
+	}
 	if cfg.ProcessedEventTTL, err = envDuration("AE_PROCESSED_EVENT_TTL", 7*24*time.Hour); err != nil {
 		return Config{}, err
 	}
@@ -216,9 +235,18 @@ func Load() (Config, error) {
 	if cfg.GRPCKeepAliveTimeout, err = envDuration("GRPC_KEEPALIVE_TIMEOUT", 5*time.Second); err != nil {
 		return Config{}, err
 	}
-	streams, err := envInt("GRPC_MAX_CONCURRENT_STREAMS", 1000)
+	streams, err := envPositiveInt("GRPC_MAX_CONCURRENT_STREAMS", 1000)
 	if err != nil {
 		return Config{}, err
+	}
+	// streams is a validated-positive int (up to the platform int width,
+	// i.e. up to 64 bits) about to be narrowed into a uint32 field — an
+	// operator typo like a stray extra digit would otherwise silently wrap
+	// via the uint32(streams) conversion instead of failing fast, the
+	// opposite of this function's own fail-fast philosophy for exactly this
+	// class of mistake.
+	if streams > math.MaxUint32 {
+		return Config{}, fmt.Errorf("GRPC_MAX_CONCURRENT_STREAMS: %d exceeds the maximum allowed value (%d)", streams, uint32(math.MaxUint32))
 	}
 	cfg.GRPCMaxConcurrentStreams = uint32(streams)
 
@@ -227,14 +255,10 @@ func Load() (Config, error) {
 	// limit, kept far below gRPC-Go's 4MiB default as defense-in-depth
 	// against a malformed or abusive message from a misbehaving Envoy
 	// instance (§8: Envoy is trusted, but "trusted" isn't "unbounded").
-	if cfg.GRPCMaxRecvMsgSizeBytes, err = envInt("GRPC_MAX_RECV_MSG_SIZE_BYTES", 256*1024); err != nil {
+	if cfg.GRPCMaxRecvMsgSizeBytes, err = envPositiveInt("GRPC_MAX_RECV_MSG_SIZE_BYTES", 256*1024); err != nil {
 		return Config{}, err
 	}
-	if cfg.GRPCMaxSendMsgSizeBytes, err = envInt("GRPC_MAX_SEND_MSG_SIZE_BYTES", 256*1024); err != nil {
-		return Config{}, err
-	}
-
-	if cfg.SQSMaxReceiveCount, err = envInt("SQS_MAX_RECEIVE_COUNT", 5); err != nil {
+	if cfg.GRPCMaxSendMsgSizeBytes, err = envPositiveInt("GRPC_MAX_SEND_MSG_SIZE_BYTES", 256*1024); err != nil {
 		return Config{}, err
 	}
 
@@ -242,19 +266,19 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	if cfg.MembershipQueueConcurrency, err = envInt("MEMBERSHIP_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
+	if cfg.MembershipQueueConcurrency, err = envPositiveInt("MEMBERSHIP_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
 		return Config{}, err
 	}
-	if cfg.UserQueueConcurrency, err = envInt("USER_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
+	if cfg.UserQueueConcurrency, err = envPositiveInt("USER_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
 		return Config{}, err
 	}
-	if cfg.BillingQueueConcurrency, err = envInt("BILLING_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
+	if cfg.BillingQueueConcurrency, err = envPositiveInt("BILLING_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
 		return Config{}, err
 	}
-	if cfg.TenantQueueConcurrency, err = envInt("TENANT_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
+	if cfg.TenantQueueConcurrency, err = envPositiveInt("TENANT_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
 		return Config{}, err
 	}
-	if cfg.TenderQueueConcurrency, err = envInt("TENDER_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
+	if cfg.TenderQueueConcurrency, err = envPositiveInt("TENDER_AUTHZ_QUEUE_CONCURRENCY", 4); err != nil {
 		return Config{}, err
 	}
 
@@ -289,6 +313,39 @@ func Load() (Config, error) {
 		)
 	}
 
+	// Blank queue URLs start idle consumers. Outside dev that looks
+	// healthy (/readyz ok) while cache never evicts and restricted/realm
+	// facts never apply. Fail fast the same way sibling URLs do.
+	queueURLs := []struct{ name, url string }{
+		{"MEMBERSHIP_AUTHZ_QUEUE_URL", cfg.MembershipQueueURL},
+		{"USER_AUTHZ_QUEUE_URL", cfg.UserQueueURL},
+		{"BILLING_AUTHZ_QUEUE_URL", cfg.BillingQueueURL},
+		{"TENANT_AUTHZ_QUEUE_URL", cfg.TenantQueueURL},
+		{"TENDER_AUTHZ_QUEUE_URL", cfg.TenderQueueURL},
+	}
+	if cfg.AppEnv != "dev" {
+		for _, q := range queueURLs {
+			if q.url == "" {
+				return Config{}, fmt.Errorf("%s is required when APP_ENV=%q — blank starts an idle consumer and this process will never see that queue's events", q.name, cfg.AppEnv)
+			}
+		}
+	}
+	// A copy-pasted queue URL shared between two of the five vars would
+	// silently corrupt the receive-error watchdog's per-URL streak
+	// tracking (cmd/server/receive_watchdog.go) in addition to being a
+	// real dispatch mistake, so guard it unconditionally — blank values
+	// are exempt (checked, or intentionally allowed idle, above).
+	seen := make(map[string]string, len(queueURLs))
+	for _, q := range queueURLs {
+		if q.url == "" {
+			continue
+		}
+		if other, dup := seen[q.url]; dup {
+			return Config{}, fmt.Errorf("%s and %s are both set to the same queue URL (%s) — each of the five queues must be distinct", other, q.name, q.url)
+		}
+		seen[q.url] = q.name
+	}
+
 	return cfg, nil
 }
 
@@ -319,6 +376,25 @@ func envInt(key string, def int) (int, error) {
 	n, err := strconv.Atoi(v)
 	if err != nil {
 		return 0, fmt.Errorf("%s: invalid integer %q: %w", key, v, err)
+	}
+	return n, nil
+}
+
+// envPositiveInt is envInt with a fail-fast range check for the fields that
+// silently misbehave (or silently wrap, for a later uint32 conversion) on a
+// zero or negative value rather than erroring — a stray minus sign or typo
+// should crash-loop the pod at startup, the same way an invalid duration or
+// malformed URL already does, instead of producing a confusing runtime
+// symptom (a gRPC server accepting zero concurrent streams, a consumer
+// built with negative concurrency, or a message-size limit that disables
+// its own defense-in-depth cap).
+func envPositiveInt(key string, def int) (int, error) {
+	n, err := envInt(key, def)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("%s: must be a positive integer, got %d", key, n)
 	}
 	return n, nil
 }

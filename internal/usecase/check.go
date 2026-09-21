@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -83,7 +84,7 @@ func (c *Checker) Check(ctx context.Context, in CheckInput) domain.Decision {
 func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 	// §2 point 3 / §9: tenant resolution. Malformed identity short-circuits
 	// everything — there is no tenant to scope any subsequent call to.
-	tenant, ok := ResolveTenant(in.Claims, c.realmMap, c.cfg.SharedRealmIssuer)
+	tenant, ok := ResolveTenant(ctx, in.Claims, c.realmMap, c.cfg.SharedRealmIssuer)
 	if !ok {
 		return domain.Denied(domain.DenyMalformedIdentity)
 	}
@@ -91,7 +92,7 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 
 	reqFacts := in.Request
 	if reqFacts.TenderID != "" {
-		reqFacts.TenderRestricted = c.restricted.IsRestricted(tenant, reqFacts.TenderID)
+		reqFacts.TenderRestricted = c.restricted.IsRestricted(ctx, tenant, reqFacts.TenderID)
 	}
 
 	// §3.1 step 1: subject resolution. Short-circuits everything else.
@@ -166,8 +167,30 @@ type sfResult struct {
 // cache (§4) and the §7 failure-handling matrix. resolved=false means the
 // caller must return Denied(reason) immediately.
 func (c *Checker) resolveContext(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, domain.DenyReason, bool) {
-	ctxVal, ctxResult, ctxErr := c.cache.GetMembershipContext(ctx, tenant, user)
-	tenantVal, tenantResult, tenantErr := c.cache.GetTenantContext(ctx, tenant)
+	// Run both Valkey reads concurrently rather than sequentially — at the
+	// default 10ms VALKEY_READ_TIMEOUT, two sequential reads can alone
+	// approach the documented 15ms p99 decision budget (§11.1) on a slow-
+	// but-not-erroring Valkey, even though each individual read is well
+	// within budget on its own.
+	var (
+		ctxVal       domain.MembershipContext
+		ctxResult    domain.CacheResult
+		ctxErr       error
+		tenantVal    domain.TenantContext
+		tenantResult domain.CacheResult
+		tenantErr    error
+	)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ctxVal, ctxResult, ctxErr = c.cache.GetMembershipContext(ctx, tenant, user)
+	}()
+	go func() {
+		defer wg.Done()
+		tenantVal, tenantResult, tenantErr = c.cache.GetTenantContext(ctx, tenant)
+	}()
+	wg.Wait()
 	valkeyReachable := ctxErr == nil && tenantErr == nil
 
 	if valkeyReachable && ctxResult == domain.CacheFresh && tenantResult == domain.CacheFresh {

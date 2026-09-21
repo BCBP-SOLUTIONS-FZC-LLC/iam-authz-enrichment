@@ -18,6 +18,8 @@ import (
 	"net/url"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
 
@@ -56,14 +58,41 @@ type Client struct {
 func New(baseURL string, timeout time.Duration, tenderACLBaseURL string, tenderACLTimeout time.Duration) *Client {
 	return &Client{
 		baseURL: baseURL,
-		http:    &http.Client{Timeout: timeout},
+		http:    instrumentedHTTPClient(timeout),
 
 		tenderACLBaseURL: tenderACLBaseURL,
-		tenderACLHTTP:    &http.Client{Timeout: tenderACLTimeout},
+		tenderACLHTTP:    instrumentedHTTPClient(tenderACLTimeout),
 	}
 }
 
-// departmentDTO/membershipsResponse mirror I-8's wire shape.
+// instrumentedHTTPClient matches iam-org-membership's httpx.NewClient:
+// otelhttp wraps the transport so every I-8/I-12/I-14 call emits a client
+// span and injects W3C traceparent through the TracerProvider
+// gincommon.InitTracingFromEnv installed. Without this, outbound calls
+// start a parentless trace at the sibling.
+func instrumentedHTTPClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 10 * time.Millisecond
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}
+}
+
+// departmentDTO/membershipsResponse mirror I-8's wire shape. The level
+// field is "role_level" on the wire, not "level" — verified against
+// Org & Membership's actual GetMemberships handler, which serializes its
+// MembershipProjection.Departments field ([]domain.DeptMembershipView,
+// RoleLevel typed with a "role_level" JSON tag) directly, and against that
+// service's own LLD, whose documented I-8 response example uses
+// "role_level" too. Every other membership-authz-q event/endpoint in that
+// service spells the same concept "level" (DepartmentMembershipGranted's
+// payload, the PUT department-member endpoints, etc.) — I-8's response is
+// the one place it's spelled differently, which is presumably why this
+// mismatch went unnoticed for as long as it did: a "level" field
+// genuinely exists in that service's vocabulary, just never on this
+// specific wire response.
 type departmentDTO struct {
 	DepartmentID string `json:"department_id"`
 	Level        string `json:"role_level"`
@@ -125,7 +154,7 @@ func (c *Client) GetMemberships(ctx context.Context, tenant, user string) (domai
 		c.baseURL, url.PathEscape(user), url.QueryEscape(tenant))
 
 	var resp membershipsResponse
-	if err := c.getJSON(ctx, u, &resp); err != nil {
+	if err := c.getJSON(ctx, tenant, u, &resp); err != nil {
 		return domain.MembershipContext{}, domain.TenantContext{}, err
 	}
 	return resp.MembershipContext(), resp.TenantContext(), nil
@@ -180,25 +209,53 @@ func (c *Client) GetMFAFreshness(ctx context.Context, tenant string) (time.Durat
 	u := fmt.Sprintf("%s/api/v1/internal/tenants/%s/mfa-freshness", c.baseURL, url.PathEscape(tenant))
 
 	var resp mfaFreshnessResponse
-	if err := c.getJSON(ctx, u, &resp); err != nil {
+	if err := c.getJSON(ctx, tenant, u, &resp); err != nil {
 		return 0, err
 	}
 	return time.Duration(resp.MFAFreshnessSeconds) * time.Second, nil
 }
 
-func (c *Client) getJSON(ctx context.Context, u string, out any) error {
-	return c.getJSONWith(ctx, c.http, u, out)
+// getJSON is used by the two Org & Membership calls (GetMemberships/
+// GetMFAFreshness). Unlike iam-tender-acl's TAC-4 (mesh-only, no RBAC —
+// see GetTenderACL/getJSONWith below), Org & Membership's /internal/*
+// routes are additionally gated by an application-level RequireSystemRole
+// check that requires x-user-id/x-tenant-id/x-tenant-roles to be present
+// on the request — verified directly against that service's own router
+// (internal := v1.Group("/internal", RequireSystemRole())) and middleware
+// (RequireSystemRole checks the request context carries the "iam-system"
+// role, itself parsed from x-tenant-roles by GUCBridgeMiddleware). Every
+// one of that service's own outbound clients to a sibling's internal API
+// (catalogadmin, groupmappingclient, delegationcheck, workflow,
+// realmprovisioner) sets these same three headers identically — this is
+// the platform-wide internal-service-identity convention, not something
+// specific to any one caller, so this client follows it too rather than
+// inventing its own.
+func (c *Client) getJSON(ctx context.Context, tenant, u string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return fmt.Errorf("%w: build request: %v", ErrUnavailable, err)
+	}
+	req.Header.Set("x-user-id", "iam-system")
+	req.Header.Set("x-tenant-id", tenant)
+	req.Header.Set("x-tenant-roles", "iam-system")
+	return c.doRequest(ctx, c.http, req, out)
 }
 
-// getJSONWith is getJSON parameterized on which http.Client to use — I-8/
-// I-14 (GetMemberships/GetMFAFreshness) go through getJSON's c.http
-// (Org & Membership's timeout); GetTenderACL goes through c.tenderACLHTTP
-// (iam-tender-acl's own timeout) via this method directly.
+// getJSONWith is getJSON's counterpart for a request that needs none of
+// the Org & Membership internal-identity headers above — currently only
+// GetTenderACL (TAC-4), which is deliberately mesh-only/no-RBAC on
+// iam-tender-acl's side, so sending them would misrepresent that trust
+// model even though the callee would simply ignore them.
 func (c *Client) getJSONWith(ctx context.Context, httpClient *http.Client, u string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return fmt.Errorf("%w: build request: %v", ErrUnavailable, err)
 	}
+	return c.doRequest(ctx, httpClient, req, out)
+}
+
+func (c *Client) doRequest(ctx context.Context, httpClient *http.Client, req *http.Request, out any) error {
+	propagateTraceparent(ctx, req)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
