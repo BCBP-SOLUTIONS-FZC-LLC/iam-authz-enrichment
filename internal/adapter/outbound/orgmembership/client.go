@@ -66,7 +66,7 @@ func New(baseURL string, timeout time.Duration, tenderACLBaseURL string, tenderA
 // departmentDTO/membershipsResponse mirror I-8's wire shape.
 type departmentDTO struct {
 	DepartmentID string `json:"department_id"`
-	Level        string `json:"level"`
+	Level        string `json:"role_level"`
 }
 
 // membershipsResponse is I-8's full response. MFAFreshnessSeconds is present
@@ -131,6 +131,16 @@ func (c *Client) GetMemberships(ctx context.Context, tenant, user string) (domai
 	return resp.MembershipContext(), resp.TenantContext(), nil
 }
 
+// tenderACLResponse is the TAC-4 wire shape. access_level and expires_at are
+// pointer types with omitempty because iam-tender-acl omits both fields when
+// has_access is false — a valid, cacheable "no grant" answer. The domain type
+// uses plain string/time.Time; this DTO absorbs the wire-vs-domain mismatch.
+type tenderACLResponse struct {
+	HasAccess   bool       `json:"has_access"`
+	AccessLevel *string    `json:"access_level,omitempty"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+}
+
 // GetTenderACL calls TAC-4 (formerly I-12) on iam-tender-acl: GET
 // /internal/tenants/:id/tenders/:tender_id/acl/:user_id — no /api/v1
 // prefix, unlike every other internal route in this file. This is
@@ -140,22 +150,22 @@ func (c *Client) GetMemberships(ctx context.Context, tenant, user string) (domai
 // Phase 4 repointed this one call here from Org & Membership's now-retired
 // (410 Gone, pending Phase 6 deletion) I-12 handler.
 //
-// domain.TenderACL's json tags already match the wire shape exactly (both
-// the old I-12 response and the new TAC-4 response — TAC-4 additionally
-// sends expires_at, which I-12 never did, but ExpiresAt is decoded-and-
-// unused by this service regardless, so this is a compatible superset, not
-// a breaking change). This endpoint never returns 404 — absence of a grant
-// is HasAccess: false, itself a valid, cacheable answer (§6 point 2). Only
-// network/5xx failures produce ErrUnavailable here.
+// This endpoint never returns 404 — absence of a grant is HasAccess: false,
+// itself a valid, cacheable answer (§6 point 2). Only network/5xx failures
+// produce ErrUnavailable here.
 func (c *Client) GetTenderACL(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
 	u := fmt.Sprintf("%s/internal/tenants/%s/tenders/%s/acl/%s",
 		c.tenderACLBaseURL, url.PathEscape(tenant), url.PathEscape(tenderID), url.PathEscape(user))
 
-	var resp domain.TenderACL
-	if err := c.getJSONWith(ctx, c.tenderACLHTTP, u, &resp); err != nil {
+	var wire tenderACLResponse
+	if err := c.getJSONWith(ctx, c.tenderACLHTTP, u, &wire); err != nil {
 		return domain.TenderACL{}, err
 	}
-	return resp, nil
+	acl := domain.TenderACL{HasAccess: wire.HasAccess}
+	if wire.AccessLevel != nil {
+		acl.AccessLevel = *wire.AccessLevel
+	}
+	return acl, nil
 }
 
 type mfaFreshnessResponse struct {

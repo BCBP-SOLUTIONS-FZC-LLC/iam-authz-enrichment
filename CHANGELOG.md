@@ -24,6 +24,11 @@ This service has no production deployment yet — pre-1.0, still in active devel
 - Real `test/load` baseline numbers: 500 RPS, hit p99=1.68ms, miss p99=3.18ms (single-machine, not production-validated).
 
 ### Changed
+- Renamed all Prometheus metrics from `authz_*` to `iam_authz_enrichment_*` per the Enterprise Platform Observability Standard three-tier taxonomy (Tier 3 service-specific namespace, with `service` and `environment` ConstLabels injected centrally).
+- Consolidated three separate dependency-call histograms (`authz_i8_call_latency_seconds`, `authz_i12_call_latency_seconds`, `authz_i14_call_latency_seconds`) into a single `iam_authz_enrichment_dependency_request_seconds{dependency}` HistogramVec.
+- Added Tier 1 platform-shared metrics: `platform_messages_received_total`, `platform_messages_processed_total`, `platform_messages_failed_total` (with `domain="iam"`, `service`, `environment` ConstLabels) for SQS consumer instrumentation.
+- Added `metric-lint` CI target (`make metric-lint`) enforcing the namespace naming rules.
+- Updated Prometheus alert rules, HPA adapter config, and PrometheusRule Helm template to use the new canonical metric names.
 - `/metrics` moved off `APP_PORT` to its own dedicated port (`METRICS_PORT`, default 9090).
 - `deploy/helm/values.yaml` replica/HPA range corrected to 5–20 to match the LLD's design commitment.
 - SQS consumer shutdown parallelized (`sync.WaitGroup`) instead of sequential, bounding worst-case shutdown time.
@@ -34,6 +39,9 @@ This service has no production deployment yet — pre-1.0, still in active devel
 - `/asyncapi` HTML viewer rendered `�` instead of the description — byte-level string truncation split multi-byte UTF-8 characters. Fixed with a rune-boundary-safe `truncateRunes` helper.
 - `api/asyncapi.yaml`'s producer-summary table incorrectly listed the same combined producer for `billing-authz-q` and `tenant-authz-q`; corrected to each queue's actual distinct producer.
 - A few CI script bugs: a hadolint false-positive on `ENV GOPRIVATE`, a SIGPIPE in `extract-release-notes.sh`, and `export-image-provenance.sh` reading provenance attestations with the wrong tool.
+
+### Deprecated
+- `authz_*` metric names are now deprecated and emitted in parallel for backward compatibility. They will be removed after dashboards and alert rules have migrated.
 
 ### Removed
 - `active_delegations[]` / `domain.Delegation` — dropped entirely; delegation state moved to its own service (`iam-delegation`, ADR-0008).

@@ -136,7 +136,7 @@ iam-authz-enrichment/
 │   │   └── outbound/
 │   │       ├── valkey/                # Cache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed
 │   │       ├── orgmembership/         # HTTP client — I-8 memberships (Org & Membership), TAC-4/I-12 tender-acl (iam-tender-acl), I-14 mfa-freshness (Org & Membership)
-│   │       └── metrics/               # Prometheus authz_* series (§10)
+│   │       └── metrics/               # Prometheus iam_authz_enrichment_* series (§10)
 │   └── config/                        # Load() — env vars only, no hot-reload (§11)
 ├── docs/
 │   ├── lld/iam-lld-authz-enrichment.md  # Low-Level Design — precedence chain, cache-key table, §16 AE-# register
@@ -630,6 +630,48 @@ For local development, running `make docker-up` (Valkey + LocalStack only) and `
 - A policy-authoring UI — policies are Go code, compiled in, redeployed to change.
 - Active session/token revocation (best-effort, owned elsewhere) — this service only bounds the *passive* cutoff via its own cache TTL.
 - Rate limiting or quota enforcement — this service only injects `x-plan`/`x-feature-flags` for other components to act on.
+
+---
+
+## Cross-service dependencies
+
+### 1. Outbound synchronous calls (this service → other services)
+
+| Service | What it calls | Adapter package | Failure posture |
+|---|---|---|---|
+| **Org & Membership** | `GET /api/v1/internal/users/:id/memberships` (I-8) — full membership projection | `outbound/orgmembership/` | §7 failure matrix — stale-if-error from cache envelope; after soft-TTL miss maps to `DENY_SERVICE_UNAVAILABLE` |
+| **Org & Membership** | `GET /api/v1/internal/tenants/:id/mfa-freshness` (I-14) — authoritative MFA window | `outbound/orgmembership/` | Failure maps to `DENY_MFA_STALE` (not `DENY_SERVICE_UNAVAILABLE`) — a sibling outage on this check is treated as "can't confirm freshness" |
+| **iam-tender-acl** | `GET /internal/tenants/:id/tenders/:tender_id/acl/:user_id` (TAC-4) — tender ACL check | `outbound/orgmembership/` | Fail-closed — a TAC-4 failure denies the tender-scoped request (`DENY_TENDER_ACL_INSUFFICIENT`) |
+
+### 2. Inbound callers (other services → this service)
+
+| Caller | Interface | Purpose |
+|---|---|---|
+| **Envoy** | `envoy.service.auth.v3.Authorization/Check` (gRPC, mTLS) | Every authenticated request proxied by the gateway — the sole inbound interface |
+
+This service exposes no REST API. Envoy is the only caller of the primary interface; the HTTP server serves only `/healthz`, `/readyz`, `/asyncapi`, and `/metrics`.
+
+### 3. Async event dependencies (this service consumes)
+
+This service is a **pure consumer** — it publishes no events.
+
+| Queue | Producer | Events consumed | Cache keys evicted |
+|---|---|---|---|
+| `membership-authz-q` | **Org & Membership** | `DepartmentMembershipGranted`, `DepartmentMembershipRevoked`, `DepartmentMembershipLevelChanged`, `TenantRoleGranted`, `TenantRoleRevoked`, `MembershipRevoked` | `ae:ctx:{tenant}:{user}` + `ae:tender_acl:{tenant}:{user}:*` on `MembershipRevoked` |
+| `user-authz-q` | **User Profile** | `UserDeleted` | `ae:ctx:{tenant}:{user}` + `ae:tender_acl:{tenant}:{user}:*` (best-effort wider eviction) |
+| `billing-authz-q` | **Billing** | `TenantPlanChanged`, `TenantSubscriptionCancelled`, `TenantReactivated` | Evict `ae:tenant:{tenant}` (envelope `tenant_id` only, no payload decode) |
+| `tenant-authz-q` | **Realm Provisioner** | `TenantConverted`, `TenantRealmReady` | Update in-process `RealmMap` (realm→tenant); `TenantConverted` also evicts `ae:tenant:{tenant}` |
+| `tender-authz-q` | **Tender Service** | `TenderRestricted`, `TenderUnrestricted` | `RestrictedTenderSet` in-process + `ae:tender_acl:{tenant}:{user}:{tender}` |
+
+Dedup: every event is idempotent-marked in Valkey (`ae:processed:{event_id}`) before handling; the mark is rolled back on handler failure so retries are not silently swallowed.
+
+### 4. Infrastructure dependencies
+
+| System | Role |
+|---|---|
+| **Valkey** (Redis-compatible, `go-redis/v9`) | Primary runtime state — `ae:ctx`, `ae:tenant`, `ae:tender_acl`, `ae:neg`, `ae:processed` key families; single-envelope trick serving both fresh-read and §7 stale-if-error paths |
+| **AWS SQS** | 5 inbound queues (one per producer domain); each with a `-dlq` handled entirely at the SQS redrive-policy level — this service never publishes to DLQs |
+| **Envoy / service mesh** | Calls this service over mTLS; validates JWTs via `jwt_authn` before the `ext_authz` call — identity arrives in `MetadataContext`, never in headers |
 
 ---
 

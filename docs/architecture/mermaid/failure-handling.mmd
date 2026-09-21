@@ -9,7 +9,7 @@ flowchart TD
     valkeyup -- "no" --> row1["§7 row 1 variant:\nboth dependencies down\n→ OutcomeFailClosed\nDENY_SERVICE_UNAVAILABLE (503)"]
 
     valkeyup -- "yes" --> stale{"Stale ae:ctx\n+ ae:tenant entry\navailable?"}
-    stale -- "yes" --> row2a["§7 row 2:\nOutcomeServeStale\nserve the stale entry\nauthz_stale_if_error_served_total++"]
+    stale -- "yes" --> row2a["§7 row 2:\nOutcomeServeStale\nserve the stale entry\niam_authz_enrichment_stale_if_error_served_total++"]
     stale -- "no" --> row2b["§7 row 2 degenerate case\n(nothing was ever cached):\nOutcomeFailClosed\nDENY_SERVICE_UNAVAILABLE (503)"]
 
     subgraph row1note["§7 row 1 (Valkey down, sibling healthy) — separate path"]

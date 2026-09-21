@@ -81,7 +81,12 @@ func run() error {
 	// land on the same registry as platform-gincommon's own HTTP metrics
 	// (below) rather than assuming prometheus.DefaultRegisterer and hoping
 	// gincommon agrees — same convention as iam-user-profile.
-	recorder := metrics.New(gincommon.MetricsRegisterer())
+	// Config injects service + environment as ConstLabels on every metric so
+	// instrumentation code cannot omit or misspell them (Observability Standard §8).
+	recorder := metrics.New(metrics.Config{
+		Service:     cfg.AppName,
+		Environment: cfg.AppEnv,
+	}, gincommon.MetricsRegisterer())
 
 	// 3. Cache.
 	cache := valkey.New(valkey.Config{
@@ -200,7 +205,7 @@ func run() error {
 
 	// 8. Background workers: the five SQS consumers.
 	ctx, cancelBackgroundWork := context.WithCancel(context.Background())
-	consumers, err := startConsumers(ctx, cfg, cache, invalidator, appLog)
+	consumers, err := startConsumers(ctx, cfg, cache, invalidator, appLog, recorder)
 	if err != nil {
 		cancelBackgroundWork()
 		return fmt.Errorf("start consumers: %w", err)
@@ -308,7 +313,7 @@ func loadServerTLS(cfg config.Config) (credentials.TransportCredentials, error) 
 // startConsumers builds and starts the five §5 SQS consumers. A consumer
 // whose queue URL is unconfigured degrades to a no-op (idle) consumer rather
 // than failing startup — useful for partial local-dev setups.
-func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache, inv *usecase.Invalidator, appLog usecase.Logger) ([]events.Consumer, error) {
+func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache, inv *usecase.Invalidator, appLog usecase.Logger, rec *metrics.Recorder) ([]events.Consumer, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
@@ -325,6 +330,7 @@ func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache,
 		EndpointURL: cfg.AWSEndpointURL,
 		Cache:       cache,
 		Log:         appLog,
+		Metrics:     rec,
 		Invalidator: inv,
 	}
 

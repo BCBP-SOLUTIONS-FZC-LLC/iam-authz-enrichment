@@ -552,16 +552,14 @@ components:
               user_id: "9c8b7a6f-3333-4c5d-9e6f-000000000002"
               tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
               department_id: "fd72f513-45f0-46ca-a1ed-9183be72484c"
-              previous_level: "reviewer"
-              new_level: "approver"
+              level: "approver"
               actor_id: "1a2b3c4d-5555-4e6f-9a0b-000000000003"
       x-consumer-schema-dependency:
         depends-on-shape:
           user_id: uuid
           tenant_id: uuid
           department_id: uuid
-          previous_level: "preparator | reviewer | approver"
-          new_level: "preparator | reviewer | approver"
+          level: "preparator | reviewer | approver"
           actor_id: uuid
         producer-lifecycle-status: stable
 
@@ -849,13 +847,15 @@ components:
             data:
               realm: "acme-corp"
       x-consumer-schema-dependency:
-        # No published asyncapi.yaml was available for the producer (Realm
-        # Provisioner) in this workspace to verify against. Reflects only
-        # usecase.TenantRealmEventPayload, the shape this service's own
-        # code (HandleTenantConverted) actually decodes.
+        # Verified 2026-09-20 against iam-realm-provisioner/api/asyncapi.yaml
+        # TenantConvertedPayload: realm (string, required) confirmed present.
+        # Producer also publishes: tenant_id, plan, billing_subscription_id,
+        # users_migrated, direct_signup — all safely ignored by this service.
         depends-on-shape:
           realm: "string — the dedicated realm identifier, used as the JWT iss claim for tenant resolution (LLD §8.3)"
-        producer-lifecycle-status: unknown
+        producer-lifecycle-status: verified
+        producer-verified-date: "2026-09-20"
+        producer-asyncapi-ref: "iam-realm-provisioner/api/asyncapi.yaml#/components/schemas/TenantConvertedPayload"
 
     TenantRealmReady:
       name: TenantRealmReady
@@ -877,9 +877,15 @@ components:
             data:
               realm: "acme-corp"
       x-consumer-schema-dependency:
+        # Verified 2026-09-20 against iam-realm-provisioner/api/asyncapi.yaml
+        # TenantRealmReadyPayload: realm (string, required) confirmed present.
+        # Producer also publishes: realm_id, realm_type, keycloak_shard,
+        # oidc_clients — all safely ignored by this service.
         depends-on-shape:
           realm: "string — the dedicated realm identifier, used as the JWT iss claim for tenant resolution (LLD §8.3)"
-        producer-lifecycle-status: unknown
+        producer-lifecycle-status: verified
+        producer-verified-date: "2026-09-20"
+        producer-asyncapi-ref: "iam-realm-provisioner/api/asyncapi.yaml#/components/schemas/TenantRealmReadyPayload"
 
     TenderRestricted:
       name: TenderRestricted
@@ -967,8 +973,7 @@ components:
         - user_id
         - tenant_id
         - department_id
-        - previous_level
-        - new_level
+        - level
         - actor_id
       properties:
         user_id:
@@ -981,12 +986,10 @@ components:
         department_id:
           type: string
           format: uuid
-        previous_level:
+        level:
           type: string
           enum: [preparator, reviewer, approver]
-        new_level:
-          type: string
-          enum: [preparator, reviewer, approver]
+          description: The new (current) department level after the change.
         actor_id:
           type: string
           format: uuid

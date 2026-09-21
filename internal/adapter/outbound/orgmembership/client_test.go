@@ -50,7 +50,7 @@ func TestGetMemberships_FullResponse_DecodesCorrectly(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"roles": ["tenant_admin"],
-			"departments": [{"department_id": "eng", "level": "approver"}],
+			"departments": [{"department_id": "eng", "role_level": "approver"}],
 			"plan": "enterprise",
 			"feature_flags": ["flag-a", "flag-b"],
 			"subscription_status": "active",

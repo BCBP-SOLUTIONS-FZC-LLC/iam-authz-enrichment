@@ -1,19 +1,24 @@
 # Prometheus alerting rules for the iam-authz-enrichment application.
 #
-# All authz_* metrics are registered in internal/adapter/outbound/metrics/recorder.go
-# (§10). Thresholds below match the SLOs documented in ARCHITECTURE.md § Observability
-# stack — decision latency p99 > 50ms/5min → SEV-2, availability < 99.5%/10min → SEV-1,
-# authz_stale_if_error_served_total nonzero → page directly (a live dependency outage).
+# Metrics follow the Enterprise Platform Observability Standard three-tier taxonomy:
+#   Tier 3 (service-specific): iam_authz_enrichment_* with labels service, environment
+#   Tier 1 (platform-shared):  platform_messages_*  with labels domain, service, environment, queue
 #
-# This service has no HTTP business API (no http_requests_total, no 5xx rate) and no
-# database — its closest equivalent to a request-error rate is the DENY_SERVICE_UNAVAILABLE
-# deny reason (§7 fail-closed / dependency failure), not a generic deny rate: most denies
-# are the policy working correctly, not an error.
+# All iam_authz_enrichment_* metrics are registered in
+# internal/adapter/outbound/metrics/recorder.go. Thresholds match the SLOs
+# documented in ARCHITECTURE.md § Observability stack — decision latency p99 >
+# 50ms/5min → SEV-2, availability < 99.5%/10min → SEV-1,
+# iam_authz_enrichment_stale_if_error_served_total nonzero → page directly (a
+# live dependency outage).
+#
+# This service has no HTTP business API (no http_requests_total, no 5xx rate)
+# and no database — its closest equivalent to a request-error rate is the
+# DENY_SERVICE_UNAVAILABLE deny reason (§7 fail-closed / dependency failure),
+# not a generic deny rate: most denies are the policy working correctly, not
+# an error.
 #
 # Deploy via PrometheusRule CRD (kube-prometheus-stack) or include in a
 # Prometheus --rule-files directory.
-#
-# Label on all authz_* metrics: job — "iam-authz-enrichment"
 
 groups:
   - name: iam_authz_enrichment_availability
@@ -73,7 +78,7 @@ groups:
         expr: |
           histogram_quantile(0.99,
             sum by (le) (
-              rate(authz_decision_latency_seconds_bucket{job="iam-authz-enrichment"}[5m])
+              rate(iam_authz_enrichment_decision_latency_seconds_bucket{job="iam-authz-enrichment"}[5m])
             )
           ) > 0.05
         for: 5m
@@ -85,9 +90,9 @@ groups:
           description: >-
             The p99 Check() decision latency is {{ $value | humanizeDuration }},
             exceeding the documented 50ms SLO. This is a SEV-2 per ARCHITECTURE.md
-            §10. Check authz_i8_call_latency_seconds / authz_i12_call_latency_seconds
-            for whether Org & Membership is the bottleneck, and Valkey round-trip
-            time if cache hit ratio has dropped.
+            §10. Check iam_authz_enrichment_dependency_request_seconds{dependency="org-membership/i8"}
+            / {dependency="tender-acl/i12"} for whether a dependency is the bottleneck,
+            and Valkey round-trip time if the cache hit ratio has dropped.
 
   - name: iam_authz_enrichment_dependency_health
     rules:
@@ -95,7 +100,7 @@ groups:
       # ── Stale-if-error serving (explicit "page on it directly" per §10) ───────
       - alert: AuthzEnrichmentStaleIfErrorServing
         expr: |
-          rate(authz_stale_if_error_served_total{job="iam-authz-enrichment"}[5m]) > 0
+          rate(iam_authz_enrichment_stale_if_error_served_total{job="iam-authz-enrichment"}[5m]) > 0
         for: 1m
         labels:
           severity: critical
@@ -103,7 +108,7 @@ groups:
         annotations:
           summary: iam-authz-enrichment is serving stale cache entries — live dependency outage
           description: >-
-            authz_stale_if_error_served_total is increasing, meaning §7's
+            iam_authz_enrichment_stale_if_error_served_total is increasing, meaning §7's
             stale-if-error path is active: a live outage of a dependency
             (Valkey or Org & Membership) is in progress right now. Page
             immediately rather than waiting for the latency/availability SLO
@@ -112,7 +117,7 @@ groups:
       # ── Fail-closed / dependency-failure deny spike ────────────────────────────
       - alert: AuthzEnrichmentServiceUnavailableSpike
         expr: |
-          rate(authz_deny_reason_total{job="iam-authz-enrichment", reason="DENY_SERVICE_UNAVAILABLE"}[5m]) > 0
+          rate(iam_authz_enrichment_deny_reason_total{job="iam-authz-enrichment", reason="DENY_SERVICE_UNAVAILABLE"}[5m]) > 0
         for: 5m
         labels:
           severity: warning
@@ -133,9 +138,9 @@ groups:
       # own guidance (never a server-computed ratio gauge).
       - alert: AuthzEnrichmentCacheHitRatioLow
         expr: |
-          sum(rate(authz_cache_hits_total{job="iam-authz-enrichment"}[15m]))
+          sum(rate(iam_authz_enrichment_cache_hits_total{job="iam-authz-enrichment"}[15m]))
             /
-          sum(rate(authz_cache_lookups_total{job="iam-authz-enrichment"}[15m]))
+          sum(rate(iam_authz_enrichment_cache_lookups_total{job="iam-authz-enrichment"}[15m]))
           < 0.5
         for: 15m
         labels:

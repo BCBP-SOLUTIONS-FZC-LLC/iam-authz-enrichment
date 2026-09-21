@@ -268,7 +268,7 @@ func TestDedupingHandler_RetriesAfterHandlerFailure(t *testing.T) {
 		return nil
 	}
 	deps := Deps{Cache: cache, Log: fixtures.NoopLogger{}}
-	wrapped := dedupingHandler(deps, inner)
+	wrapped := dedupingHandler(deps, "", inner)
 
 	env := envelope(t, "AnyType", "tenant-1", map[string]string{})
 	err := wrapped(context.Background(), env)
@@ -288,7 +288,7 @@ func TestDedupingHandler_SkipsAlreadyProcessedEvent(t *testing.T) {
 		return nil
 	}
 	deps := Deps{Cache: cache, Log: fixtures.NoopLogger{}}
-	wrapped := dedupingHandler(deps, inner)
+	wrapped := dedupingHandler(deps, "", inner)
 
 	env := envelope(t, "AnyType", "tenant-1", map[string]string{})
 	require.NoError(t, wrapped(context.Background(), env))
@@ -322,7 +322,7 @@ func TestDedupingHandler_EmptyEventID_SecondCallDeduplicated(t *testing.T) {
 		return nil
 	}
 	deps := Deps{Cache: cache, Log: fixtures.NoopLogger{}}
-	wrapped := dedupingHandler(deps, inner)
+	wrapped := dedupingHandler(deps, "", inner)
 
 	emptyIDEnv := events.Envelope[json.RawMessage]{ID: "", Type: "AnyType", TenantID: "tenant-1"}
 	require.NoError(t, wrapped(context.Background(), emptyIDEnv))

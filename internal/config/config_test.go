@@ -58,9 +58,9 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 20*time.Millisecond, cfg.ValkeyDialTimeout)
 	assert.Equal(t, 10*time.Millisecond, cfg.ValkeyReadTimeout)
 	assert.Equal(t, 10*time.Millisecond, cfg.ValkeyWriteTimeout)
-	assert.Equal(t, "http://localhost:8081", cfg.OrgMembershipBaseURL)
+	assert.Equal(t, "http://localhost:8080", cfg.OrgMembershipBaseURL)
 	assert.Equal(t, 10*time.Millisecond, cfg.OrgMembershipTimeout)
-	assert.Equal(t, "http://localhost:8086", cfg.TenderACLBaseURL)
+	assert.Equal(t, "http://localhost:8080", cfg.TenderACLBaseURL)
 	assert.Equal(t, 20*time.Millisecond, cfg.TenderACLTimeout)
 	assert.Equal(t, "", cfg.SharedRealmIssuer)
 	assert.Equal(t, "envoy.filters.http.jwt_authn", cfg.JWTMetadataNamespace)
@@ -314,7 +314,7 @@ func TestLoad_OrgMembershipDevDefault_AllowedInDev(t *testing.T) {
 	cfg, err := config.Load()
 
 	require.NoError(t, err)
-	assert.Equal(t, "http://localhost:8081", cfg.OrgMembershipBaseURL)
+	assert.Equal(t, "http://localhost:8080", cfg.OrgMembershipBaseURL)
 }
 
 // TestLoad_OrgMembershipOverridden_PassesOutsideDev proves the check is on
@@ -359,7 +359,7 @@ func TestLoad_TenderACLDevDefault_AllowedInDev(t *testing.T) {
 	cfg, err := config.Load()
 
 	require.NoError(t, err)
-	assert.Equal(t, "http://localhost:8086", cfg.TenderACLBaseURL)
+	assert.Equal(t, "http://localhost:8080", cfg.TenderACLBaseURL)
 }
 
 // TC-059: REALM_TENANT_MAP_SEED valid JSON but wrong type (array instead of

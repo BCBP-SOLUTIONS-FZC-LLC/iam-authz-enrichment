@@ -39,7 +39,7 @@ autoscaling:
   maxReplicas: 20
   targetCPUUtilizationPercentage: 70
   targetMemoryUtilizationPercentage: 75
-  # RPS-equivalent: every Check() call produces exactly one authz_decisions_total
+  # RPS-equivalent: every Check() call produces exactly one iam_authz_enrichment_decisions_total
   # increment, so this is a direct per-pod decision-rate target, not an
   # approximation the way a generic HTTP request counter would be.
   targetDecisionsPerSecondPerReplica: 500

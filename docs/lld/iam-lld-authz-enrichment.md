@@ -68,7 +68,7 @@
 ## 1. Document Overview
 
 This is the Low-Level Design for the AuthZ Enrichment service (`iam-authz-enrichment`), one of the IAM subsystem's services, produced after the Org & Membership and User Profile LLDs. (The IAM subsystem began as seven services in HLD v1.41 §5.6; the Org & Membership decomposition programme has since carved four further services out of the O&M monolith — Catalog/Admin Config, Group Mapping/JIT Config, Tender ACL, and Delegation — under ADR-0007/ADR-0008, so the stack is larger than seven today; see §16 AE-21.) AuthZ Enrichment is the stateless gRPC `ext_authz` Policy Decision Point (PDP) that sits in Envoy's request path for every authenticated request against the platform (HLD §4.3, §5.4, §18.1 glossary). It is the consumer, not the definer, of most of the contracts it depends on: the membership/entitlement projection it rebuilds on cache miss (Org & Membership's I-8), the tender-ACL check it performs for restricted tenders (the **Tender ACL Service**'s TAC-4, formerly I-12 — extracted from Org & Membership under ADR-0007 and confirmed against that service's own LLD; see §16 AE-19), and the event topics that keep its cache honest (`membership-authz-q`, `user-authz-q`, and the direct `billing-authz-q`/`tenant-authz-q`/`tender-authz-q` subscriptions catalogued in HLD §9.1/§9.4).
-
+    
 ### 1.1 Relationship to the HLD and sibling LLDs
 
 This document does not redesign anything the HLD or a sibling LLD has already fixed. Per the drafting brief's rules of engagement: where the HLD or a sibling LLD is explicit (response shape, header names, cache TTLs, invariant IDs), this LLD reuses it verbatim and cites the section; where it is silent, this LLD proposes a design and marks it as a new decision in §16 under the `AE-#` prefix.
@@ -814,22 +814,30 @@ This is recorded as a new decision in §16 (AE-13): the trust rule itself is not
 
 ### 11.2 Metrics
 
+All metrics follow the Enterprise Platform Observability Standard three-tier taxonomy. Tier 3 (service-specific) metrics use the `iam_authz_enrichment_` namespace; Tier 1 (platform-shared) metrics use the `platform_` namespace. `service` and `environment` ConstLabels are injected centrally by the metrics adapter and are not repeated per-series below.
+
 Reused verbatim from HLD §12.2, in spirit — `authz_cache_hit_ratio` is HLD §12.2's named metric, but this service does **not** implement it as a single ratio gauge; see the note below:
 
-- `authz_decisions_total{decision}`
-- `authz_decision_latency_seconds{quantile}`
-- `authz_cache_lookups_total` / `authz_cache_hits_total` (see note)
+- `iam_authz_enrichment_decisions_total{decision, service, environment}`
+- `iam_authz_enrichment_decision_latency_seconds{quantile}`
+- `iam_authz_enrichment_cache_lookups_total` / `iam_authz_enrichment_cache_hits_total` (see note)
 - gRPC server metrics from `go-control-plane`
 
-New metrics this LLD introduces to cover the design decisions above:
+New metrics this LLD introduces to cover the design decisions above (Tier 3):
 
-- `authz_negative_cache_lookups_total` / `authz_negative_cache_hits_total` (§6.4, see note)
-- `authz_i8_call_latency_seconds` (I-8 → Org & Membership), `authz_i12_call_latency_seconds` (TAC-4, formerly I-12 → Tender ACL Service — metric name retained for continuity, §16 AE-19), `authz_i14_call_latency_seconds` (I-14 → Org & Membership, MFA-freshness) (§8.2, §8.4, §8.5)
-- `authz_stale_if_error_served_total` (§9.2 row 2 — every time a request is served from an expired `ae:ctx` entry during an Org & Membership outage; a nonzero rate here should itself page, since it indicates a live dependency outage)
-- `authz_deny_reason_total{reason}` (per-`DenyReason` breakdown, §17)
-- `authz_singleflight_coalesced_total` (§9.1 stampede-protection effectiveness)
+- `iam_authz_enrichment_negative_cache_lookups_total` / `iam_authz_enrichment_negative_cache_hits_total` (§6.4, see note)
+- `iam_authz_enrichment_dependency_request_seconds{dependency}` — a single HistogramVec covering all three dependency call sites: `dependency="org-membership/i8"` (I-8 → Org & Membership), `dependency="tender-acl/i12"` (TAC-4, formerly I-12 → Tender ACL Service, §16 AE-19), `dependency="org-membership/i14"` (I-14 → Org & Membership, MFA-freshness) (§8.2, §8.4, §8.5)
+- `iam_authz_enrichment_stale_if_error_served_total` (§9.2 row 2 — every time a request is served from an expired `ae:ctx` entry during an Org & Membership outage; a nonzero rate here should itself page, since it indicates a live dependency outage)
+- `iam_authz_enrichment_deny_reason_total{reason}` (per-`DenyReason` breakdown, §17)
+- `iam_authz_enrichment_singleflight_coalesced_total` (§9.1 stampede-protection effectiveness)
 
-**Note on the two ratio metrics (implementation correction, v1.3):** `authz_cache_hit_ratio` and `authz_negative_cache_hit_ratio` are **not** exposed as single ratio gauges — computing a ratio server-side and exposing it as a gauge is a well-known Prometheus anti-pattern (it cannot be aggregated correctly across replicas or time windows). Each is instead a lookups/hits counter pair; the ratio itself is a PromQL query at read time — `rate(authz_cache_hits_total[5m]) / rate(authz_cache_lookups_total[5m])` — which is the correct way to compute it. Earlier revisions of this section named the ratio-gauge form the actual implementation never built; this note corrects that.
+Tier 1 platform-shared metrics (SQS consumer instrumentation):
+
+- `platform_messages_received_total{domain="iam", service, environment, queue}`
+- `platform_messages_processed_total{domain="iam", service, environment, queue}`
+- `platform_messages_failed_total{domain="iam", service, environment, queue}`
+
+**Note on the two ratio metrics (implementation correction, v1.3):** `authz_cache_hit_ratio` and `authz_negative_cache_hit_ratio` are **not** exposed as single ratio gauges — computing a ratio server-side and exposing it as a gauge is a well-known Prometheus anti-pattern (it cannot be aggregated correctly across replicas or time windows). Each is instead a lookups/hits counter pair; the ratio itself is a PromQL query at read time — `rate(iam_authz_enrichment_cache_hits_total[5m]) / rate(iam_authz_enrichment_cache_lookups_total[5m])` — which is the correct way to compute it. Earlier revisions of this section named the ratio-gauge form the actual implementation never built; this note corrects that.
 
 Cross-reference: `iam_session_revoke_failed_total` (Org & Membership's own AUTH-8 metric, O&M LLD §16 A46) is not this service's metric, but the two should be viewed together on the same dashboard — a spike in that metric plus this service's own `ae:ctx` staleness is exactly the §10.4 worst case materializing.
 

@@ -117,15 +117,15 @@ const staleIfErrorHardCap = 5 * time.Minute
 // devOrgMembershipBaseURL is the local-dev default — never a valid address
 // for a real Org & Membership service, so Load() fails outside APP_ENV=dev
 // if this is still the resolved value.
-const devOrgMembershipBaseURL = "http://localhost:8081"
+const devOrgMembershipBaseURL = "http://localhost:8080"
 
 // devTenderACLBaseURL is the local-dev default for iam-tender-acl (ADR-0007
 // Wave 3 Phase 4 — I-12/GetTenderACL is repointed here from Org &
 // Membership; GetMemberships/GetMFAFreshness (I-8/I-14) are unaffected and
 // still call devOrgMembershipBaseURL above). Matches iam-tender-acl's own
-// dev HTTP_PORT (8086, see its .env.example) — same fail-fast-outside-dev
+// dev HTTP_PORT (8080, see its .env-example) — same fail-fast-outside-dev
 // convention as devOrgMembershipBaseURL.
-const devTenderACLBaseURL = "http://localhost:8086"
+const devTenderACLBaseURL = "http://localhost:8080"
 
 // Load reads Config from the environment, applying the same conventions as
 // the rest of the IAM fleet (plain os.Getenv + default fallback, no

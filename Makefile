@@ -51,7 +51,8 @@ help:
 	@echo "  make build           - compile server binary to bin/"
 	@echo "  make cover           - coverage profile + open HTML report"
 	@echo "  make cover-func      - coverage summary by function"
-	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + test-ci + build"
+	@echo "  make metric-lint     - validate metric naming conventions (Platform Observability Standard)"
+	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + metric-lint + test-ci + build"
 	@echo "  make docker-up       - start local Valkey + LocalStack"
 	@echo "  make docker-down     - stop local containers"
 	@echo "  make fmt-check       - verify gofmt formatting (no changes applied)"
@@ -172,8 +173,12 @@ pin-base-images:
 # CI
 # -----------------------------
 
+.PHONY: metric-lint
+metric-lint:
+	@bash .github/scripts/validate-metrics.sh
+
 .PHONY: ci
-ci: tidy fmt-check vet lint arch-lint test-ci build
+ci: tidy fmt-check vet lint arch-lint metric-lint test-ci build
 
 # -----------------------------
 # COVERAGE

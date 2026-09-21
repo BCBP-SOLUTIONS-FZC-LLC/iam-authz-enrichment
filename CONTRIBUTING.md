@@ -273,7 +273,7 @@ chain) rather than `iam-user-profile`'s `http_requests_total` — this service h
 business traffic, and `status_class="5xx"` only fires on a genuine transport-level RPC failure
 (`internal/adapter/inbound/grpc/server.go`'s `Check()` always returns a nil error for every
 Allow/Deny outcome), so it's a clean deployment-health signal distinct from
-`authz_deny_reason_total{reason="DENY_SERVICE_UNAVAILABLE"}` (dependency health, not deployment
+`iam_authz_enrichment_deny_reason_total{reason="DENY_SERVICE_UNAVAILABLE"}` (dependency health, not deployment
 health — an unrelated dependency outage at deploy time shouldn't trigger a rollback).
 
 Notify the platform team on Slack if a change here affects the Envoy `ext_authz` contract

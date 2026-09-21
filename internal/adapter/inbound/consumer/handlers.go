@@ -41,7 +41,7 @@ func membershipHandler(deps Deps) events.Handler {
 
 // NewMembershipConsumer builds the membership-authz-q consumer.
 func NewMembershipConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption) (events.Consumer, error) {
-	return buildConsumer(queueURL, deps, membershipHandler(deps), opts...)
+	return buildConsumer(queueURL, "membership-authz-q", deps, membershipHandler(deps), opts...)
 }
 
 // userHandler implements user-authz-q (§5): UserUpdated (email changes
@@ -71,7 +71,7 @@ func userHandler(deps Deps) events.Handler {
 
 // NewUserConsumer builds the user-authz-q consumer.
 func NewUserConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption) (events.Consumer, error) {
-	return buildConsumer(queueURL, deps, userHandler(deps), opts...)
+	return buildConsumer(queueURL, "user-authz-q", deps, userHandler(deps), opts...)
 }
 
 // billingHandler implements billing-authz-q (§5): TenantPlanChanged,
@@ -91,7 +91,7 @@ func billingHandler(deps Deps) events.Handler {
 
 // NewBillingConsumer builds the billing-authz-q consumer.
 func NewBillingConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption) (events.Consumer, error) {
-	return buildConsumer(queueURL, deps, billingHandler(deps), opts...)
+	return buildConsumer(queueURL, "billing-authz-q", deps, billingHandler(deps), opts...)
 }
 
 // tenantHandler implements tenant-authz-q (§5): TenantConverted (evicts +
@@ -121,7 +121,7 @@ func tenantHandler(deps Deps) events.Handler {
 
 // NewTenantConsumer builds the tenant-authz-q consumer.
 func NewTenantConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption) (events.Consumer, error) {
-	return buildConsumer(queueURL, deps, tenantHandler(deps), opts...)
+	return buildConsumer(queueURL, "tenant-authz-q", deps, tenantHandler(deps), opts...)
 }
 
 // tenderHandler implements tender-authz-q (§5): TenderRestricted — flips an
@@ -142,5 +142,5 @@ func tenderHandler(deps Deps) events.Handler {
 
 // NewTenderConsumer builds the tender-authz-q consumer.
 func NewTenderConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption) (events.Consumer, error) {
-	return buildConsumer(queueURL, deps, tenderHandler(deps), opts...)
+	return buildConsumer(queueURL, "tender-authz-q", deps, tenderHandler(deps), opts...)
 }

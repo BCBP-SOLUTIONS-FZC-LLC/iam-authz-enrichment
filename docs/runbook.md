@@ -33,11 +33,12 @@ check which specific pods are unhealthy and why.
 
 p99 `Check()` latency above 50ms for 5 minutes.
 
-1. Check `authz_i8_call_latency_seconds` / `authz_i12_call_latency_seconds` —
+1. Check `iam_authz_enrichment_dependency_request_seconds{dependency="org-membership/i8"}` /
+   `iam_authz_enrichment_dependency_request_seconds{dependency="tender-acl/i12"}` —
    is Org & Membership itself slow? If so, this is their incident, not this
    service's; `AuthzEnrichmentStaleIfErrorServing` should also be firing.
-2. Check the cache hit ratio (`rate(authz_cache_hits_total[5m]) /
-   rate(authz_cache_lookups_total[5m])`) — a sudden drop means more
+2. Check the cache hit ratio (`rate(iam_authz_enrichment_cache_hits_total[5m]) /
+   rate(iam_authz_enrichment_cache_lookups_total[5m])`) — a sudden drop means more
    requests are taking the slow (I-8 call) path. Correlate with a recent
    mass membership/tenant event (bulk import, tenant migration).
 3. Check Valkey directly (`valkey-cli --latency` from inside the cluster,
@@ -52,7 +53,7 @@ p99 `Check()` latency above 50ms for 5 minutes.
 
 ## Alert: `AuthzEnrichmentStaleIfErrorServing` (critical — page directly)
 
-`authz_stale_if_error_served_total` is increasing — §7's stale-if-error path
+`iam_authz_enrichment_stale_if_error_served_total` is increasing — §7's stale-if-error path
 is active *right now*. This means Valkey is reachable but Org & Membership
 is not (or vice versa isn't relevant here — stale-if-error specifically
 requires Valkey up + sibling down + a stale entry available).
