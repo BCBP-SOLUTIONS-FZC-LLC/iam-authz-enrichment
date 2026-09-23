@@ -107,7 +107,13 @@ stale beyond its intended TTL.
    it was for.
 2. Check this service's logs around the time of the original delivery
    attempts for the actual handler error (`internal/usecase/invalidate.go`'s
-   `Handle*` methods log on failure).
+   `Handle*` methods log on failure). The 5th delivery also logs
+   `message exhausted retries, SQS will move it to the DLQ` (with
+   `queue`/`event_id`/`event_type`/`tenant_id`) — the first signal, ahead of
+   this alarm. A `glue decode:` error means the producer sent a malformed or
+   compressed Glue frame (compression is not supported); a JSON decode
+   error on a Glue-encoded event can no longer happen for a well-formed
+   frame (`GlueDecoder`, LLD AE-35).
 3. Once the root cause is fixed, manually replay the message (there is no
    automated DLQ replay mechanism — deliberately, per §5) by re-sending an
    equivalent event to the primary queue, or manually evicting the

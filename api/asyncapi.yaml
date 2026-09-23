@@ -48,10 +48,19 @@ info:
     still counts toward `maxReceiveCount` and reaches its DLQ, instead of
     being falsely treated as already-processed on redelivery.
 
+    Wire format: a producer with its Glue registry configured (every IAM
+    sibling) Glue-encodes `data` — base64 of [0x03][0x00][16-byte schema
+    version UUID] + JSON — and sets `dataschema`. This service strips that
+    self-describing header (GlueDecoder) without any Glue client or
+    registry of its own; a plain-JSON envelope passes through untouched.
+
     DLQ: all five queues follow the identical, purely SQS-native
     convention — `maxReceiveCount=5` before a message lands in its own
     `-dlq`, configured on the queue resource itself
-    (`scripts/init-localstack.sh`), never in application code. Because
+    (`scripts/init-localstack.sh`), never in application code. A
+    dead-letter handler only logs each message's 5th and last delivery
+    (it never acks). Note `TenderRestricted`'s `ae:restricted` fact has no
+    TTL, so a DLQ'd one stays stale until it is replayed. Because
     every event here is a cache-invalidation trigger rather than a state
     mutation, a DLQ'd message degrades to "this cache entry may be stale
     until its TTL naturally expires" (5–60s, LLD §6.1) rather than a

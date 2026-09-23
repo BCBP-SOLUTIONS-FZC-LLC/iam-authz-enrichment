@@ -178,7 +178,7 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 |---------|-----------|-------|
 | **Cache** | Valkey (`go-redis/v9`) | The only persistent-ish state this service touches — no database, no ORM, no migrations |
 | **Sibling services** | Org & Membership + iam-tender-acl (HTTP, mTLS) | Org & Membership: I-8 membership rebuild, I-14 MFA-freshness. iam-tender-acl: TAC-4 tender-ACL (formerly Org & Membership's I-12, repointed here ADR-0007 Wave 3 Phase 4). Both are the source of truth behind the cache |
-| **Events (consumed)** | AWS SQS, 5 queues | `platform-events` consumer; DLQ via SQS's own `maxReceiveCount=5` redrive policy, no application code. Full contract: [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `/asyncapi` (§ Common commands) |
+| **Events (consumed)** | AWS SQS, 5 queues | `platform-events` consumer; Glue-encoded envelopes decoded by `GlueDecoder` (no Glue client needed); DLQ via SQS's own `maxReceiveCount=5` redrive policy — application code only logs the last delivery. Full contract: [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `/asyncapi` (§ Common commands) |
 | **Events (published)** | None | This service emits nothing to the bus |
 
 ### Shared library dependencies

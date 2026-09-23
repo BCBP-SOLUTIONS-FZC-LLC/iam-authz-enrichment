@@ -330,6 +330,10 @@ sequenceDiagram
     participant DLQ as SQS -dlq
 
     SQS ->> Consumer: ReceiveMessage (long poll)
+    Note over Consumer: GlueDecoder strips the 18-byte Glue header when the envelope's<br/>dataschema is set (producers Glue-encode once their registry is configured).<br/>A plain-JSON envelope passes through untouched.
+    alt 5th delivery (ApproximateReceiveCount above 4)
+        Consumer ->> Consumer: DeadLetterHandler — log "exhausted retries", return error (never acks)
+    end
     Consumer ->> Dedup: dispatch Envelope[json.RawMessage]
     Dedup ->> Cache: MarkProcessed(event.ID)  — SET NX, 7-day TTL
 
@@ -358,7 +362,7 @@ sequenceDiagram
     end
 
     Consumer -->> SQS: DeleteMessage (only on nil)
-    Note over SQS,DLQ: A message left undeleted becomes visible again after its\nvisibility timeout and is redelivered. After 5 receives, SQS's own\nredrive policy — not application code — moves it to the -dlq (§5).\nA DLQ'd message degrades to stale-until-TTL-expiry, not a\ncorrectness failure requiring replay.
+    Note over SQS,DLQ: A message left undeleted becomes visible again after its\nvisibility timeout and is redelivered. After 5 receives, SQS's own\nredrive policy — not application code — moves it to the -dlq (§5).\nDeadLetterHandler only observes that 5th delivery.\nA DLQ'd message degrades to stale-until-TTL-expiry, not a\ncorrectness failure requiring replay.
 ```
 
 **Consumed event types:**
@@ -505,7 +509,8 @@ graph LR
 | The first failing check in the §3.1 precedence order wins | `usecase.Checker.check` evaluates steps 1–5 in a fixed, linear order with no reordering based on cost or code-path convenience |
 | A tender-ACL failure fails closed for that overlay only | `usecase/check.go` returns `DENY_TENDER_ACL_INSUFFICIENT` directly at the TAC-4 (formerly I-12) call site, independent of `DecideDependencyOutcome` |
 | Consumer idempotency never double-applies an eviction, and never permanently swallows a bad message | `MarkProcessed` (SET NX) before dispatch; `EvictProcessed` on handler failure so a redelivery is a real retry, not a false-positive dedup skip |
-| DLQ routing is infra-only | No `WithMaxReceiveCount`/`WithDeadLetterHandler` application code — SQS's native redrive policy does the counting (see `scripts/init-localstack.sh`) |
+| DLQ routing is infra-only | SQS's native redrive policy does the counting and the move (see `scripts/init-localstack.sh`). The only application code is observability: `WithMaxReceiveCount(4)` + `DeadLetterHandler`, which logs the 5th and last delivery and always returns an error — so it never acks, and it is what stops platform-events deleting a message past its max receive count |
+| Glue-encoded events are decoded, never dead-lettered for their wire format | `GlueDecoder` (`WithConsumerCodec`) strips the 18-byte Glue header whenever `dataschema` is set — every sibling producer Glue-encodes once its registry is configured |
 | Stale-if-error never exceeds its hard cap regardless of configuration | `internal/config/config.go` clamps `AE_STALE_IF_ERROR_MAX_AGE` to 5 minutes even if a higher value is configured |
 | Realm-map freshness survives the direct-paid-signup edge case | Both `TenantConverted` and `TenantRealmReady` update the realm map; only the latter fires for a tenant that never went through conversion |
 | A deployment left pointed at the local-dev Org & Membership URL fails at startup, not silently on every request | `internal/config/config.go`'s `Load()` returns an error when `OrgMembershipBaseURL` is still `http://localhost:8081` and `APP_ENV != "dev"` |
