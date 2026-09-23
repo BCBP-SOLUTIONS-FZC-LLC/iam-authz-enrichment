@@ -22,6 +22,12 @@ TEST_E2E_PKGS  := ./test/e2e/...
 # Source packages measured for coverage (excludes test helpers and cmd).
 COVER_PKG_LIST := $(shell $(GO) list ./internal/... | tr '\n' ',' | sed 's/,$$//')
 
+# Every build tag a test file here declares (integration: test/integration,
+# e2e: test/e2e). vet and lint run a second pass with all of them — CI's
+# quality gate calls `make vet` / `make lint`, so without it the tagged test
+# files were never checked.
+ALL_TEST_TAGS := integration,e2e
+
 # -----------------------------
 # SETUP
 # -----------------------------
@@ -41,8 +47,8 @@ help:
 	@echo "  make install-hooks   - install local git hooks (.githooks -> .git/hooks)"
 	@echo "  make tidy            - go mod tidy"
 	@echo "  make fmt             - go fmt ./..."
-	@echo "  make vet             - go vet all packages"
-	@echo "  make lint            - run golangci-lint"
+	@echo "  make vet             - go vet (default build + every test build tag)"
+	@echo "  make lint            - run golangci-lint (default build + every test build tag)"
 	@echo "  make arch-lint       - enforce .go-arch-lint.yml component boundaries"
 	@echo "  make test            - unit tests (no Docker required)"
 	@echo "  make test-ci         - unit tests with race detector + coverage (used in CI)"
@@ -89,6 +95,7 @@ fmt:
 .PHONY: vet
 vet:
 	$(GO) vet ./...
+	$(GO) vet -tags=$(ALL_TEST_TAGS) ./...
 
 # -----------------------------
 # LINT
@@ -97,7 +104,8 @@ vet:
 .PHONY: lint
 lint:
 	@echo "Running linter..."
-	$(GO) tool golangci-lint run
+	$(GO) tool golangci-lint run ./...
+	$(GO) tool golangci-lint run --build-tags=$(ALL_TEST_TAGS) ./...
 
 .PHONY: arch-lint
 arch-lint:
