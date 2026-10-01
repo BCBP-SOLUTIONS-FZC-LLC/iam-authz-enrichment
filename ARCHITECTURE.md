@@ -42,7 +42,7 @@ graph TD
     subgraph adapters_out["Outbound Adapters  —  internal/adapter/outbound/"]
         valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
         org_a["orgmembership/\nClient — I-8 memberships + I-14 mfa-freshness against Org & Membership,\nTAC-4 tender-acl (formerly I-12) against iam-tender-acl since ADR-0007\nWave 3 Phase 4 — two base URLs/timeouts, one Go package\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
-        metrics_a["metrics/\nRecorder — Prometheus authz_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
+        metrics_a["metrics/\nRecorder — Prometheus iam_authz_enrichment_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
         postgres_a["postgres/\nplatform-pgcommon DSN / PoolConfig / Zap logger /\nOTel tracer / OpenPool wrapper — no live pool (HLD §5.4)"]
     end
 
@@ -182,7 +182,7 @@ sequenceDiagram
                         Checker ->> Checker: DecideDependencyOutcome (§7)
                         alt Valkey reachable and a Stale entry exists
                             Checker ->> Checker: serve the Stale entry
-                            Note over Checker: authz_stale_if_error_served_total++ —<br/>nonzero rate should page (§10)
+                            Note over Checker: iam_authz_enrichment_stale_if_error_served_total++ —<br/>nonzero rate should page (§10)
                         else nothing to fall back on
                             Checker -->> Server: Denied — DENY_SERVICE_UNAVAILABLE (503)
                             Note over Checker,Server: 5xx, not 403 — distinguishes a degraded<br/>authz system from a genuine not-authorized answer (§9)
@@ -467,15 +467,15 @@ graph LR
     end
 
     subgraph prom["Prometheus  →  /metrics (§10)"]
-        p1["authz_decisions_total{decision}"]
-        p2["authz_deny_reason_total{reason}"]
-        p3["authz_decision_latency_seconds"]
-        p4["authz_cache_hits_total / authz_cache_lookups_total\n(hit ratio via PromQL rate() division —\nnever a server-computed ratio gauge)"]
-        p5["authz_negative_cache_hits_total / _lookups_total"]
-        p6["authz_stale_if_error_served_total\n— nonzero rate should page"]
-        p7["authz_singleflight_coalesced_total"]
-        p8["authz_i8_call_latency_seconds"]
-        p9["authz_i12_call_latency_seconds"]
+        p1["iam_authz_enrichment_decisions_total{decision}"]
+        p2["iam_authz_enrichment_deny_reason_total{reason}"]
+        p3["iam_authz_enrichment_decision_latency_seconds"]
+        p4["iam_authz_enrichment_cache_hits_total / iam_authz_enrichment_cache_lookups_total\n(hit ratio via PromQL rate() division —\nnever a server-computed ratio gauge)"]
+        p5["iam_authz_enrichment_negative_cache_hits_total / _lookups_total"]
+        p6["iam_authz_enrichment_stale_if_error_served_total\n— nonzero rate should page"]
+        p7["iam_authz_enrichment_singleflight_coalesced_total"]
+        p8["iam_authz_enrichment_i8_call_latency_seconds"]
+        p9["iam_authz_enrichment_i12_call_latency_seconds"]
         p10["standard gRPC server metrics\n(from the interceptor chain)"]
     end
 
@@ -491,7 +491,7 @@ graph LR
     l1 --- l2 --- l3
 ```
 
-**SLOs (§10):** decision latency p99 > 50ms for 5 min → SEV-2. Availability < 99.5% over 10 min → SEV-1. `authz_stale_if_error_served_total` at a nonzero rate means a live dependency outage is in progress — page on it directly rather than waiting for the SLO windows above to trip. These thresholds are validated against a single-machine, loopback-network `test/load` run only (README § Testing) — not yet measured against a real cluster/network path.
+**SLOs (§10):** decision latency p99 > 50ms for 5 min → SEV-2. Availability < 99.5% over 10 min → SEV-1. `iam_authz_enrichment_stale_if_error_served_total` at a nonzero rate means a live dependency outage is in progress — page on it directly rather than waiting for the SLO windows above to trip. These thresholds are validated against a single-machine, loopback-network `test/load` run only (README § Testing) — not yet measured against a real cluster/network path.
 
 **A gap Prometheus can't cover:** DLQ depth is a CloudWatch-native metric, and DLQ routing is entirely SQS-native (no application code ever reads a `-dlq` queue — see the "DLQ routing is infra-only" invariant above). `deploy/monitoring/dlq-alarms.tf.example` is the only alerting on a message actually landing in one; without it, a permanently-undeliverable message sits there unmonitored indefinitely. See `docs/runbook.md` for what to do when it fires.
 
@@ -515,7 +515,7 @@ graph LR
 | Realm-map freshness survives the direct-paid-signup edge case | Both `TenantConverted` and `TenantRealmReady` update the realm map; only the latter fires for a tenant that never went through conversion |
 | A deployment left pointed at the local-dev Org & Membership URL fails at startup, not silently on every request | `internal/config/config.go`'s `Load()` returns an error when `OrgMembershipBaseURL` is still `http://localhost:8081` and `APP_ENV != "dev"` |
 | The five SQS consumers stop concurrently, not sequentially, on shutdown | `cmd/server/main.go`'s shutdown path uses a `sync.WaitGroup`, bounding worst-case shutdown to one drain window instead of five |
-| A consumer whose `ReceiveMessage` calls fail forever is still detected and restarts the pod | `platform-events`' consumer loop never returns an error for this case — it retries internally, forever, logging only. `cmd/server/receive_watchdog.go` polls `sqs_receive_errors_total` per queue and pushes to `fatalErr` after several minutes of no successful receive, closing a gap `fatalErr` alone could not detect |
+| A consumer whose `ReceiveMessage` calls fail forever is still detected and restarts the pod | `platform-events`' consumer loop never returns an error for this case — it retries internally, forever, logging only. `cmd/server/receive_watchdog.go` wraps each consumer's SQS client to count that queue's own `ReceiveMessage` errors and successes, and pushes to `fatalErr` after several minutes of errors with no successful receive (no dependency on a metric name), closing a gap `fatalErr` alone could not detect |
 | Two `*_AUTHZ_QUEUE_URL` env vars can never silently point at the same queue | `internal/config/config.go`'s `Load()` fails fast on a duplicate — undetected, it would also corrupt the receive-error watchdog's per-URL streak tracking (two aliases racing to update/reset the same counter every poll) |
 | An unexpected death of the gRPC/HTTP/metrics server itself — not just a consumer — still restarts the pod | `values.yaml`'s liveness/readiness probes are `httpGet` against the HTTP server only, with no `grpc:` probe against the gRPC port's health service; `cmd/server/main.go`'s three server goroutines report any non-graceful `Serve`/`ListenAndServe` exit to the same `fatalErr` channel a stuck consumer feeds, so a dead gRPC server (the entire ext_authz decision path) can't run indefinitely behind a healthy-looking `/healthz` (LLD §16 AE-28) |
 
@@ -532,7 +532,7 @@ STRIDE analysis of `iam-authz-enrichment`. Threats marked **External** are depen
 | **Spoofing** | Forged SQS message evicts or corrupts another tenant's cache entry | SQS consumers | `aws:SourceArn` condition on SQS resource policy (**External** — platform infra); event payloads only ever affect the `(tenant, user)` pair named in the envelope/payload |
 | **Tampering** | Corrupt or type-confused Valkey entry causes a wrong decision | Valkey cache | Defensive decode: a JSON-unmarshal failure returns an error, not a zero-value success — callers fall back to §7's failure-handling path, never silently serve a corrupt struct |
 | **Tampering** | Direct Valkey write bypasses tenant scoping | Valkey | Every key-builder function requires `tenant` as a parameter; there is no unscoped key path in this codebase to target |
-| **Repudiation** | A cache eviction or deny decision has no auditable trail | All decision paths | `authz_deny_reason_total{reason}` + structured logs on every deny; **audit-log persistence itself is External** — owned by the platform Audit service |
+| **Repudiation** | A cache eviction or deny decision has no auditable trail | All decision paths | `iam_authz_enrichment_deny_reason_total{reason}` + structured logs on every deny; **audit-log persistence itself is External** — owned by the platform Audit service |
 | **Information Disclosure** | PII or claim values leaked through logs | All log call sites | Only `sub`/`iss` are ever logged, and only those two — enforced by construction (§8.5), not by a post-hoc redaction filter |
 | **Information Disclosure** | Cross-tenant data served from cache | Valkey cache | Tenant is part of every cache key; no shared/unscoped namespace exists (§8.4) |
 | **Denial of Service** | Cache-miss stampede on simultaneous key expiry | Valkey read path | Per-key jitter (±6s) desyncs expiry across replicas; `singleflight` desyncs concurrent callers within one replica against the same key (§4.5). Deliberately no cross-replica lock — the sibling's headroom makes this a non-issue |

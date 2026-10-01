@@ -20,15 +20,15 @@ graph LR
     end
 
     subgraph prom["Prometheus  →  /metrics (§10)"]
-        p1["authz_decisions_total{decision}"]
-        p2["authz_deny_reason_total{reason}"]
-        p3["authz_decision_latency_seconds"]
-        p4["authz_cache_hits_total / authz_cache_lookups_total\n(hit ratio via PromQL rate() division —\nnever a server-computed ratio gauge)"]
-        p5["authz_negative_cache_hits_total / _lookups_total"]
-        p6["authz_stale_if_error_served_total\n— nonzero rate should page"]
-        p7["authz_singleflight_coalesced_total"]
-        p8["authz_i8_call_latency_seconds"]
-        p9["authz_i12_call_latency_seconds"]
+        p1["iam_authz_enrichment_decisions_total{decision}"]
+        p2["iam_authz_enrichment_deny_reason_total{reason}"]
+        p3["iam_authz_enrichment_decision_latency_seconds"]
+        p4["iam_authz_enrichment_cache_hits_total / iam_authz_enrichment_cache_lookups_total\n(hit ratio via PromQL rate() division —\nnever a server-computed ratio gauge)"]
+        p5["iam_authz_enrichment_negative_cache_hits_total / _lookups_total"]
+        p6["iam_authz_enrichment_stale_if_error_served_total\n— nonzero rate should page"]
+        p7["iam_authz_enrichment_singleflight_coalesced_total"]
+        p8["iam_authz_enrichment_i8_call_latency_seconds"]
+        p9["iam_authz_enrichment_i12_call_latency_seconds"]
         p10["standard gRPC server metrics\n(from the interceptor chain)"]
     end
 

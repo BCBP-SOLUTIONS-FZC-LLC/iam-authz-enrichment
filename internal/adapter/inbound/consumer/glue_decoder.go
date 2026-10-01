@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 )
 
 // glueHeaderLen is the AWS Glue Schema Registry wire-format header:

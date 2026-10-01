@@ -88,7 +88,7 @@ type Config struct {
 
 	// DocsEnabled/DocsAuthToken gate the AsyncAPI event-contract viewer
 	// (/asyncapi, /asyncapi.yaml — internal/adapter/inbound/http's
-	// DocsConfig). Outside AppEnv=="production" the viewer is always on
+	// DocsConfig). Outside AppEnv=="prod" the viewer is always on
 	// regardless of DocsEnabled; in production it's opt-in via DocsEnabled
 	// and, if DocsAuthToken is set, gated behind a bearer token.
 	DocsEnabled   bool

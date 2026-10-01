@@ -31,11 +31,11 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/grpccommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgmetrics"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/consumer"
 	grpcadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/grpc"
@@ -141,31 +141,47 @@ func run() error {
 	// uses grpccommon.Shutdown, which is the same OTel+Zap flush).
 	shutdownTracing := gincommon.InitTracingFromEnv()
 
+	// Observability identity (Enterprise Platform Observability Standard):
+	// domain "iam" is fixed for this service; OBSERVABILITY_DOMAIN (set in
+	// the Helm values / compose / .env-example) is only the fallback
+	// gincommon reads when Config.Domain is empty. The environment comes
+	// from APP_ENV and must be one of local/dev/test/staging/prod —
+	// gincommon panics at startup on anything else (e.g. "production").
 	ginCfg := gincommon.Config{
 		Logger:       appLog,
 		ServiceName:  cfg.AppName,
 		BuildVersion: buildVersion,
+		Domain:       observabilityDomain,
+		Environment:  cfg.AppEnv,
 	}
 	grpcCfg := grpccommon.Config{
 		ServiceName:  cfg.AppName,
 		BuildVersion: buildVersion,
 		Logger:       appLog,
+		Domain:       observabilityDomain,
+		Environment:  cfg.AppEnv,
 	}
 
 	// ObservabilityMiddlewares is gincommon's public metrics-init API. Call
-	// it here (before any collector registration) so authz_* and
+	// it here (before any collector registration) so iam_authz_enrichment_* and
 	// platform-events metrics land on gincommon.MetricsRegisterer with
-	// matching {service, version} const labels — same order as
+	// matching {domain, service, environment} const labels — same order as
 	// iam-org-membership / iam-user-profile. NewRouter applies the same
-	// middleware slice; gincommon's metrics.Init is sync.Once.
+	// middleware slice; gincommon's metrics init is first-call-wins.
 	_ = gincommon.ObservabilityMiddlewares(ginCfg)
 
-	// 3. Metrics — business collectors + platform-events consumer
-	// collectors, both on gincommon's registerer (the same /metrics scrape
-	// as HTTP/gRPC interceptor series).
+	// 3. Metrics — business collectors + platform-events / platform-pgcommon
+	// Tier 1 collectors, all on gincommon's registerer (the same /metrics
+	// scrape as HTTP/gRPC interceptor series), with the identity gincommon
+	// resolved so every library labels the same {domain, service,
+	// environment}. pgcommon's identity is initialised before any pool
+	// would be created (this service creates none today — HLD §5.4).
 	recorder := metrics.New(gincommon.MetricsRegisterer())
-	events.InitWithRegisterer(cfg.AppName, buildVersion, gincommon.MetricsRegisterer())
-	pgmetrics.InitWithRegisterer(cfg.AppName, buildVersion, gincommon.MetricsRegisterer())
+	if err := initLibraryMetrics(appLog); err != nil {
+		appLog.Error("init platform metrics", map[string]interface{}{"error": err.Error()})
+		shutdownTracing()
+		return fmt.Errorf("init platform metrics: %w", err)
+	}
 
 	// Database config — same ConfigFromEnv / DSNFromEnv / Zap logger /
 	// gincommon TracerProvider path as iam-user-profile / iam-org-membership.
@@ -258,7 +274,7 @@ func run() error {
 	// health (§7 — see ReadinessProbe's doc comment for why).
 	healthServer := health.NewServer()
 	healthgrpc.RegisterHealthServer(grpcServer, healthServer)
-	if cfg.AppEnv != "production" {
+	if cfg.AppEnv != "prod" {
 		// Lets grpcurl/grpcui/Postman discover and call Check without a local
 		// copy of the envoy ext_authz .proto — same non-production-only
 		// convention iam-user-profile uses for its Swagger/AsyncAPI viewers.
@@ -313,7 +329,7 @@ func run() error {
 	// first fatal source to fire never blocks on a send nobody is receiving
 	// yet.
 	fatalErr := make(chan error, 1)
-	consumers, queueURLs, err := startConsumers(ctx, cfg, cache, invalidator, appLog, fatalErr)
+	consumers, receiveTrackers, err := startConsumers(ctx, cfg, cache, invalidator, appLog, fatalErr)
 	if err != nil {
 		cancelBackgroundWork()
 		appLog.Error("start consumers", map[string]interface{}{"error": err.Error()})
@@ -322,13 +338,13 @@ func run() error {
 
 	// Safety net for fatalErr: platform-events' sqsConsumer.Start() never
 	// returns an error for a persistently failing ReceiveMessage loop (IAM
-	// permissions revoked, queue deleted, etc.) — it logs
-	// sqs_receive_errors_total and retries forever internally, so fatalErr
-	// above would otherwise never fire for that failure mode. This watchdog
-	// polls that same counter (platform-events' own "alert when non-zero"
-	// metric) and treats staleAfter consecutive polls with no successful
-	// receive as stuck.
-	go runReceiveErrorWatchdog(ctx, gincommon.MetricsRegisterer(), queueURLs, 30*time.Second, 6, fatalErr, appLog)
+	// permissions revoked, queue deleted, etc.) — it logs and retries
+	// forever internally, so fatalErr above would otherwise never fire for
+	// that failure mode. Each consumer's SQS client is wrapped to record its
+	// own ReceiveMessage outcomes (receive_watchdog.go); the watchdog treats
+	// staleAfter consecutive polls with errors and no successful receive as
+	// stuck.
+	go runReceiveErrorWatchdog(ctx, receiveTrackers, 30*time.Second, 6, fatalErr, appLog)
 
 	// reportFatal is a non-blocking send — fatalErr is 1-buffered and only
 	// the first fatal source needs to win; a second concurrent failure
@@ -431,9 +447,40 @@ func run() error {
 	return grpccommon.Shutdown(appLog)
 }
 
+// observabilityDomain is this service's business domain in the Platform
+// Observability Registry — the domain label on every metric it emits.
+const observabilityDomain = "iam"
+
+// initLibraryMetrics registers platform-events' and platform-pgcommon's Tier 1
+// platform_* metrics on gincommon's registerer with the identity
+// ObservabilityMiddlewares resolved (gincommon.MetricsConstLabels), so all
+// three libraries report identical {domain, service, environment} labels.
+// MetricsRegisterer — never a LabeledRegisterer wrapper — because both
+// libraries inject the identity labels themselves. An invalid identity is an
+// error; a metric that cannot be registered is fail-soft and only logged.
+func initLibraryMetrics(log usecase.Logger) error {
+	labels := gincommon.MetricsConstLabels()
+	reg := gincommon.MetricsRegisterer()
+	evWarnings, err := events.InitMetrics(events.MetricsIdentityFromLabels(labels), reg)
+	if err != nil {
+		return fmt.Errorf("platform-events metrics: %w", err)
+	}
+	for _, w := range evWarnings {
+		log.Warn("platform-events metric disabled", map[string]interface{}{"metric": w.Metric, "error": w.Error()})
+	}
+	pgWarnings, err := pgmetrics.InitWithIdentity(pgmetrics.IdentityFromLabels(labels), reg)
+	if err != nil {
+		return fmt.Errorf("platform-pgcommon metrics: %w", err)
+	}
+	for _, w := range pgWarnings {
+		log.Warn("platform-pgcommon metric disabled", map[string]interface{}{"metric": w.Metric, "error": w.Error()})
+	}
+	return nil
+}
+
 // metricsScrapeHandler serves /metrics from gincommon's registerer — the
-// same registry ObservabilityMiddlewares, authz_* collectors, and
-// platform-events InitWithRegisterer write to. promhttp.Handler() always
+// same registry ObservabilityMiddlewares, iam_authz_enrichment_* collectors, and
+// platform-events / platform-pgcommon metrics write to. promhttp.Handler() always
 // scrapes prometheus.DefaultGatherer; after ObservabilityMiddlewares that
 // is the same registry, but scraping MetricsRegisterer() keeps this
 // listener correct if gincommon ever switches tests/prod onto an isolated
@@ -492,8 +539,9 @@ var (
 // startConsumers builds and starts the five §5 SQS consumers. A consumer
 // whose queue URL is unconfigured degrades to a no-op (idle) consumer rather
 // than failing startup — useful for partial local-dev setups. Also returns
-// the configured (non-idle) queues by name, for the receive-error watchdog.
-func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache, inv *usecase.Invalidator, appLog usecase.Logger, fatal chan<- error) ([]events.Consumer, map[string]string, error) {
+// a ReceiveMessage tracker per configured (non-idle) queue, by name, for the
+// receive-error watchdog.
+func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache, inv *usecase.Invalidator, appLog usecase.Logger, fatal chan<- error) ([]events.Consumer, map[string]*receiveTracker, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
 		return nil, nil, fmt.Errorf("load aws config: %w", err)
@@ -546,16 +594,21 @@ func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache,
 	}
 
 	consumers := make([]events.Consumer, 0, len(builders))
-	queueURLs := make(map[string]string, len(builders))
+	trackers := make(map[string]*receiveTracker, len(builders))
 	for _, b := range builders {
+		// Each consumer gets its own SQS client wrapper so the watchdog sees
+		// that consumer's ReceiveMessage outcomes and nothing else.
+		qDeps := deps
 		if b.queueURL != "" {
-			queueURLs[b.name] = b.queueURL
+			tr := &receiveTracker{}
+			trackers[b.name] = tr
+			qDeps.Client = receiveTrackingClient{SQSClientLike: sqsClient, tracker: tr}
 		}
 		// events.WithConcurrency sets how many messages this consumer hands
 		// to handler goroutines at once; the platform-events default is 1
 		// (fully serial per queue), which would bottleneck cache-eviction
 		// under a burst of events (e.g. a bulk department restructuring).
-		c, err := b.build(b.queueURL, deps, events.WithConcurrency(b.concurrency))
+		c, err := b.build(b.queueURL, qDeps, events.WithConcurrency(b.concurrency))
 		if err != nil {
 			return nil, nil, fmt.Errorf("build %s consumer: %w", b.name, err)
 		}
@@ -570,5 +623,5 @@ func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache,
 			}
 		}(b.name, c)
 	}
-	return consumers, queueURLs, nil
+	return consumers, trackers, nil
 }

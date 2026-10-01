@@ -33,11 +33,11 @@ check which specific pods are unhealthy and why.
 
 p99 `Check()` latency above 50ms for 5 minutes.
 
-1. Check `authz_i8_call_latency_seconds` / `authz_i12_call_latency_seconds` —
+1. Check `iam_authz_enrichment_i8_call_latency_seconds` / `iam_authz_enrichment_i12_call_latency_seconds` —
    is Org & Membership itself slow? If so, this is their incident, not this
    service's; `AuthzEnrichmentStaleIfErrorServing` should also be firing.
-2. Check the cache hit ratio (`rate(authz_cache_hits_total[5m]) /
-   rate(authz_cache_lookups_total[5m])`) — a sudden drop means more
+2. Check the cache hit ratio (`rate(iam_authz_enrichment_cache_hits_total[5m]) /
+   rate(iam_authz_enrichment_cache_lookups_total[5m])`) — a sudden drop means more
    requests are taking the slow (I-8 call) path. Correlate with a recent
    mass membership/tenant event (bulk import, tenant migration).
 3. Check Valkey directly (`valkey-cli --latency` from inside the cluster,
@@ -52,7 +52,7 @@ p99 `Check()` latency above 50ms for 5 minutes.
 
 ## Alert: `AuthzEnrichmentStaleIfErrorServing` (critical — page directly)
 
-`authz_stale_if_error_served_total` is increasing — §7's stale-if-error path
+`iam_authz_enrichment_stale_if_error_served_total` is increasing — §7's stale-if-error path
 is active *right now*. This means Valkey is reachable but Org & Membership
 is not (or vice versa isn't relevant here — stale-if-error specifically
 requires Valkey up + sibling down + a stale entry available).
@@ -142,8 +142,13 @@ visibility (the alerts above will fire again immediately if the cause is
 still present) and forces a fresh IAM/queue-config resolution.
 
 1. Check the `queue` field on the log line to identify which of the 5
-   queues is affected, then check the same `sqs_receive_errors_total{queue=...}`
-   metric this watchdog itself polls.
+   queues is affected (the watchdog tracks each consumer's own
+   `ReceiveMessage` results, so the log line is the per-queue signal). The
+   service-level metric is
+   `sum by (domain, service, environment) (rate(platform_dependency_request_seconds_count{service="iam-authz-enrichment",dependency="sqs",operation="receive_message",outcome="error"}[5m]))`
+   — it has **no** `queue` label, so it confirms receive errors but not
+   which queue (registry status: proposed). The pod's
+   `sqs: receive message failed` error logs carry the AWS error.
 2. Most likely cause: the queue was deleted, or this pod's IAM role/policy
    no longer grants `sqs:ReceiveMessage` on it (a permissions change is not
    fixed by restarting — fix the permission/queue, not the pod).

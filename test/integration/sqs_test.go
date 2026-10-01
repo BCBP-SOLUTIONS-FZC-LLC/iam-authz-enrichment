@@ -16,7 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/consumer"
@@ -89,7 +89,7 @@ func TestSQS_MembershipConsumer_EndToEnd(t *testing.T) {
 	defer func() { _ = c.Stop() }()
 
 	sendEnvelope(t, client, qURL, map[string]any{
-		"id": uuid.NewString(), "type": "DepartmentMembershipGranted", "tenant_id": tenant,
+		"id": uuid.NewString(), "type": "DepartmentMembershipGranted", "source": "iam-authz-enrichment-it", "tenant_id": tenant,
 		"time": time.Now().Format(time.RFC3339), "data": map[string]string{"user_id": user},
 	})
 
@@ -131,7 +131,7 @@ func TestSQS_DLQ_MessageMovesAfterMaxReceiveCount(t *testing.T) {
 	// TenderRestrictedPayload — so the handler always returns an error and
 	// the message is never deleted, forcing SQS's own redrive counting.
 	sendEnvelope(t, client, qURL, map[string]any{
-		"id": uuid.NewString(), "type": "TenderRestricted", "tenant_id": "it-dlq-tenant",
+		"id": uuid.NewString(), "type": "TenderRestricted", "source": "iam-authz-enrichment-it", "tenant_id": "it-dlq-tenant",
 		"time": time.Now().Format(time.RFC3339), "data": "not-an-object",
 	})
 

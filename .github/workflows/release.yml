@@ -5,15 +5,20 @@
 #
 # deploy-gate mirrors iam-user-profile's job of the same name, adapted for
 # this service having no HTTP business traffic: the health query uses
-# grpc_server_handled_total{status_class="5xx"} (emitted by
+# platform_grpc_server_handled_total{status_class="5xx"} (emitted by
 # platform-gincommon's gRPC interceptor chain) rather than
-# http_requests_total{status_class="5xx"}, which doesn't exist here.
+# platform_http_requests_total{status_class="5xx"}, which has no business
+# traffic here. It selects on the standard identity labels
+# {domain="iam", service="iam-authz-enrichment"} that every platform_* series
+# carries. metric_status: proposed — platform_grpc_server_handled_total is
+# still awaiting observability-governance ratification in the Platform
+# Observability Registry.
 # status_class="5xx" only fires on a genuine transport-level RPC failure
 # (panic, internal error) — internal/adapter/inbound/grpc/server.go's
 # Check() always returns a nil error for every Allow/Deny outcome (the
 # ext_authz convention: Deny is a successful RPC with a PERMISSION_DENIED
 # payload, not a failed one), so this metric is a clean deployment-health
-# signal, distinct from authz_deny_reason_total{reason="DENY_SERVICE_UNAVAILABLE"}
+# signal, distinct from iam_authz_enrichment_deny_reason_total{reason="DENY_SERVICE_UNAVAILABLE"}
 # (which reflects dependency health at that moment, not whether THIS
 # deployment is broken — a dependency outage unrelated to the rollout could
 # otherwise trigger a false-positive rollback).
@@ -359,7 +364,7 @@ jobs:
       # failure (panic, internal error) — Check() always returns a nil
       # error for every Allow/Deny outcome, so this is a clean
       # deployment-health signal (see this file's header comment for why
-      # it's deliberately not authz_deny_reason_total).
+      # it's deliberately not iam_authz_enrichment_deny_reason_total).
       - name: Health gate — error rate < 1% for 2 minutes
         run: |
           PROM_URL="${{ vars.PROMETHEUS_URL }}"
@@ -367,7 +372,8 @@ jobs:
             echo "PROMETHEUS_URL not set — skipping error-rate check"
             exit 0
           fi
-          QUERY='sum(rate(grpc_server_handled_total{job=~".*iam-authz-enrichment.*",status_class="5xx"}[2m]))/sum(rate(grpc_server_handled_total{job=~".*iam-authz-enrichment.*"}[2m]))'
+          # metric_status: proposed (platform_grpc_server_handled_total).
+          QUERY='sum(rate(platform_grpc_server_handled_total{domain="iam",service="iam-authz-enrichment",status_class="5xx"}[2m]))/sum(rate(platform_grpc_server_handled_total{domain="iam",service="iam-authz-enrichment"}[2m]))'
           # Sleep AFTER confirming Prometheus is configured so the 2-minute window
           # only runs when there is actually something to measure.
           sleep 120

@@ -137,7 +137,7 @@ iam-authz-enrichment/
 │   │       ├── valkey/                # Cache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed
 │   │       ├── orgmembership/         # HTTP client — I-8 memberships (Org & Membership), TAC-4/I-12 tender-acl (iam-tender-acl), I-14 mfa-freshness (Org & Membership)
 │   │       ├── postgres/              # platform-pgcommon DSN/pool config, Zap logger adapter, OTel tracer — no live pool (HLD §5.4)
-│   │       └── metrics/               # Prometheus authz_* series (§10)
+│   │       └── metrics/               # Prometheus iam_authz_enrichment_* series (§10)
 │   └── config/                        # Load() — env vars only, no hot-reload (§11)
 ├── docs/
 │   ├── lld/iam-lld-authz-enrichment.md  # Low-Level Design — precedence chain, cache-key table, §16 AE-# register
@@ -259,7 +259,7 @@ make docker-up   # start Valkey + floci (SQS) + floci-ui — scripts/init-floci.
 make run         # go run ./cmd/server
 ```
 
-`/healthz`, `/readyz` are served on `APP_PORT` (default `8080`); `/metrics` is served separately on `METRICS_PORT` (default `9090`); the `ext_authz` gRPC service listens on `GRPC_PORT` (default `9091`). `/asyncapi` (HTML event-contract viewer) and `/asyncapi.yaml` (raw spec) are also on `APP_PORT` — always on outside `APP_ENV=production`, opt-in in production via `DOCS_ENABLED` — try `http://localhost:8080/asyncapi` after `make run`.
+`/healthz`, `/readyz` are served on `APP_PORT` (default `8080`); `/metrics` is served separately on `METRICS_PORT` (default `9090`); the `ext_authz` gRPC service listens on `GRPC_PORT` (default `9091`). `/asyncapi` (HTML event-contract viewer) and `/asyncapi.yaml` (raw spec) are also on `APP_PORT` — always on outside `APP_ENV=prod`, opt-in in production via `DOCS_ENABLED` — try `http://localhost:8080/asyncapi` after `make run`.
 
 ### Common commands
 
@@ -278,7 +278,7 @@ make ci                 # the full local gate: tidy + fmt-check + vet + lint + a
 
 ### Exercising the gRPC API locally
 
-There's no REST API, so there's no Swagger UI — the direct analogs for a gRPC-only service are **`grpcurl`** (curl-equivalent) and **`grpcui`** (a literal Swagger-UI-style browser form), both driven by gRPC server reflection. Reflection is registered whenever `APP_ENV != production` (same non-prod-only convention `iam-user-profile` uses for its Swagger/AsyncAPI viewers) — see `cmd/server/main.go`.
+There's no REST API, so there's no Swagger UI — the direct analogs for a gRPC-only service are **`grpcurl`** (curl-equivalent) and **`grpcui`** (a literal Swagger-UI-style browser form), both driven by gRPC server reflection. Reflection is registered whenever `APP_ENV != prod` (same non-prod-only convention `iam-user-profile` uses for its Swagger/AsyncAPI viewers) — see `cmd/server/main.go`.
 
 ```sh
 go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
@@ -548,9 +548,11 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 
 | Variable | Default | Notes |
 |----------|---------|-------|
+| `APP_ENV` | `dev` | One of `local`, `dev`, `test`, `staging`, `prod` (Enterprise Platform Observability Standard; `production`/`development` fail startup). It is the `environment` label on every metric |
+| `OBSERVABILITY_DOMAIN` | `iam` | Registry domain for the `{domain, service, environment}` metric labels; `cmd/server` also sets `iam` explicitly |
 | `APP_PORT` / `METRICS_PORT` / `GRPC_PORT` | `8080` / `9090` / `9091` | HTTP (health only), metrics (`/metrics`, separate listener), and gRPC (`ext_authz`) listen ports |
 | `VALKEY_URL` | `localhost:6379` | `.env-example` recommends `localhost:6384` for local dev (matches `docker-compose.yml`'s host-mapped port so it doesn't collide with a system-wide Redis/Valkey on the default port); `rediss://` for TLS in-transit in prod/staging |
-| `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=production`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled |
+| `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=prod`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled |
 | `AE_CTX_TTL` / `AE_CTX_JITTER` | `60s` / `6s` | §4.1 — desyncs expiry across replicas |
 | `AE_TENDER_ACL_TTL` / `AE_NEG_TTL` | `15s` / `5s` | Half the sibling's own TTL / negative-cache storm collapse |
 | `AE_RESTRICTED_NEG_TTL` / `AE_REALM_NEG_TTL` | `5s` each | L1 negative-cache TTLs for `RestrictedTenderSet`/`RealmMap` — separate from `AE_NEG_TTL` since each bounds a distinct security-propagation delay (how fast a replica notices another replica's write), not a shared performance knob |

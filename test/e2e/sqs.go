@@ -37,6 +37,7 @@ func sendEvent(t *testing.T, queueName, eventType, tenant string, data any) {
 	body, err := json.Marshal(map[string]any{
 		"id":        uuid.NewString(),
 		"type":      eventType,
+		"source":    "iam-authz-enrichment-e2e",
 		"tenant_id": tenant,
 		"time":      time.Now().UTC().Format(time.RFC3339),
 		"data":      data,

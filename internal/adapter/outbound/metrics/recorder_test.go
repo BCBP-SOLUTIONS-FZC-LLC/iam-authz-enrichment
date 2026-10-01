@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/obsregistry"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
@@ -57,7 +58,7 @@ func TestNew_RegistersOnExplicitRegisterer(t *testing.T) {
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
-	assert.NotEmpty(t, mfs, "authz_* metrics should be registered on the explicit registerer")
+	assert.NotEmpty(t, mfs, "iam_authz_enrichment_* metrics should be registered on the explicit registerer")
 }
 
 func TestNew_AppliesGincommonConstLabels(t *testing.T) {
@@ -67,10 +68,15 @@ func TestNew_AppliesGincommonConstLabels(t *testing.T) {
 	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
 		ServiceName:  "iam-authz-enrichment",
 		BuildVersion: "test",
+		Domain:       "iam",
+		Environment:  "test",
 	})
 	want := gincommon.MetricsConstLabels()
 	require.Equal(t, "iam-authz-enrichment", want["service"])
-	require.Equal(t, "test", want["version"])
+	require.Equal(t, "iam", want["domain"])
+	require.Equal(t, "test", want["environment"])
+	_, hasVersion := want["version"]
+	require.False(t, hasVersion, "version is only on platform_build_info, never a const label")
 	require.Equal(t, want, gincommonLabels())
 	require.Equal(t, want, constLabelsOrNil(want))
 
@@ -83,7 +89,7 @@ func TestNew_AppliesGincommonConstLabels(t *testing.T) {
 
 	var found bool
 	for _, mf := range mfs {
-		if mf.GetName() != "authz_decisions_total" {
+		if mf.GetName() != "iam_authz_enrichment_decisions_total" {
 			continue
 		}
 		found = true
@@ -93,9 +99,20 @@ func TestNew_AppliesGincommonConstLabels(t *testing.T) {
 			labels[l.GetName()] = l.GetValue()
 		}
 		assert.Equal(t, want["service"], labels["service"])
-		assert.Equal(t, want["version"], labels["version"])
+		assert.Equal(t, want["domain"], labels["domain"])
+		assert.Equal(t, want["environment"], labels["environment"])
+		assert.NotContains(t, labels, "version")
 	}
-	assert.True(t, found, "authz_decisions_total must be gathered from the isolated registerer")
+	assert.True(t, found, "iam_authz_enrichment_decisions_total must be gathered from the isolated registerer")
+
+	// Enterprise Platform Observability Standard: every service metric is
+	// named iam_authz_enrichment_* (Tier 3) and carries the identity labels.
+	rep, err := obsregistry.Validate(reg, obsregistry.Options{})
+	require.NoError(t, err)
+	for _, f := range rep.Errors() {
+		t.Errorf("observability standard violation: %v", f)
+	}
+	assert.Equal(t, "iam_authz_enrichment_", obsregistry.ServicePrefix("iam", "iam-authz-enrichment"))
 }
 
 func TestObserveDecision_Allow(t *testing.T) {

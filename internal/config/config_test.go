@@ -341,7 +341,7 @@ func TestLoad_InvalidRealmTenantMapSeed_JSON(t *testing.T) {
 // request that isn't a cache hit.
 func TestLoad_OrgMembershipDevDefault_FailsOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	// ORG_MEMBERSHIP_BASE_URL left unset — resolves to the dev default.
 
 	_, err := config.Load()
@@ -368,7 +368,7 @@ func TestLoad_OrgMembershipDevDefault_AllowedInDev(t *testing.T) {
 // deployment must not be blocked by this validation.
 func TestLoad_OrgMembershipOverridden_PassesOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
 	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8080")
 	setRequiredQueueURLs(t)
@@ -391,7 +391,7 @@ func setRequiredQueueURLs(t *testing.T) {
 
 func TestLoad_QueueURLRequiredOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
 	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8080")
 	t.Setenv("MEMBERSHIP_AUTHZ_QUEUE_URL", "http://q/membership")
@@ -446,7 +446,7 @@ func TestLoad_DuplicateQueueURL_BlanksExempt(t *testing.T) {
 
 func TestLoad_TenderACLDevDefault_FailsOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	// ORG_MEMBERSHIP_BASE_URL must be overridden too, or that check fires
 	// first and this test would be asserting the wrong error message.
 	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")

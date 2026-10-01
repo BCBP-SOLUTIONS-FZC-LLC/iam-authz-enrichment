@@ -23,8 +23,8 @@ import (
 // exposed as a hits/lookups counter pair rather than a single ratio gauge —
 // computing a ratio metric server-side and exposing it as a gauge is a
 // well-known Prometheus anti-pattern (it can't be aggregated correctly
-// across replicas or time windows); `rate(authz_cache_hits_total[5m]) /
-// rate(authz_cache_lookups_total[5m])` in PromQL is the correct way to get
+// across replicas or time windows); `rate(iam_authz_enrichment_cache_hits_total[5m]) /
+// rate(iam_authz_enrichment_cache_lookups_total[5m])` in PromQL is the correct way to get
 // the ratio the doc names.
 type Recorder struct {
 	decisionsTotal   *prometheus.CounterVec
@@ -41,13 +41,13 @@ type Recorder struct {
 	i14Latency       prometheus.Histogram
 }
 
-// New builds and registers all authz_* metrics on reg — the same registry
+// New builds and registers all iam_authz_enrichment_* metrics on reg — the same registry
 // cmd/server's dedicated /metrics listener scrapes via gincommon.MetricsRegisterer().
 // reg is optional (variadic so every existing zero-arg call site keeps
 // compiling) and defaults to prometheus.DefaultRegisterer; cmd/server
 // passes gincommon.MetricsRegisterer() AFTER ObservabilityMiddlewares has
 // run, so these collectors land in the same registry and pick up the same
-// {service, version} const labels as platform-gincommon's own HTTP/gRPC
+// {domain, service, environment} const labels as platform-gincommon's own HTTP/gRPC
 // series (same convention as iam-org-membership / iam-user-profile).
 func New(reg ...prometheus.Registerer) *Recorder {
 	registerer := prometheus.DefaultRegisterer
@@ -57,8 +57,8 @@ func New(reg ...prometheus.Registerer) *Recorder {
 	return newRecorder(registerer)
 }
 
-// gincommonLabels returns a copy of gincommon's {service, version} const
-// labels so authz_* collectors scrape on the same registry and labels as
+// gincommonLabels returns a copy of gincommon's {domain, service, environment} const
+// labels so iam_authz_enrichment_* collectors scrape on the same registry and labels as
 // HTTP/gRPC interceptor metrics. Returns nil when ObservabilityMiddlewares
 // has not run yet, matching prometheus's "no const labels" zero value so
 // unit tests that never bootstrap gincommon still register cleanly.
@@ -73,7 +73,7 @@ func constLabelsOrNil(labels prometheus.Labels) prometheus.Labels {
 	return labels
 }
 
-// newRecorder builds and registers all authz_* metrics on reg. Factored out
+// newRecorder builds and registers all iam_authz_enrichment_* metrics on reg. Factored out
 // from New() so tests can pass an isolated prometheus.NewRegistry() instead
 // of colliding on the process-wide default registry when multiple tests (or
 // test files) each want their own Recorder.
@@ -82,65 +82,65 @@ func newRecorder(reg prometheus.Registerer) *Recorder {
 	labels := gincommonLabels()
 	return &Recorder{
 		decisionsTotal: f.NewCounterVec(prometheus.CounterOpts{
-			Name:        "authz_decisions_total",
+			Name:        "iam_authz_enrichment_decisions_total",
 			Help:        "Total ext_authz decisions, by decision (allow/deny).",
 			ConstLabels: labels,
 		}, []string{"decision"}),
 		denyReasonTotal: f.NewCounterVec(prometheus.CounterOpts{
-			Name:        "authz_deny_reason_total",
+			Name:        "iam_authz_enrichment_deny_reason_total",
 			Help:        "Total deny decisions, by DenyReason.",
 			ConstLabels: labels,
 		}, []string{"reason"}),
 		decisionLatency: f.NewHistogram(prometheus.HistogramOpts{
-			Name:        "authz_decision_latency_seconds",
+			Name:        "iam_authz_enrichment_decision_latency_seconds",
 			Help:        "End-to-end Check() decision latency.",
 			Buckets:     prometheus.ExponentialBuckets(0.0005, 2, 16), // 0.5ms .. ~16s
 			ConstLabels: labels,
 		}),
 		cacheLookups: f.NewCounter(prometheus.CounterOpts{
-			Name:        "authz_cache_lookups_total",
-			Help:        "Total ae:ctx/ae:tenant lookups. Divide authz_cache_hits_total by this for the hit ratio.",
+			Name:        "iam_authz_enrichment_cache_lookups_total",
+			Help:        "Total ae:ctx/ae:tenant lookups. Divide iam_authz_enrichment_cache_hits_total by this for the hit ratio.",
 			ConstLabels: labels,
 		}),
 		cacheHits: f.NewCounter(prometheus.CounterOpts{
-			Name:        "authz_cache_hits_total",
+			Name:        "iam_authz_enrichment_cache_hits_total",
 			Help:        "ae:ctx/ae:tenant lookups that were a fresh hit.",
 			ConstLabels: labels,
 		}),
 		negCacheLookups: f.NewCounter(prometheus.CounterOpts{
-			Name:        "authz_negative_cache_lookups_total",
+			Name:        "iam_authz_enrichment_negative_cache_lookups_total",
 			Help:        "Total ae:neg lookups.",
 			ConstLabels: labels,
 		}),
 		negCacheHits: f.NewCounter(prometheus.CounterOpts{
-			Name:        "authz_negative_cache_hits_total",
+			Name:        "iam_authz_enrichment_negative_cache_hits_total",
 			Help:        "ae:neg lookups that hit.",
 			ConstLabels: labels,
 		}),
 		staleServedTotal: f.NewCounter(prometheus.CounterOpts{
-			Name:        "authz_stale_if_error_served_total",
+			Name:        "iam_authz_enrichment_stale_if_error_served_total",
 			Help:        "Requests served from a stale ae:ctx entry under §7's stale-if-error rule. A nonzero rate means a live dependency outage is in progress — page on this.",
 			ConstLabels: labels,
 		}),
 		sfCoalescedTotal: f.NewCounter(prometheus.CounterOpts{
-			Name:        "authz_singleflight_coalesced_total",
+			Name:        "iam_authz_enrichment_singleflight_coalesced_total",
 			Help:        "Membership-rebuild calls coalesced by singleflight instead of issued.",
 			ConstLabels: labels,
 		}),
 		i8Latency: f.NewHistogram(prometheus.HistogramOpts{
-			Name:        "authz_i8_call_latency_seconds",
+			Name:        "iam_authz_enrichment_i8_call_latency_seconds",
 			Help:        "Org & Membership membership-rebuild (I-8) call latency.",
 			Buckets:     prometheus.ExponentialBuckets(0.0005, 2, 16),
 			ConstLabels: labels,
 		}),
 		i12Latency: f.NewHistogram(prometheus.HistogramOpts{
-			Name:        "authz_i12_call_latency_seconds",
+			Name:        "iam_authz_enrichment_i12_call_latency_seconds",
 			Help:        "iam-tender-acl TAC-4 (formerly Org & Membership's I-12) tender-ACL call latency.",
 			Buckets:     prometheus.ExponentialBuckets(0.0005, 2, 16),
 			ConstLabels: labels,
 		}),
 		i14Latency: f.NewHistogram(prometheus.HistogramOpts{
-			Name:        "authz_i14_call_latency_seconds",
+			Name:        "iam_authz_enrichment_i14_call_latency_seconds",
 			Help:        "Org & Membership MFA-freshness (I-14) call latency.",
 			Buckets:     prometheus.ExponentialBuckets(0.0005, 2, 16),
 			ConstLabels: labels,

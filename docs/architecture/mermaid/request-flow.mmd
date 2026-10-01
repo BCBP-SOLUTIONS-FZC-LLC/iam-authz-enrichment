@@ -48,7 +48,7 @@ sequenceDiagram
                         Checker ->> Checker: DecideDependencyOutcome (§7)
                         alt Valkey reachable and a Stale entry exists
                             Checker ->> Checker: serve the Stale entry
-                            Note over Checker: authz_stale_if_error_served_total++ —<br/>nonzero rate should page (§10)
+                            Note over Checker: iam_authz_enrichment_stale_if_error_served_total++ —<br/>nonzero rate should page (§10)
                         else nothing to fall back on
                             Checker -->> Server: Denied — DENY_SERVICE_UNAVAILABLE (503)
                             Note over Checker,Server: 5xx, not 403 — distinguishes a degraded<br/>authz system from a genuine not-authorized answer (§9)

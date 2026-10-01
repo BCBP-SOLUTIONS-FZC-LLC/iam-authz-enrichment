@@ -26,7 +26,7 @@ spec:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
     {{- if .Values.autoscaling.targetDecisionsPerSecondPerReplica }}
-    # Decision-rate scaling: every Check() call increments authz_decisions_total
+    # Decision-rate scaling: every Check() call increments iam_authz_enrichment_decisions_total
     # exactly once, so this is a direct per-pod load signal — not an
     # approximation the way a generic HTTP request counter would be for a
     # multi-endpoint service.
@@ -37,7 +37,7 @@ spec:
     - type: Pods
       pods:
         metric:
-          name: authz_decisions_per_second
+          name: iam_authz_enrichment_decisions_per_second
         target:
           type: AverageValue
           averageValue: {{ .Values.autoscaling.targetDecisionsPerSecondPerReplica }}

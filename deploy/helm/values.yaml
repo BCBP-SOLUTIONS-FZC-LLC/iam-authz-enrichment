@@ -39,7 +39,7 @@ autoscaling:
   maxReplicas: 20
   targetCPUUtilizationPercentage: 70
   targetMemoryUtilizationPercentage: 75
-  # RPS-equivalent: every Check() call produces exactly one authz_decisions_total
+  # RPS-equivalent: every Check() call produces exactly one iam_authz_enrichment_decisions_total
   # increment, so this is a direct per-pod decision-rate target, not an
   # approximation the way a generic HTTP request counter would be.
   targetDecisionsPerSecondPerReplica: 500
@@ -53,7 +53,13 @@ resources:
     memory: "256Mi"
 
 env:
-  APP_ENV: "production"
+  # Enterprise Platform Observability Standard environment vocabulary:
+  # local | dev | test | staging | prod (no aliases — "production" fails
+  # startup). It is the environment label on every metric.
+  APP_ENV: "prod"
+  # Registry domain for the {domain, service, environment} metric labels.
+  # cmd/server also sets it explicitly; this is the documented fallback.
+  OBSERVABILITY_DOMAIN: "iam"
   APP_PORT: "8080"
   METRICS_PORT: "9090"
   GRPC_PORT: "9091"
