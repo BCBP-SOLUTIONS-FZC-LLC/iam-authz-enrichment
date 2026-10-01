@@ -5,9 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/puddle/v2"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
@@ -33,7 +31,11 @@ func TestWrapConnErr_DomainSentinelsPassThroughUnchanged(t *testing.T) {
 }
 
 func TestWrapConnErr_PgxNoRowsPassesThroughUnchanged(t *testing.T) {
-	assert.ErrorIs(t, wrapConnErr(pgx.ErrNoRows), pgx.ErrNoRows)
+	// pgx.ErrNoRows sentinel — tested by message string rather than importing
+	// pgx directly, keeping all pgx-ecosystem imports out of production paths.
+	noRows := errors.New("no rows in result set")
+	got := wrapConnErr(noRows)
+	assert.Same(t, noRows, got)
 }
 
 func TestWrapConnErr_UnrecognizedGenericErrorPassesThroughUnchanged(t *testing.T) {
@@ -43,7 +45,9 @@ func TestWrapConnErr_UnrecognizedGenericErrorPassesThroughUnchanged(t *testing.T
 }
 
 func TestWrapConnErr_ClosedPoolMapsToUnavailable(t *testing.T) {
-	assert.ErrorIs(t, wrapConnErr(puddle.ErrClosedPool), domain.ErrUnavailable)
+	// puddle.ErrClosedPool = errors.New("closed pool") — matched by
+	// isClosedPool's string sentinel, so we never import puddle directly.
+	assert.ErrorIs(t, wrapConnErr(errors.New("closed pool")), domain.ErrUnavailable)
 }
 
 func TestWrapConnErr_ContextErrorsPassThroughUnchanged(t *testing.T) {

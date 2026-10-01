@@ -228,7 +228,7 @@ The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) �
 | `TenantSubscriptionCancelled` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
 | `TenantReactivated` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
 
-**`tenant-authz-q`** (Realm Provisioner, 2 event types) — keep the in-process realm→tenant map fresh for JWT-issuer-based tenant resolution (LLD §8.3); both must be wired, since a direct-paid-signup tenant fires only the second one:
+**`tenant-authz-q`** (Realm Provisioner, 2 event types) — keep the in-process realm→tenant map fresh for JWT-issuer-based tenant resolution (LLD §8.3); both must be wired. The Realm Provisioner always co-emits both events (RP-2 direct-paid signup and RP-3 trial→dedicated conversion each emit `TenantRealmReady` followed by `TenantConverted` in the same outbox transaction). The SNS subscription filter for this queue **must include both** `EventType` values — omitting `TenantRealmReady` leaves `HandleTenantRealmReady` as dead code and breaks any future provisioning path that may emit it without a co-emitted `TenantConverted`:
 
 | Event type | Consumed field(s) | Effect |
 |---|---|---|
@@ -240,6 +240,55 @@ The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) �
 | Event type | Consumed field(s) | Effect |
 |---|---|---|
 | `TenderRestricted` | `tender_id` | Mark `(tenant, tender_id)` restricted in the in-process `RestrictedTenderSet` — the §3.1 step-4 tender-ACL overlay only calls out to TAC-4 for a tender this set marks restricted |
+
+---
+
+## Cross-service dependencies
+
+### 1. Synchronous outbound calls (this service → other services)
+
+Every `Authorization.Check` traverses the §3.1 precedence chain. Not every call reaches every dependency — the table below shows when each is hit:
+
+| Dependency | When called | Adapter package | Posture | On failure |
+|---|---|---|---|---|
+| **Valkey** | Every `Check()` — cache read (`ae:ctx`, `ae:tenant`) | `outbound/valkey/` | soft — bypass | Call Org & Membership directly for this request; a Valkey miss is not an error |
+| **Org & Membership** (`ORG_MEMBERSHIP_BASE_URL`) | Cache miss or Valkey unavailable — I-8 membership rebuild | `outbound/orgmembership/` | stale-if-error, capped 5 min | Stale `ae:ctx`/`ae:tenant` entry present → serve it (§7 row 2). No stale entry → `DENY_SERVICE_UNAVAILABLE` (§7 row 3) |
+| **Org & Membership** (`ORG_MEMBERSHIP_BASE_URL`) | Approver-gated requests only — I-14 MFA-freshness | `outbound/orgmembership/` | fail-closed | `DENY_MFA_STALE` — **never cached**; a sibling outage on this check is treated as "can't confirm freshness", not "service unavailable" |
+| **iam-tender-acl** (`TENDER_ACL_BASE_URL`) | Restricted tender-scoped requests only — TAC-4 tender-ACL | `outbound/orgmembership/` | fail-closed, overlay only | `DENY_TENDER_ACL_INSUFFICIENT` — never escalates to `DENY_SERVICE_UNAVAILABLE`; does not affect non-tender aspects of the same request |
+
+The common path at 95%+ cache-hit rate hits **Valkey only** — no synchronous sibling call at all.
+
+`mfa_freshness_seconds` is a **hard security invariant**: it is never written into `ae:ctx` or any other Valkey key. A code path that folds it into a cached envelope is a security regression, not a performance optimization — there is a dedicated regression test for this.
+
+### 2. Inbound callers (other services → this service)
+
+| Caller | Interface | Purpose |
+|---|---|---|
+| **Envoy** | gRPC `envoy.service.auth.v3.Authorization/Check` | The sole inbound interface — called on every authenticated request the gateway proxies. Envoy's `jwt_authn` validates the JWT first; this service reads only the already-validated metadata (`MetadataContext`), never raw headers |
+
+No other service calls this service directly. There is no REST or HTTP business API.
+
+### 3. Async event dependencies
+
+**Events this service consumes** (cache-invalidation only — no domain state of its own is mutated, nothing is published):
+
+| Queue | Producer | Event types | Action |
+|---|---|---|---|
+| `membership-authz-q` | Org & Membership | `DepartmentMembershipGranted`, `DepartmentMembershipRevoked`, `DepartmentMembershipLevelChanged`, `TenantRoleGranted`, `TenantRoleRevoked`, `MembershipRevoked` | Evict `ae:ctx`/`ae:neg` for the user; `MembershipRevoked` additionally performs a best-effort eviction of all `ae:tender_acl:{tenant}:*:{user}` entries — the whole-membership-removal cascade signal (LLD §16 AE-20) |
+| `user-authz-q` | User Profile (`iam-user-profile`) | `UserUpdated`, `UserAvailabilityChanged`, `UserDeleted` | Evict `ae:ctx`/`ae:neg`; `UserUpdated` only evicts if `"email"` appears in `changed_fields`; `UserDeleted` also evicts all `ae:tender_acl` entries for the user |
+| `billing-authz-q` | Billing Service | `TenantPlanChanged`, `TenantSubscriptionCancelled`, `TenantReactivated` | Evict `ae:tenant:{tenant}` — no payload decode beyond the envelope's `tenant_id` |
+| `tenant-authz-q` | Realm Provisioner | `TenantConverted`, `TenantRealmReady` | Update in-process realm→tenant map; `TenantConverted` also evicts `ae:tenant:{tenant}` (realm strategy changed) |
+| `tender-authz-q` | Tender Service | `TenderRestricted` | Mark `(tenant, tender_id)` restricted in in-process `RestrictedTenderSet` — gates whether TAC-4 is called on subsequent tender-scoped `Check()` calls |
+
+**Events this service produces:** **None.** This service is a pure consumer. `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner` are never called (HLD §5.4 / EVT-2). The full machine-readable consumer contract is [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `GET /asyncapi`.
+
+### 4. Infrastructure dependencies
+
+| System | Role |
+|---|---|
+| **Valkey** (Redis-compatible) | The only persistent-ish state this service touches — `ae:ctx`, `ae:tenant`, `ae:tender_acl`, `ae:neg`, `ae:processed` cache keys; no database, no ORM, no migrations |
+| **AWS SQS** (5 queues + 5 DLQs) | `membership-authz-q`, `user-authz-q`, `billing-authz-q`, `tenant-authz-q`, `tender-authz-q`; DLQ via SQS-native `maxReceiveCount=5` redrive — no application-layer DLQ code; a DLQ'd message degrades to a stale cache entry until its TTL expires, not a correctness failure |
+| **Envoy** (inbound only) | The API gateway / service mesh proxy — the sole caller of `Authorization.Check`. `jwt_authn` validates JWTs upstream; this service reads only Envoy-injected `MetadataContext`, never raw headers |
 
 ---
 
@@ -273,7 +322,9 @@ make test-e2e         # real binary over a real gRPC connection (requires make b
 make lint              # golangci-lint
 make arch-lint          # enforce .go-arch-lint.yml component boundaries
 make cover              # coverage profile + open HTML report
-make ci                 # the full local gate: tidy + fmt-check + vet + lint + arch-lint + test-ci + build
+make ci                 # the full local gate: tidy + fmt-check + vet + lint + arch-lint + observability-lint + database-lint + test-ci + build
+make observability-lint # enforce all logs/metrics/traces pass through platform-gincommon only
+make database-lint      # enforce all DB connections/config/ops pass through platform-pgcommon only
 ```
 
 ### Exercising the gRPC API locally
@@ -549,16 +600,17 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `APP_PORT` / `METRICS_PORT` / `GRPC_PORT` | `8080` / `9090` / `9091` | HTTP (health only), metrics (`/metrics`, separate listener), and gRPC (`ext_authz`) listen ports |
-| `VALKEY_URL` | `localhost:6379` | `.env-example` recommends `localhost:6384` for local dev (matches `docker-compose.yml`'s host-mapped port so it doesn't collide with a system-wide Redis/Valkey on the default port); `rediss://` for TLS in-transit in prod/staging |
-| `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=production`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled |
+| `VALKEY_URL` | `localhost:6379` | `.env-example` recommends `localhost:6384` for local dev; **must use `rediss://` scheme (TLS) outside `APP_ENV=dev`** — startup fails fast on a plaintext URL in non-dev, since the cache holds authorization context |
+| `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=production`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled; startup warns when `DOCS_ENABLED=true` in production without `DOCS_AUTH_TOKEN` |
 | `AE_CTX_TTL` / `AE_CTX_JITTER` | `60s` / `6s` | §4.1 — desyncs expiry across replicas |
 | `AE_TENDER_ACL_TTL` / `AE_NEG_TTL` | `15s` / `5s` | Half the sibling's own TTL / negative-cache storm collapse |
 | `AE_RESTRICTED_NEG_TTL` / `AE_REALM_NEG_TTL` | `5s` each | L1 negative-cache TTLs for `RestrictedTenderSet`/`RealmMap` — separate from `AE_NEG_TTL` since each bounds a distinct security-propagation delay (how fast a replica notices another replica's write), not a shared performance knob |
+| `AE_PROCESSED_EVENT_TTL` | `192h` (8 days) | PE-1: must be strictly > 7-day SQS message lifetime to guarantee redelivered messages are still recognized as processed |
 | `AE_STALE_IF_ERROR_MAX_AGE` | `5m` | Hard-capped at 5m regardless of configured value (§7) |
 | `ORG_MEMBERSHIP_BASE_URL` / `_TIMEOUT` | `http://localhost:8081` / `10ms` | I-8/I-14. Aggressive timeout — headroom inside the 15ms p99 budget |
 | `TENDER_ACL_BASE_URL` / `TENDER_ACL_TIMEOUT` | `http://localhost:8086` / `20ms` | TAC-4 (formerly I-12) against iam-tender-acl, ADR-0007 Wave 3 Phase 4 — sized against that service's own 5ms-hit/20ms-miss SLO, not reused from `ORG_MEMBERSHIP_TIMEOUT` |
-| `SHARED_REALM_ISSUER` | _(empty)_ | Keycloak issuer for the shared trial realm |
-| `REALM_TENANT_MAP_SEED` | `{}` | Startup-only JSON seed for dedicated realms; kept fresh at runtime by events, never re-read |
+| `SHARED_REALM_ISSUER` | _(empty)_ | Keycloak issuer for the shared trial realm. **At least one of `SHARED_REALM_ISSUER` or `REALM_TENANT_MAP_SEED` must be set outside `APP_ENV=dev`** — both empty causes a startup failure (every request would silently return `DENY_MALFORMED_IDENTITY`) |
+| `REALM_TENANT_MAP_SEED` | `{}` | Startup-only JSON `{"realm": "tenant_id"}` seed for dedicated realms; kept fresh at runtime by `tenant-authz-q` events, never re-read after startup |
 | `JWT_METADATA_NAMESPACE` / `JWT_PAYLOAD_KEY` | `envoy.filters.http.jwt_authn` / `trial` | Must match the Envoy `jwt_authn` filter config |
 | `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups (`APP_ENV=dev` only — required, and must be pairwise distinct, outside dev; `config.Load()` fails fast otherwise) |
 | `*_AUTHZ_QUEUE_CONCURRENCY` (5 vars) | `4` each | `events.WithConcurrency` per queue — messages handed to handler goroutines at once, instead of `platform-events`' library default of `1` (fully serial per queue) |
@@ -568,7 +620,14 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `GRPC_MAX_RECV_MSG_SIZE_BYTES` / `_SEND_` | `262144` (256KiB) | Defense-in-depth, not a real operating limit — `CheckRequest`/`CheckResponse` are small |
 | `GRPC_TLS_CERT_FILE` / `_KEY_FILE` / `_CLIENT_CA_FILE` | _(empty → plaintext)_ | App-level TLS/mTLS for deployments with no service-mesh sidecar or CNI-level encryption — see § Security |
 
-Startup fails fast (not silently) if `ORG_MEMBERSHIP_BASE_URL` or `TENDER_ACL_BASE_URL` is left at its local-dev default (`http://localhost:8081` / `http://localhost:8086`) outside `APP_ENV=dev` — see `docs/runbook.md`.
+Startup fails fast (not silently) on all of the following outside `APP_ENV=dev`:
+- `ORG_MEMBERSHIP_BASE_URL` or `TENDER_ACL_BASE_URL` left at its local-dev default
+- `VALKEY_URL` without `rediss://` scheme (authorization context must be encrypted in transit)
+- Both `SHARED_REALM_ISSUER` and `REALM_TENANT_MAP_SEED` empty (no tenant-resolution path)
+- Any of the five `*_AUTHZ_QUEUE_URL` vars blank
+- Any two queue URLs set to the same value
+
+See `docs/runbook.md` for startup-failure troubleshooting.
 
 ---
 

@@ -8,6 +8,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Security
+
+- **Valkey TLS enforcement**: `VALKEY_URL` must now use the `rediss://` scheme (TLS in transit) when `APP_ENV` is not `dev`. A plaintext URL fails startup with a clear error — authorization context cached in Valkey must be encrypted in transit in staging/production.
+- **`SHARED_REALM_ISSUER` + `REALM_TENANT_MAP_SEED` both empty outside dev** now fails startup with an error (previously only logged a warning). Both empty means no tenant-resolution path — every request would silently return `DENY_MALFORMED_IDENTITY` with no observable difference from a real authz denial.
+- **`DOCS_AUTH_TOKEN` warning**: a startup warning is now logged when `DOCS_ENABLED=true` in production without `DOCS_AUTH_TOKEN`, making the unauthenticated `/asyncapi` exposure visible immediately at deploy time.
+
+### Fixed
+
+- **`AE_PROCESSED_EVENT_TTL` default corrected** from 168h (7 days, at-boundary with SQS lifetime) to 192h (8 days, strictly greater per PE-1), matching iam-user-profile / iam-org-membership. A message delivered on day 6 and redelivered on day 7 was at risk of being re-processed after the old TTL expired.
+- **`internal/adapter/outbound/postgres/wrap.go`**: removed direct `"github.com/jackc/puddle/v2"` import; replaced `errors.Is(err, puddle.ErrClosedPool)` with a string-sentinel helper `isClosedPool()` — all pgx-ecosystem imports now stay inside platform-pgcommon.
+- **`api/asyncapi.yaml` spec correction**: three locations incorrectly claimed that Realm Provisioner's RP-2 direct-paid signup emits "only TenantRealmReady, never TenantConverted". RP-2 always co-emits both; the spec, channel description, and message summary are corrected. `internal/usecase/invalidate.go` and `README.md` carry the same correction.
+- **`deploy/helm/values.yaml` improvements**: `TENDER_ACL_BASE_URL` comment adds explicit REQUIRED warning and consequence; queue URLs block comment corrected from "blank fails startup" (wrong — consumers start idle) to a per-queue impact table.
+
+### Added
+
+- **`make observability-lint`** (`check-observability-routing.sh`): CI enforcement that all logs, metrics, and traces pass through `platform-gincommon` only. Wired into `make ci` and `validate-quality.yml`.
+- **`make database-lint`** (`check-database-routing.sh`): CI enforcement that all DB connections, configuration, and operations pass through `platform-pgcommon` only — including the HLD §5.4 invariant that `cmd/server` never calls `OpenPool`/migrate/outbox. Wired into `make ci` and `validate-quality.yml`.
+- **`validate-quality.yml` tidy drift check**: `go mod tidy` is now run in CI and the workflow fails if it would change `go.mod`/`go.sum`.
+
 ### Added
 
 - `consumer.DeadLetterHandler` + `WithMaxReceiveCount(4)` on all five queues: logs each message's 5th and last delivery before SQS's own redrive moves it to the `-dlq`. Observability-only — it never acks, so DLQ routing stays SQS-native (EVT-4).

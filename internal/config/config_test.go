@@ -71,7 +71,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 5*time.Second, cfg.NegativeCacheTTL)
 	assert.Equal(t, 5*time.Second, cfg.RestrictedNegativeTTL)
 	assert.Equal(t, 5*time.Second, cfg.RealmNegativeTTL)
-	assert.Equal(t, 7*24*time.Hour, cfg.ProcessedEventTTL)
+	assert.Equal(t, 8*24*time.Hour, cfg.ProcessedEventTTL) // PE-1: strictly > 7-day SQS lifetime
 	assert.Equal(t, 5*time.Minute, cfg.StaleIfErrorMaxAge)
 	assert.Equal(t, 30*time.Second, cfg.GRPCKeepAliveTime)
 	assert.Equal(t, 5*time.Second, cfg.GRPCKeepAliveTimeout)
@@ -106,7 +106,7 @@ func TestLoad_CustomValues(t *testing.T) {
 	t.Setenv("APP_PORT", "9999")
 	t.Setenv("METRICS_PORT", "9997")
 	t.Setenv("GRPC_PORT", "9998")
-	t.Setenv("VALKEY_URL", "valkey.internal:6380")
+	t.Setenv("VALKEY_URL", "rediss://valkey.internal:6380") // TLS required outside dev
 	t.Setenv("VALKEY_DIAL_TIMEOUT", "5ms")
 	t.Setenv("VALKEY_READ_TIMEOUT", "6ms")
 	t.Setenv("VALKEY_WRITE_TIMEOUT", "7ms")
@@ -158,7 +158,7 @@ func TestLoad_CustomValues(t *testing.T) {
 	assert.Equal(t, "9999", cfg.AppPort)
 	assert.Equal(t, "9997", cfg.MetricsPort)
 	assert.Equal(t, "9998", cfg.GRPCPort)
-	assert.Equal(t, "valkey.internal:6380", cfg.ValkeyURL)
+	assert.Equal(t, "rediss://valkey.internal:6380", cfg.ValkeyURL)
 	assert.Equal(t, 5*time.Millisecond, cfg.ValkeyDialTimeout)
 	assert.Equal(t, 6*time.Millisecond, cfg.ValkeyReadTimeout)
 	assert.Equal(t, 7*time.Millisecond, cfg.ValkeyWriteTimeout)
@@ -342,6 +342,8 @@ func TestLoad_InvalidRealmTenantMapSeed_JSON(t *testing.T) {
 func TestLoad_OrgMembershipDevDefault_FailsOutsideDev(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("APP_ENV", "production")
+	t.Setenv("VALKEY_URL", "rediss://valkey.iam.svc.cluster.local:6379")
+	t.Setenv("SHARED_REALM_ISSUER", "https://keycloak.example.com/realms/shared") // avoid earlier check
 	// ORG_MEMBERSHIP_BASE_URL left unset — resolves to the dev default.
 
 	_, err := config.Load()
@@ -369,9 +371,9 @@ func TestLoad_OrgMembershipDevDefault_AllowedInDev(t *testing.T) {
 func TestLoad_OrgMembershipOverridden_PassesOutsideDev(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("APP_ENV", "production")
+	setRequiredProductionEnv(t)
 	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
 	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8080")
-	setRequiredQueueURLs(t)
 
 	cfg, err := config.Load()
 
@@ -389,16 +391,24 @@ func setRequiredQueueURLs(t *testing.T) {
 	t.Setenv("TENDER_AUTHZ_QUEUE_URL", "http://q/tender")
 }
 
+// setRequiredProductionEnv sets all env vars that Load() requires outside
+// APP_ENV=dev so individual non-dev tests can focus on the one var under test
+// without being blocked by unrelated checks.
+func setRequiredProductionEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("VALKEY_URL", "rediss://valkey.iam.svc.cluster.local:6379")
+	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
+	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8086")
+	t.Setenv("SHARED_REALM_ISSUER", "https://keycloak.example.com/realms/shared")
+	setRequiredQueueURLs(t)
+}
+
 func TestLoad_QueueURLRequiredOutsideDev(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("APP_ENV", "production")
-	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
-	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8080")
-	t.Setenv("MEMBERSHIP_AUTHZ_QUEUE_URL", "http://q/membership")
-	t.Setenv("USER_AUTHZ_QUEUE_URL", "http://q/user")
-	t.Setenv("BILLING_AUTHZ_QUEUE_URL", "http://q/billing")
-	t.Setenv("TENANT_AUTHZ_QUEUE_URL", "http://q/tenant")
-	// TENDER_AUTHZ_QUEUE_URL left blank.
+	setRequiredProductionEnv(t)
+	// Override TENDER_AUTHZ_QUEUE_URL to blank to test the missing-queue check.
+	t.Setenv("TENDER_AUTHZ_QUEUE_URL", "")
 
 	_, err := config.Load()
 
@@ -447,6 +457,8 @@ func TestLoad_DuplicateQueueURL_BlanksExempt(t *testing.T) {
 func TestLoad_TenderACLDevDefault_FailsOutsideDev(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("APP_ENV", "production")
+	t.Setenv("VALKEY_URL", "rediss://valkey.iam.svc.cluster.local:6379")
+	t.Setenv("SHARED_REALM_ISSUER", "https://keycloak.example.com/realms/shared") // avoid earlier check
 	// ORG_MEMBERSHIP_BASE_URL must be overridden too, or that check fires
 	// first and this test would be asserting the wrong error message.
 	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
@@ -466,4 +478,112 @@ func TestLoad_TenderACLDevDefault_AllowedInDev(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, "http://localhost:8086", cfg.TenderACLBaseURL)
+}
+
+// TestLoad_ValkeyTLS_* prove the rediss:// enforcement invariant: plaintext
+// Valkey must be rejected outside dev (authorization context is sensitive),
+// and rediss:// must be accepted. Dev is exempt (no TLS in local docker-compose).
+
+func TestLoad_ValkeyTLS_PlaintextFailsOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("VALKEY_URL", "localhost:6379") // plain host:port — no TLS
+
+	_, err := config.Load()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "VALKEY_URL")
+	assert.Contains(t, err.Error(), "rediss://")
+}
+
+func TestLoad_ValkeyTLS_RedisSchemeFailsOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("VALKEY_URL", "redis://valkey:6379") // redis:// is plaintext
+
+	_, err := config.Load()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rediss://")
+}
+
+func TestLoad_ValkeyTLS_RedissPassesOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "production")
+	setRequiredProductionEnv(t) // sets rediss:// Valkey URL + other required vars
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.True(t, len(cfg.ValkeyURL) > 0)
+}
+
+func TestLoad_ValkeyTLS_PlaintextAllowedInDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "dev")
+	t.Setenv("VALKEY_URL", "localhost:6379") // plain — fine in dev
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.Equal(t, "localhost:6379", cfg.ValkeyURL)
+}
+
+// TestLoad_SharedRealmIssuer_* prove the fail-fast invariant: both
+// SHARED_REALM_ISSUER and REALM_TENANT_MAP_SEED empty outside dev means no
+// tenant-resolution path exists, so Load() must fail rather than starting a
+// process that silently returns DENY_MALFORMED_IDENTITY on every request.
+
+func TestLoad_SharedRealmIssuerBothEmpty_FailsOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("VALKEY_URL", "rediss://valkey.iam.svc.cluster.local:6379")
+	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
+	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8086")
+	setRequiredQueueURLs(t)
+	// SHARED_REALM_ISSUER left blank (default). REALM_TENANT_MAP_SEED left as "{}" (empty map).
+
+	_, err := config.Load()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tenant-resolution")
+}
+
+func TestLoad_SharedRealmIssuerBothEmpty_AllowedInDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "dev")
+	// Both empty — fine in dev.
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.Empty(t, cfg.SharedRealmIssuer)
+	assert.Empty(t, cfg.RealmTenantMapSeed)
+}
+
+func TestLoad_SharedRealmIssuerSet_PassesOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "production")
+	setRequiredProductionEnv(t) // includes SHARED_REALM_ISSUER
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.NotEmpty(t, cfg.SharedRealmIssuer)
+}
+
+func TestLoad_RealmMapSeedSet_PassesOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("VALKEY_URL", "rediss://valkey.iam.svc.cluster.local:6379")
+	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
+	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8086")
+	t.Setenv("REALM_TENANT_MAP_SEED", `{"kc.example.com/realms/tenant-a": "tenant-uuid-a"}`)
+	// SHARED_REALM_ISSUER left blank — seed alone should be enough.
+	setRequiredQueueURLs(t)
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.Len(t, cfg.RealmTenantMapSeed, 1)
 }

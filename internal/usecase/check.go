@@ -19,6 +19,13 @@ import (
 // i8_call/i12_call/mfa_freshness_call). The outer ext_authz span comes from
 // platform-gincommon's gRPC tracing interceptor via context propagation —
 // this package only ever adds children to whatever span is already on ctx.
+//
+// otel.Tracer() calls otel.GetTracerProvider(), which uses OTel's delegating
+// global TracerProvider. cmd/server/main.go calls gincommon.InitTracingFromEnv()
+// before any Check() is served; the delegate automatically picks up the real
+// provider, so all spans export through gincommon's OTLP pipeline.
+// Do NOT replace this with a locally-constructed TracerProvider — that would
+// bypass gincommon's provider and break distributed trace continuity.
 var tracer = otel.Tracer("github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/usecase")
 
 // CheckInput is everything the inbound gRPC adapter has decoded from a

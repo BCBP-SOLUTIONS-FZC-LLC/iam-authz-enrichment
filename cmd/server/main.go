@@ -106,16 +106,6 @@ func run() error {
 		"service": cfg.AppName, "version": buildVersion, "env": cfg.AppEnv,
 	})
 
-	// SHARED_REALM_ISSUER is legitimately optional — ResolveTenant falls
-	// back to RealmTenantMapSeed for dedicated-realm-only platforms (see
-	// tenant_resolve.go) — so this is a warning, not the hard startup
-	// failure config.Load() applies to ORG_MEMBERSHIP_BASE_URL. But BOTH
-	// empty outside dev means there is no tenant-resolution path at all:
-	// every request will resolve to DENY_MALFORMED_IDENTITY.
-	if cfg.AppEnv != "dev" && cfg.SharedRealmIssuer == "" && len(cfg.RealmTenantMapSeed) == 0 {
-		appLog.Warn("no tenant-resolution path configured — every request will get DENY_MALFORMED_IDENTITY until SHARED_REALM_ISSUER is set or a TenantConverted/TenantRealmReady event seeds the realm map", nil)
-	}
-
 	// Align the env vars platform-gincommon reads directly (InitTracingFromEnv,
 	// NewLogger, OTEL_SERVICE_NAME) with this process's identity so a
 	// deployment that only set APP_NAME still gets matching trace/metric
@@ -159,6 +149,18 @@ func run() error {
 	// iam-org-membership / iam-user-profile. NewRouter applies the same
 	// middleware slice; gincommon's metrics.Init is sync.Once.
 	_ = gincommon.ObservabilityMiddlewares(ginCfg)
+
+	// DOCS_AUTH_TOKEN guard: if /asyncapi is enabled in production without a
+	// bearer token, the event-contract viewer is public — it doesn't expose
+	// credentials but does expose the consumer topology and schema detail.
+	// Warn at startup (not a fatal error — DOCS_ENABLED=false is the safe
+	// default in production) so an operator who sets DOCS_ENABLED=true
+	// without DOCS_AUTH_TOKEN gets an immediate, visible signal rather than
+	// discovering the exposure post-deployment. Mirrors iam-user-profile's
+	// identical startup warning.
+	if cfg.AppEnv == "production" && cfg.DocsEnabled && cfg.DocsAuthToken == "" {
+		appLog.Warn("DOCS_ENABLED=true in production without DOCS_AUTH_TOKEN — /asyncapi and /asyncapi.yaml are served unauthenticated; set DOCS_AUTH_TOKEN to require a bearer token", nil)
+	}
 
 	// 3. Metrics — business collectors + platform-events consumer
 	// collectors, both on gincommon's registerer (the same /metrics scrape
@@ -431,19 +433,33 @@ func run() error {
 	return grpccommon.Shutdown(appLog)
 }
 
-// metricsScrapeHandler serves /metrics from gincommon's registerer — the
-// same registry ObservabilityMiddlewares, authz_* collectors, and
-// platform-events InitWithRegisterer write to. promhttp.Handler() always
-// scrapes prometheus.DefaultGatherer; after ObservabilityMiddlewares that
-// is the same registry, but scraping MetricsRegisterer() keeps this
-// listener correct if gincommon ever switches tests/prod onto an isolated
-// registry (the contract MetricsRegisterer documents).
+// metricsScrapeHandler serves /metrics exclusively from gincommon's
+// registerer — the same registry ObservabilityMiddlewares, authz_*
+// collectors, and platform-events InitWithRegisterer all write to.
+//
+// All logs, metrics, and traces in this service MUST pass through
+// platform-gincommon only (enforced by make observability-lint):
+//   - Logs     → logger.NewLogger(appEnv)  (Zap, structured, redacted)
+//   - Metrics  → gincommon.MetricsRegisterer()  (this registry)
+//   - Traces   → gincommon.InitTracingFromEnv() sets the global OTel
+//     TracerProvider; all spans are children of the gRPC
+//     interceptor span from grpccommon.ObservabilityUnaryInterceptors
+//
+// Never fall back to prometheus.DefaultRegisterer / prometheus.DefaultGatherer
+// or the stdlib `log` package — a fallback would silently expose a different
+// registry on /metrics (missing authz_* and platform-events series) and break
+// observability parity with iam-org-membership / iam-user-profile.
 func metricsScrapeHandler() http.Handler {
 	reg := gincommon.MetricsRegisterer()
-	if g, ok := reg.(prometheus.Gatherer); ok {
-		return promhttp.HandlerFor(g, promhttp.HandlerOpts{})
+	g, ok := reg.(prometheus.Gatherer)
+	if !ok {
+		// gincommon.MetricsRegisterer() always returns a *prometheus.Registry
+		// which implements both Registerer and Gatherer. If this ever panics,
+		// a gincommon upgrade changed the return type — fix MetricsRegisterer
+		// rather than silently serving from the wrong (default) registry.
+		panic("iam-authz-enrichment: gincommon.MetricsRegisterer() does not implement prometheus.Gatherer — all metrics must pass through platform-gincommon")
 	}
-	return promhttp.Handler()
+	return promhttp.HandlerFor(g, promhttp.HandlerOpts{})
 }
 
 func envOr(key, def string) string {

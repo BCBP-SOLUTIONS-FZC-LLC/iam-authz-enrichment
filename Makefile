@@ -50,6 +50,8 @@ help:
 	@echo "  make vet             - go vet (default build + every test build tag)"
 	@echo "  make lint            - run golangci-lint (default build + every test build tag)"
 	@echo "  make arch-lint       - enforce .go-arch-lint.yml component boundaries"
+	@echo "  make observability-lint - enforce all logs/metrics/traces route through platform-gincommon"
+	@echo "  make database-lint      - enforce all DB connections/config/ops route through platform-pgcommon"
 	@echo "  make test            - unit tests (no Docker required)"
 	@echo "  make test-ci         - unit tests with race detector + coverage (used in CI)"
 	@echo "  make test-integration - Valkey + LocalStack SQS integration tests (requires Docker)"
@@ -59,7 +61,7 @@ help:
 	@echo "  make build           - compile server binary to bin/"
 	@echo "  make cover           - coverage profile + open HTML report"
 	@echo "  make cover-func      - coverage summary by function"
-	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + test-ci + build"
+	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + observability-lint + database-lint + test-ci + build"
 	@echo "  make docker-up       - start local Valkey + floci (SQS)"
 	@echo "  make docker-down     - stop local containers"
 	@echo "  make fmt-check       - verify gofmt formatting (no changes applied)"
@@ -111,6 +113,26 @@ lint:
 arch-lint:
 	@command -v go-arch-lint >/dev/null || $(GO) install github.com/fe3dback/go-arch-lint@v1.15.0
 	go-arch-lint check --project-path .
+
+# database-lint enforces the platform-pgcommon-only routing invariant:
+#   Connections → postgres.OpenPool (→ pgcommon.NewPool)
+#   Config      → pgcommon.ConfigFromEnv() / postgres.DSNFromEnv()
+#   Operations  → pgcommon helpers (IsConnectionException / IsPgError / ...)
+# Also enforces the HLD §5.4 invariant: this service has no schema, so
+# cmd/server must never call OpenPool / migrate / outbox runner.
+.PHONY: database-lint
+database-lint:
+	@bash .github/scripts/check-database-routing.sh
+
+# observability-lint enforces the platform-gincommon-only routing invariant:
+#   Logs    → logger.NewLogger (Zap, structured, redacted)
+#   Metrics → gincommon.MetricsRegisterer() via promauto.With()
+#   Traces  → gincommon.InitTracingFromEnv() global TracerProvider
+# Any violation of this constraint means observability data bypasses the shared
+# sink — breaking redaction, label consistency, and distributed trace continuity.
+.PHONY: observability-lint
+observability-lint:
+	@bash .github/scripts/check-observability-routing.sh
 
 # -----------------------------
 # TESTS
@@ -196,7 +218,7 @@ pin-base-images:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy fmt-check vet lint arch-lint test-ci build
+ci: tidy fmt-check vet lint arch-lint observability-lint database-lint test-ci build
 
 # -----------------------------
 # COVERAGE

@@ -149,3 +149,58 @@ groups:
             Org & Membership (I-8) call volume and decision latency — check for
             a recent mass cache eviction (bulk membership/tenant event), a TTL
             misconfiguration, or Valkey eviction pressure/capacity issues.
+
+  - name: iam_authz_enrichment_consumers
+    rules:
+
+      # ── SQS consumer stuck: persistent ReceiveMessage errors ─────────────────
+      # platform-events retries ReceiveMessage forever internally and never
+      # surfaces the error back to the caller — sqs_receive_errors_total is
+      # the only externally-observable signal. The receive-error watchdog in
+      # cmd/server/receive_watchdog.go already pushes to fatalErr after 6
+      # consecutive polls (~3 minutes at 30s intervals), causing a pod restart.
+      # This alert catches a rising error count before the watchdog fires and is
+      # also useful if the watchdog itself is not running (e.g. during startup).
+      - alert: AuthzEnrichmentSQSReceiveErrors
+        expr: |
+          increase(sqs_receive_errors_total{job="iam-authz-enrichment"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-authz-enrichment SQS consumer ReceiveMessage errors
+          description: >-
+            sqs_receive_errors_total for queue {{ $labels.queue }} has increased
+            in the last 5 minutes. This typically means the queue URL is wrong,
+            IAM permissions were revoked, or the queue was deleted. Cache
+            eviction events are not being received — stale authorization context
+            will persist until TTL expiry. The receive-error watchdog will restart
+            the pod after ~3 minutes of sustained failure; check SQS permissions
+            and queue configuration. Queue: {{ $labels.queue }}.
+
+      # ── DLQ messages arrived: a handler exhausted all retries ─────────────────
+      # A message in the DLQ means its handler failed on all 5 deliveries
+      # (maxReceiveCount=5 redrive policy). For cache-eviction consumers this
+      # means a role/membership/tender change was NOT applied — stale context
+      # persists until the key's TTL expires. For TenderRestricted (ae:restricted
+      # has no TTL by design) a missed event permanently disables the tender-ACL
+      # overlay for that tender until a pod restart re-processes the SQS backlog
+      # or the key is manually deleted. Page immediately.
+      - alert: AuthzEnrichmentDLQMessageArrived
+        expr: |
+          increase(platform_dlq_messages_total{job="iam-authz-enrichment"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: iam-authz-enrichment consumer sent a message to the DLQ
+          description: >-
+            A message on queue {{ $labels.queue }} (event type {{ $labels.event_type }})
+            exhausted all 5 delivery attempts and was moved to the DLQ.
+            The corresponding cache eviction was NOT applied. For TenderRestricted
+            events, the tender-ACL overlay for that tender is permanently disabled
+            until the key is manually cleared or the pod restarts. Inspect the DLQ,
+            fix the root cause, and replay the message.
+            Queue: {{ $labels.queue }}, Event: {{ $labels.event_type }}.

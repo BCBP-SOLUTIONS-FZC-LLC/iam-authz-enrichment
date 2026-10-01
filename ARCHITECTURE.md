@@ -76,7 +76,13 @@ graph TD
     metrics_a -.->|"satisfies Recorder\n(structurally — no import)"| ports
 ```
 
-**Rule:** `domain` ← `policy` ← `usecase` ← `adapter` ← `cmd`. Outbound adapters (`valkey`, `orgmembership`, `metrics`, `postgres`) depend only on `domain`/`policy` — they **never** import `usecase`, even though they implement interfaces `usecase/ports.go` declares. That inversion is the whole point: `usecase` owns the contract, adapters satisfy it structurally. Enforced in CI by `go-arch-lint check --project-path .` against `.go-arch-lint.yml`. `postgres` is config-only (no usecase port): it wraps `platform-pgcommon` so a future schema cannot bypass it with a raw `pgxpool`.
+**Rule:** `domain` ← `policy` ← `usecase` ← `adapter` ← `cmd`. Outbound adapters (`valkey`, `orgmembership`, `metrics`, `postgres`) depend only on `domain`/`policy` — they **never** import `usecase`, even though they implement interfaces `usecase/ports.go` declares. That inversion is the whole point: `usecase` owns the contract, adapters satisfy it structurally. Enforced in CI by three complementary gates:
+
+1. **`go-arch-lint check --project-path .`** against `.go-arch-lint.yml` — enforces the inward-only import direction between layers.
+2. **`make observability-lint`** (`.github/scripts/check-observability-routing.sh`) — enforces that all logs, metrics, and traces pass through `platform-gincommon` only: no direct `go.uber.org/zap`, no `prometheus.MustRegister` outside the gincommon registerer, no `otel.SetTracerProvider` in application code, no bare `http.DefaultTransport` without `otelhttp` wrapping.
+3. **`make database-lint`** (`.github/scripts/check-database-routing.sh`) — enforces that all DB connections, config, and operations pass through `platform-pgcommon` only: no raw `pgxpool.New`/`pgx.Connect`, all DSN assembly via `pgcommon.ConfigFromEnv`, `OpenPool` is the only pool constructor, and `cmd/server` never calls `NewPool`/migrate/outbox (HLD §5.4 — no schema).
+
+`postgres` is config-only (no usecase port): it wraps `platform-pgcommon` so a future schema cannot bypass it with a raw `pgxpool`.
 
 ---
 

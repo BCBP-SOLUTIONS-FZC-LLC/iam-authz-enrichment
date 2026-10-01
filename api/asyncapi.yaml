@@ -160,9 +160,18 @@ info:
         - "Update the in-process realm→tenant map (realm from payload → this event's tenant_id) — NO cache eviction"
       publishes_events: false
       note: >-
-        Wiring this (not just TenantConverted) matters: a newly-dedicated
-        realm created via direct-paid signup fires only TenantRealmReady,
-        never TenantConverted (LLD §5).
+        Wiring this (not just TenantConverted) matters because both events
+        must reach this consumer to keep the realm→tenant map correct for
+        all provisioning paths. Both RP-2 (direct-paid signup) and RP-3
+        (trial→dedicated conversion) always emit TenantRealmReady followed
+        by TenantConverted in the same outbox transaction — the filter on
+        tenant-authz-q MUST include both event types. With only
+        TenantConverted in the filter, HandleTenantRealmReady is never
+        invoked, and any future RP path that emits TenantRealmReady without
+        TenantConverted would leave the realm map un-updated, causing
+        DENY_UNRESOLVABLE_SUBJECT for all users in that realm. The note in
+        an earlier revision of this spec that said "direct-paid signup fires
+        only TenantRealmReady" was incorrect — RP-2 has always emitted both.
     TenderRestricted:
       on_receipt:
         - "Flip the in-memory restricted-tender fact for (tenant, tender) — NOT a cache eviction"
@@ -325,8 +334,13 @@ channels:
     title: Tenant realm events (AuthZ Enrichment consumer)
     description: >-
       Two event types that keep the in-process realm→tenant map fresh for
-      JWT-issuer-based tenant resolution (LLD §8.3). Only TenantConverted
-      also evicts ae:tenant.
+      JWT-issuer-based tenant resolution (LLD §8.3). TenantConverted also
+      evicts ae:tenant (realm strategy changed — context is stale);
+      TenantRealmReady updates the map only with no cache eviction. Both
+      events MUST be included in the SNS subscription filter for this queue
+      — the Realm Provisioner always co-emits them together (RP-2 and RP-3),
+      but omitting TenantRealmReady from the filter leaves HandleTenantRealmReady
+      as dead code and breaks any future RP path that may emit it independently.
     servers:
       - $ref: "#/servers/tenantAuthZQueue"
     messages:
@@ -872,7 +886,7 @@ components:
     TenantRealmReady:
       name: TenantRealmReady
       title: Tenant Realm Ready
-      summary: A dedicated realm finished provisioning and is ready for tenant resolution (fires alone for direct-paid signups, without a preceding TenantConverted).
+      summary: A dedicated realm finished provisioning and is ready for tenant resolution. Always co-emitted with TenantConverted by the Realm Provisioner (RP-2 direct-paid signup and RP-3 trial conversion). HandleTenantRealmReady updates the realm→tenant map only with no cache eviction; TenantConverted additionally evicts ae:tenant.
       tags:
         - $ref: "#/components/tags/consumed"
       contentType: application/json

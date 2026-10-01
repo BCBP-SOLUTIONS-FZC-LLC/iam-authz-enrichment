@@ -154,8 +154,11 @@ func (inv *Invalidator) HandleTenantConverted(ctx context.Context, tenant string
 }
 
 // HandleTenantRealmReady: NO ae:ctx eviction — refresh the realm map only.
-// Wiring this (not just TenantConverted) matters: a newly-dedicated realm
-// created via direct-paid signup fires only TenantRealmReady (§5).
+// Both RP-2 (direct-paid signup) and RP-3 (trial→dedicated conversion) always
+// co-emit TenantRealmReady alongside TenantConverted. This handler must still
+// be wired because TenantRealmReady MUST be in the tenant-authz-q SNS filter —
+// omitting it leaves this handler dead and breaks any future RP path that may
+// emit TenantRealmReady independently of TenantConverted.
 func (inv *Invalidator) HandleTenantRealmReady(ctx context.Context, tenant string, p TenantRealmEventPayload) error {
 	if err := inv.realmMap.Set(ctx, p.Realm, tenant); err != nil {
 		return fmt.Errorf("persist realm map: %w", err)
