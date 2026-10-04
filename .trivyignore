@@ -1,0 +1,13 @@
+# Trivy ignore list — every entry needs a reason and an expiry (exp:), so a
+# suppression can never outlive the condition that justified it. After the
+# expiry date the finding fails the ci.yml gate again. Mirrors iam-audit-log's,
+# iam-catalog-admin's and iam-org-membership's entries for the same advisory.
+
+# DLA-4792-1 — tzdata 2026b → 2026c in gcr.io/distroless/static-debian12:nonroot.
+# A timezone-database refresh, not a security flaw (Trivy: UNKNOWN; the CI gate
+# fails on UNKNOWN). Not exploitable here: the service never loads a zone (no
+# time.LoadLocation, no time/tzdata, no time.Local use; all timestamps are UTC).
+# Blocked upstream: on 2026-10-04 the newest :nonroot digest (sha256:afa5c872…,
+# pinned in the Dockerfile) still ships tzdata 2026b. Remove this entry and
+# re-pin (`make pin-base-images`) once distroless ships 2026c.
+DLA-4792-1 exp:2026-10-31
