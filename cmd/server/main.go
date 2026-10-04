@@ -487,11 +487,17 @@ func run() error {
 	}
 
 	shutdownTracing()
-	shutdownErr := grpccommon.Shutdown(appLog)
-	if fatalCause != nil {
-		return errors.Join(fmt.Errorf("fatal: %w", fatalCause), shutdownErr)
+	// A flush error never decides the exit code — same as iam-org-membership.
+	// Zap's Sync fsyncs stderr, which fails with EINVAL on Linux whenever
+	// stderr is a pipe (every container runtime, and the e2e harness), so
+	// returning it made every clean SIGTERM shutdown exit 1.
+	if err := grpccommon.Shutdown(appLog); err != nil {
+		appLog.Warn("logger/tracer flush error", map[string]interface{}{"error": err.Error()})
 	}
-	return shutdownErr
+	if fatalCause != nil {
+		return fmt.Errorf("fatal: %w", fatalCause)
+	}
+	return nil
 }
 
 // observabilityDomain is this service's business domain in the Platform
