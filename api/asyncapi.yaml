@@ -51,15 +51,16 @@ info:
     Wire format: a producer with its Glue registry configured (every IAM
     sibling) Glue-encodes `data` — base64 of [0x03][0x00][16-byte schema
     version UUID] + JSON — and sets `dataschema`. This service strips that
-    self-describing header (GlueDecoder) without any Glue client or
+    self-describing header (platform-events GlueDecodeCodec) without any Glue client or
     registry of its own; a plain-JSON envelope passes through untouched.
 
-    DLQ: all five queues follow the identical, purely SQS-native
-    convention — `maxReceiveCount=5` before a message lands in its own
-    `-dlq`, configured on the queue resource itself
-    (`scripts/init-localstack.sh`), never in application code. A
-    dead-letter handler only logs each message's 5th and last delivery
-    (it never acks). Note `TenderRestricted`'s `ae:restricted` fact has no
+    DLQ: all five queues follow the identical convention — each has its
+    own `-dlq` as its RedrivePolicy target (`maxReceiveCount=5`, configured
+    on the queue resource, `scripts/init-localstack.sh`). The consumer
+    forwards poison messages there itself (platform-events DLQ forwarding,
+    LLD AE-36): a malformed body or failed Glue decode on first receipt,
+    and a failing message on its 5th delivery, which is logged first.
+    SQS's own redrive is the backstop. Note `TenderRestricted`'s `ae:restricted` fact has no
     TTL, so a DLQ'd one stays stale until it is replayed. Because
     every event here is a cache-invalidation trigger rather than a state
     mutation, a DLQ'd message degrades to "this cache entry may be stale

@@ -18,7 +18,7 @@
 # Check() always returns a nil error for every Allow/Deny outcome (the
 # ext_authz convention: Deny is a successful RPC with a PERMISSION_DENIED
 # payload, not a failed one), so this metric is a clean deployment-health
-# signal, distinct from iam_authz_enrichment_deny_reason_total{reason="DENY_SERVICE_UNAVAILABLE"}
+# signal, distinct from iam_authz_enrichment_deny_reason_total{reason="deny_service_unavailable"}
 # (which reflects dependency health at that moment, not whether THIS
 # deployment is broken — a dependency outage unrelated to the rollout could
 # otherwise trigger a false-positive rollback).
@@ -316,6 +316,10 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@v5.0.1
 
+      # grpcTLS.meshProvidesMTLS: the chart refuses to render a prod release with
+      # plaintext gRPC until someone confirms a mesh / CNI encrypts it. Set the
+      # repository variable MESH_PROVIDES_MTLS=true once that is verified for
+      # the target cluster (or enable grpcTLS in values instead).
       # Deploy the just-published image via Helm so the gate is never a no-op,
       # regardless of whether a GitOps controller is configured. existingSecret
       # assumes a Kubernetes Secret named iam-authz-enrichment-secrets already
@@ -330,6 +334,7 @@ jobs:
             --namespace="${{ vars.K8S_NAMESPACE || 'default' }}" \
             --set image.tag="${{ needs.docker.outputs.version }}" \
             --set existingSecret=iam-authz-enrichment-secrets \
+            --set grpcTLS.meshProvidesMTLS="${{ vars.MESH_PROVIDES_MTLS || 'false' }}" \
             --atomic
 
       # Verify the running image digest matches what was signed and published.

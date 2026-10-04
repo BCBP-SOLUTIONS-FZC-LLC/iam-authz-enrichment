@@ -222,3 +222,35 @@ func TestRunReceiveErrorWatchdog_ContextCancelled_ReturnsWithoutFiring(t *testin
 	}
 	assert.Empty(t, fatal)
 }
+
+// attrsSQS is a scriptedSQS that also answers GetQueueAttributes, like *sqs.Client.
+type attrsSQS struct {
+	scriptedSQS
+	attrCalls atomic.Int64
+}
+
+//nolint:unparam // signature must match the SQS client's
+func (s *attrsSQS) GetQueueAttributes(context.Context, *awssqs.GetQueueAttributesInput, ...func(*awssqs.Options)) (*awssqs.GetQueueAttributesOutput, error) {
+	s.attrCalls.Add(1)
+	return &awssqs.GetQueueAttributesOutput{Attributes: map[string]string{"ApproximateNumberOfMessages": "3"}}, nil
+}
+
+// The wrapper must expose GetQueueAttributes, or platform-events' queue-depth
+// sampler (SQS_QUEUE_DEPTH_INTERVAL) type-asserts it away and never samples.
+func TestReceiveTrackingClient_ExposesGetQueueAttributes(t *testing.T) {
+	inner := &attrsSQS{}
+	var c any = receiveTrackingClient{SQSClientLike: inner, tracker: &receiveTracker{}}
+
+	api, ok := c.(queueAttributesAPI)
+	require.True(t, ok, "the consumer client must satisfy platform-events' queue-depth interface")
+	out, err := api.GetQueueAttributes(context.Background(), &awssqs.GetQueueAttributesInput{})
+	require.NoError(t, err)
+	assert.Equal(t, "3", out.Attributes["ApproximateNumberOfMessages"])
+	assert.Equal(t, int64(1), inner.attrCalls.Load())
+}
+
+func TestReceiveTrackingClient_GetQueueAttributes_UnsupportedClient(t *testing.T) {
+	c := receiveTrackingClient{SQSClientLike: &scriptedSQS{}, tracker: &receiveTracker{}}
+	_, err := c.GetQueueAttributes(context.Background(), &awssqs.GetQueueAttributesInput{})
+	require.Error(t, err)
+}

@@ -44,15 +44,24 @@ autoscaling:
   # approximation the way a generic HTTP request counter would be.
   targetDecisionsPerSecondPerReplica: 500
 
+# No CPU limit, deliberately: Check has a 15ms p99 budget (LLD §11.1), and a
+# CFS quota throttles a burst for the rest of its 100ms period — exactly the
+# tail latency the budget forbids. The request reserves real capacity for
+# scheduling and HPA instead. Memory stays limited; GOMEMLIMIT (env below)
+# keeps the Go heap under it so the GC works harder before the kernel OOM-kills.
 resources:
   requests:
-    cpu: "100m"
+    cpu: "250m"
     memory: "128Mi"
   limits:
-    cpu: "500m"
     memory: "256Mi"
 
 env:
+  # The service label on every metric and the OTel service.name. cmd/server
+  # passes it to gincommon (Config/TracingConfig) explicitly, so
+  # OTEL_SERVICE_NAME is not needed. Must stay "iam-authz-enrichment": the
+  # alert rules and dashboards select service="iam-authz-enrichment".
+  APP_NAME: "iam-authz-enrichment"
   # Enterprise Platform Observability Standard environment vocabulary:
   # local | dev | test | staging | prod (no aliases — "production" fails
   # startup). It is the environment label on every metric.
@@ -62,6 +71,10 @@ env:
   OBSERVABILITY_DOMAIN: "iam"
   APP_PORT: "8080"
   METRICS_PORT: "9090"
+  # Valkey timeouts for SQS event processing (a separate client from the
+  # request path's 10ms one): an eviction has no latency budget, and a failed
+  # one waits a full visibility timeout (30s) before its retry.
+  VALKEY_EVENT_TIMEOUT: "500ms"
   GRPC_PORT: "9091"
 
   # §4.1 cache TTLs / jitter and the §7 stale-if-error hard cap. Defaults match
@@ -75,16 +88,21 @@ env:
   AE_PROCESSED_EVENT_TTL: "168h"
   AE_STALE_IF_ERROR_MAX_AGE: "5m"
 
-  # Org & Membership sibling service (§6) — I-8/I-14. Required: point at
-  # the real in-cluster service, e.g. http://iam-org-membership.iam.svc.cluster.local:8080.
-  ORG_MEMBERSHIP_BASE_URL: ""
-  ORG_MEMBERSHIP_TIMEOUT: "10ms"
+  # Org & Membership sibling service (§6) — I-8/I-14. IAM convention: every
+  # service runs in namespace "iam" as a Service named after its repo on port
+  # 8080. Override per environment if a cluster differs. (An empty value falls
+  # back to the local-dev default, which config.Load rejects outside dev.)
+  ORG_MEMBERSHIP_BASE_URL: "http://iam-org-membership.iam.svc.cluster.local:8080"
+  # 40ms covers Org & Membership's own I-8 p99 targets (15ms cache hit, 30ms
+  # miss) plus the mesh hop — LLD §16 AE-37. Shorter fails healthy calls.
+  ORG_MEMBERSHIP_TIMEOUT: "40ms"
 
   # iam-tender-acl sibling service — TAC-4 (formerly I-12), repointed here
-  # from Org & Membership per ADR-0007 Wave 3 Phase 4. Required: point at
-  # the real in-cluster service, e.g. http://iam-tender-acl.iam.svc.cluster.local:8080.
-  TENDER_ACL_BASE_URL: ""
-  TENDER_ACL_TIMEOUT: "20ms"
+  # from Org & Membership per ADR-0007 Wave 3 Phase 4. Same IAM convention
+  # (iam-tender-acl README "Onboarding a TAC-4 caller", its LLD §21.5).
+  TENDER_ACL_BASE_URL: "http://iam-tender-acl.iam.svc.cluster.local:8080"
+  # TAC-4 targets 5ms hit / 20ms miss (iam-tender-acl LLD §14.1) + headroom.
+  TENDER_ACL_TIMEOUT: "30ms"
 
   # Tenant resolution (§2 point 3). SHARED_REALM_ISSUER is required — the
   # Keycloak issuer for the shared trial realm. REALM_TENANT_MAP_SEED is a
@@ -104,6 +122,11 @@ env:
   GRPC_MAX_CONCURRENT_STREAMS: "1000"
   GRPC_KEEPALIVE_TIME: "30s"
   GRPC_KEEPALIVE_TIMEOUT: "5s"
+  # Server-side cap on each Check (grpccommon.TimeoutUnaryInterceptor). Envoy's
+  # ext_authz grpc_service timeout (README, 250ms) normally arrives as a
+  # grpc-timeout and wins; this bounds a caller that sends none. Covers the
+  # worst sequential path: Valkey reads + I-8 + TAC-4 + I-14 (~170ms).
+  GRPC_REQUEST_TIMEOUT: "250ms"
   GRPC_MAX_RECV_MSG_SIZE_BYTES: "262144"
   GRPC_MAX_SEND_MSG_SIZE_BYTES: "262144"
 
@@ -117,20 +140,57 @@ env:
   BILLING_AUTHZ_QUEUE_URL: ""
   TENANT_AUTHZ_QUEUE_URL: ""
   TENDER_AUTHZ_QUEUE_URL: ""
-  # Loaded by platform-events LoadSQS, then forced to 0 in-process so a
-  # failing handler leaves the message for the queue's own RedrivePolicy
-  # (maxReceiveCount=5 on the SQS resource). Do not use this to configure
-  # in-app DLQ deletion.
-  SQS_MAX_RECEIVE_COUNT: "5"
+  # SQS consumer knobs read by platform-events (LoadSQS / SQSConsumerOptions).
+  # SQS_MAX_RECEIVE_COUNT is deliberately absent: the consumer pins its
+  # threshold to 4 (one short of each queue's RedrivePolicy maxReceiveCount=5)
+  # and forwards the 5th delivery to the DLQ itself (LLD §16 AE-36).
   SQS_MAX_MESSAGES: "10"
   SQS_WAIT_SECONDS: "20"
   SQS_VISIBILITY_TIMEOUT: "30s"
+  # Bounds each handler call (Valkey evictions — milliseconds normally); stays
+  # below the 30s visibility timeout so a hung handler fails before the message
+  # reappears to another replica.
+  SQS_HANDLER_TIMEOUT: "20s"
+  # How long Stop() waits for in-flight handlers at shutdown. 30s is the
+  # library default the terminationGracePeriodSeconds budget below assumes
+  # (10s gRPC + 10s HTTP + 30s drain + 5s = 55s of 60s); raise both together.
+  SQS_DRAIN_TIMEOUT: "30s"
+  # Samples platform_queue_depth / platform_dlq_depth for every queue (needs
+  # sqs:GetQueueAttributes on the -dlq queues, deploy/iam/policy.json).
+  SQS_QUEUE_DEPTH_INTERVAL: "60s"
+  # events.WithConcurrency per queue (platform-events' own default is 1, fully
+  # serial). Overrides SQS_CONCURRENCY, which is therefore not set.
+  MEMBERSHIP_AUTHZ_QUEUE_CONCURRENCY: "4"
+  USER_AUTHZ_QUEUE_CONCURRENCY: "4"
+  BILLING_AUTHZ_QUEUE_CONCURRENCY: "4"
+  TENANT_AUTHZ_QUEUE_CONCURRENCY: "4"
+  TENDER_AUTHZ_QUEUE_CONCURRENCY: "4"
 
-  # Read directly from process env by platform-gincommon (not this service's
-  # own internal/config) — see that library's internal/config/env.go.
-  OTEL_SERVICE_NAME: "iam-authz-enrichment"
-  OTEL_EXPORTER_OTLP_ENDPOINT: ""     # gRPC OTel collector endpoint (e.g. otelcollector:4317)
+  # Tracing — read by platform-gincommon. Same values as iam-org-membership.
+  # "none" (gincommon v1.6.0+) installs the in-process provider without export.
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.observability.svc.cluster.local:4317"
   OTEL_EXPORTER_OTLP_INSECURE: "false"
+  # Head-sampling ratio for new traces (parent-based).
+  OTEL_TRACES_SAMPLER_RATIO: "0.1"
+  # W3C baggage propagation on outbound I-8/I-14/TAC-4 calls.
+  OTEL_PROPAGATOR_BAGGAGE: "false"
+  # true re-samples spans whose remote parent (Envoy) is marked sampled, so a
+  # caller cannot force 100% sampling. Envoy is trusted here, so false.
+  OTEL_TRACES_IGNORE_REMOTE_PARENT_SAMPLED: "false"
+
+  # Logging — read by platform-gincommon's logger.
+  LOG_LEVEL: "info"          # debug | info | warn | error
+  # true: every Check logs one grpc_request line at INFO — ~2,500 lines/s at
+  # 5 replicas × 500 decisions/s. Sampling keeps the first 100/s per message
+  # and level, then 1 in 100; denies and errors stay visible in metrics.
+  LOG_SAMPLING: "true"
+  # Soft heap limit for the Go runtime, ~90% of resources.limits.memory —
+  # change both together.
+  GOMEMLIMIT: "230MiB"
+
+  # AsyncAPI viewer (/asyncapi) — off in prod unless enabled; optionally
+  # bearer-gated by DOCS_AUTH_TOKEN (add it to envFromSecret to use it).
+  DOCS_ENABLED: "false"
 
 envFromSecret:
   - VALKEY_URL
@@ -174,6 +234,17 @@ terminationGracePeriodSeconds: 60
 podDisruptionBudget:
   enabled: true
   minAvailable: 2
+
+# Spread replicas across zones (hard) and nodes (best effort). Replaces the
+# old hard one-pod-per-node anti-affinity, which needed ≥ minReplicas (5)
+# nodes just to start, left HPA scale-out beyond the node count Pending, and
+# never spread across zones. A zone outage now takes at most ~1/zones of the
+# fleet; set zoneWhenUnsatisfiable: ScheduleAnyway on single-zone clusters.
+topologySpread:
+  zoneMaxSkew: 1
+  zoneWhenUnsatisfiable: DoNotSchedule
+  nodeMaxSkew: 1
+  nodeWhenUnsatisfiable: ScheduleAnyway
 
 # startupProbe budget is short — unlike iam-user-profile there are no
 # migrations or schema checks to wait out; Valkey/SQS/Org&Membership are all
@@ -225,6 +296,11 @@ grpcTLS:
   enabled: false
   secretName: "iam-authz-enrichment-tls"
   requireClientCert: false
+  # With grpcTLS.enabled false the gRPC port is plaintext, so encryption in
+  # transit depends on a service mesh / CNI providing mTLS — which this chart
+  # cannot verify. With APP_ENV=prod the chart refuses to render until you
+  # either enable grpcTLS or set this to true, confirming the mesh exists.
+  meshProvidesMTLS: false
 
 # NetworkPolicy — enabled by default. Restricts grpc-port ingress to wherever
 # Envoy's ext_authz caller actually runs, and http-port (metrics) ingress to
@@ -265,10 +341,28 @@ networkPolicy:
       app.kubernetes.io/name: prometheus
   # Extra ingress rules (raw NetworkPolicy ingress spec entries).
   additionalIngressRules: []
-  # Extra egress rules (raw NetworkPolicy egress spec entries). Add a rule
-  # here for Org & Membership (ORG_MEMBERSHIP_BASE_URL) — its port isn't
-  # fixed by convention the way Valkey/AWS are, so it isn't in the default
-  # egress list below.
+  # Egress to the two synchronous HTTP siblings, each restricted to that
+  # service's own pods on its HTTP port. The labels are the pods' real
+  # selectorLabels (app.kubernetes.io/name = each chart's name): Org &
+  # Membership's chart is "iam-org-membership", iam-tender-acl's chart is
+  # "tender-acl" (its Service is named iam-tender-acl, its pods are not).
+  # iam-tender-acl must in turn list this service's pods
+  # (app.kubernetes.io/name: iam-authz-enrichment) in its own
+  # networkPolicy.internalCallerPodSelectors.
+  upstreamEgress:
+    - name: iam-org-membership   # ORG_MEMBERSHIP_BASE_URL — I-8 / I-14
+      namespaceSelector:
+        kubernetes.io/metadata.name: iam
+      podSelector:
+        app.kubernetes.io/name: iam-org-membership
+      port: 8080
+    - name: iam-tender-acl       # TENDER_ACL_BASE_URL — TAC-4
+      namespaceSelector:
+        kubernetes.io/metadata.name: iam
+      podSelector:
+        app.kubernetes.io/name: tender-acl
+      port: 8080
+  # Extra egress rules (raw NetworkPolicy egress spec entries).
   additionalEgressRules: []
 
 # ServiceMonitor — requires kube-prometheus-stack (monitoring.coreos.com/v1 CRD).

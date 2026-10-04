@@ -71,6 +71,10 @@ var (
 	// on the next one, silently corrupting that run's "not yet restricted"
 	// sanity check.
 	runID string
+
+	// e2eBinary is the binary under test, for tests that start their own
+	// short-lived instance (startup_test.go).
+	e2eBinary string
 )
 
 // id suffixes base with the current run's unique ID, so two separate
@@ -86,6 +90,7 @@ func runMain(m *testing.M) int {
 	runID = uuid.NewString()[:8]
 
 	binaryPath := envOr("E2E_BINARY_PATH", "../../bin/iam-authz-enrichment")
+	e2eBinary = binaryPath
 	if _, err := os.Stat(binaryPath); err != nil {
 		fmt.Fprintf(os.Stderr, "e2e: binary not found at %s — run `make build` first (or set E2E_BINARY_PATH)\n", binaryPath)
 		return 1
@@ -123,6 +128,19 @@ func runMain(m *testing.M) int {
 		"TENDER_ACL_TIMEOUT=2s",
 		"SHARED_REALM_ISSUER="+e2eTestIssuer,
 		"DOCS_ENABLED=false",
+		// Short long-poll and visibility windows, for test isolation only.
+		// Consecutive suite runs share the same queues; a stopped binary's
+		// in-flight 20s ReceiveMessage can stay open on the emulator, which
+		// then hands the next run's freshly sent event to that dead poll and
+		// hides it for the 30s visibility timeout — longer than any
+		// eventually() window here, so the tender-ACL test failed
+		// intermittently. A 1s wait lets abandoned polls expire before the
+		// next run starts, and a 5s visibility timeout recovers any message
+		// that is still lost well inside the 10s windows. (In production this
+		// is ordinary at-least-once behaviour during a rolling restart: such
+		// a message is redelivered after one visibility timeout.)
+		"SQS_WAIT_SECONDS=1",
+		"SQS_VISIBILITY_TIMEOUT=5s",
 	)
 	cmd.Stdout = &logs
 	cmd.Stderr = &logs

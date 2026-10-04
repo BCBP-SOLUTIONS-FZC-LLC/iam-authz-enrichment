@@ -5,7 +5,8 @@ graph LR
         tracing_i["tracing"]
         metrics_i["metrics"]
         logging_i["logging"]
-        panic --> reqid --> tracing_i --> metrics_i --> logging_i
+        timeout_i["timeout (innermost)\nTimeoutUnaryInterceptor —\nGRPC_REQUEST_TIMEOUT"]
+        panic --> reqid --> tracing_i --> metrics_i --> logging_i --> timeout_i
     end
 
     subgraph spans["OTel spans (child of the outer ext_authz span)"]
@@ -28,8 +29,8 @@ graph LR
         p6["iam_authz_enrichment_stale_if_error_served_total\n— nonzero rate should page"]
         p7["iam_authz_enrichment_singleflight_coalesced_total"]
         p8["iam_authz_enrichment_i8_call_latency_seconds"]
-        p9["iam_authz_enrichment_i12_call_latency_seconds"]
-        p10["standard gRPC server metrics\n(from the interceptor chain)"]
+        p9["iam_authz_enrichment_i12_call_latency_seconds\n/ iam_authz_enrichment_i14_call_latency_seconds"]
+        p10["platform_grpc_server_* (interceptor chain,\ngrpc_method bounded by RegisterKnownMethods)\n+ platform_messages_* / platform_dlq_* / queue depth\n(platform-events) — full inventory:\ndocs/observability/metric-registry.md"]
     end
 
     subgraph logs["Structured logs (zap, JSON in non-dev)"]

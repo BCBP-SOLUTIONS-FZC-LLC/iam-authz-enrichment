@@ -25,8 +25,8 @@ const ConsumerName = "iam-authz-enrichment"
 // no table to hold it in.
 //
 // Mark-then-handle (not mark-last): a handler failure Evicts the claim so
-// SQS redelivery is a real retry and the message can still reach the
-// SQS-native DLQ after maxReceiveCount, rather than being silently
+// SQS redelivery is a real retry and the message can still reach its
+// queue's DLQ after maxReceiveCount, rather than being silently
 // swallowed as "already processed". skipDuplicate's MarkProcessed SET NX
 // is itself the duplicate check — there is no separate IsProcessed method.
 type IdempotencyStore interface {

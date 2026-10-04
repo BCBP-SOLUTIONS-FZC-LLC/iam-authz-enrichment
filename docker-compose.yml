@@ -25,6 +25,11 @@ services:
       TENANT_AUTHZ_QUEUE_URL: http://floci:4566/000000000000/tenant-authz-q
       TENDER_AUTHZ_QUEUE_URL: http://floci:4566/000000000000/tender-authz-q
       SHARED_REALM_ISSUER: https://kc.example.com/realms/shared-trial
+      SQS_HANDLER_TIMEOUT: 20s
+      SQS_QUEUE_DEPTH_INTERVAL: 60s
+      # No collector in this compose stack: keep trace IDs, skip export.
+      OTEL_EXPORTER_OTLP_ENDPOINT: none
+      LOG_LEVEL: debug
     depends_on:
       valkey:
         condition: service_healthy

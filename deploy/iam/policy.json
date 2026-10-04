@@ -19,6 +19,22 @@
       ]
     },
     {
+      "Sid": "ForwardPoisonMessagesToDLQ",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes",
+        "sqs:SendMessage"
+      ],
+      "Resource": [
+        "${membership_authz_dlq_arn}",
+        "${user_authz_dlq_arn}",
+        "${billing_authz_dlq_arn}",
+        "${tenant_authz_dlq_arn}",
+        "${tender_authz_dlq_arn}"
+      ]
+    },
+    {
       "Sid": "CloudWatchLogs",
       "Effect": "Allow",
       "Action": [

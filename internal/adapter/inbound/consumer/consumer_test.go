@@ -10,7 +10,10 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/config"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events/mock"
+	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -55,8 +58,8 @@ func TestBuildConsumer_EmptyQueueURL_ReturnsIdleConsumer(t *testing.T) {
 func TestBuildConsumer_RealQueueURL_RunsAndStops(t *testing.T) {
 	t.Parallel()
 	client := &fakeSQSClient{}
-	// MaxReceiveCount is set here so the forced-to-0 path in buildConsumer
-	// is exercised — SQS-native redrive must not be overridden in-process.
+	// MaxReceiveCount is set here so the override in buildConsumer is
+	// exercised — the threshold is always dlqObserveReceiveCount.
 	deps := Deps{
 		Client: client,
 		SQS:    config.SQSConfigEnv{MaxReceiveCount: 5, Region: "ap-south-1"},
@@ -198,4 +201,88 @@ func TestProcessedHandler_HandlerPanics_EvictProcessedAlsoFails_StillRepanics(t 
 	assert.PanicsWithValue(t, "boom", func() {
 		_ = wrapped(context.Background(), events.Envelope[json.RawMessage]{ID: "evt-1"})
 	}, "the original panic must still propagate even if the best-effort EvictProcessed cleanup also fails")
+}
+
+// Without a DLQ publisher, DeadLetterHandler only observes: it logs and
+// returns an error so platform-events never deletes the message, and SQS's
+// redrive moves it.
+func TestDeadLetterHandler_NoForwarding_LogsAndNeverAcks(t *testing.T) {
+	log := &recordingLogger{}
+	err := DeadLetterHandler("membership-authz-q", log, false)(context.Background(), events.Envelope[json.RawMessage]{ID: "e1", Type: "UserUpdated"})
+	require.Error(t, err)
+	assert.Len(t, log.errors, 1)
+}
+
+// With forwarding it returns nil — that is what lets platform-events forward
+// the message to the DLQ and delete it from the source queue.
+func TestDeadLetterHandler_Forwarding_LogsAndLetsTheLibraryForward(t *testing.T) {
+	log := &recordingLogger{}
+	err := DeadLetterHandler("membership-authz-q", log, true)(context.Background(), events.Envelope[json.RawMessage]{ID: "e1", Type: "UserUpdated"})
+	require.NoError(t, err)
+	assert.Len(t, log.errors, 1)
+}
+
+func TestNewDLQPublisher(t *testing.T) {
+	p, err := NewDLQPublisher(awssqs.New(awssqs.Options{Region: "ap-south-1"}), "iam-authz-enrichment", fixtures.NoopLogger{})
+	require.NoError(t, err)
+	assert.NotNil(t, p)
+}
+
+// malformedSQSClient serves one message whose body is not an envelope, then
+// nothing; it records deletes.
+type malformedSQSClient struct {
+	fakeSQSClient
+	served  atomic.Bool
+	deletes atomic.Int64
+}
+
+func (f *malformedSQSClient) ReceiveMessage(ctx context.Context, in *awssqs.ReceiveMessageInput, o ...func(*awssqs.Options)) (*awssqs.ReceiveMessageOutput, error) {
+	if f.served.CompareAndSwap(false, true) {
+		return &awssqs.ReceiveMessageOutput{Messages: []sqstypes.Message{{
+			MessageId: awssdk.String("m1"), ReceiptHandle: awssdk.String("r1"), Body: awssdk.String("not an envelope"),
+		}}}, nil
+	}
+	return f.fakeSQSClient.ReceiveMessage(ctx, in, o...)
+}
+
+func (f *malformedSQSClient) DeleteMessage(context.Context, *awssqs.DeleteMessageInput, ...func(*awssqs.Options)) (*awssqs.DeleteMessageOutput, error) {
+	f.deletes.Add(1)
+	return &awssqs.DeleteMessageOutput{}, nil
+}
+
+// With Deps.DLQ set, a malformed body is forwarded to the queue's DLQ before
+// it is deleted — without forwarding, platform-events would delete it and
+// the eviction it carried would leave no trace anywhere (LLD §16 AE-36).
+func TestBuildConsumer_WithDLQ_ForwardsMalformedBody(t *testing.T) {
+	t.Parallel()
+	client := &malformedSQSClient{}
+	dlq := &mock.DLQPublisher{}
+	deps := Deps{
+		Client: client,
+		SQS:    config.SQSConfigEnv{Region: "ap-south-1"},
+		Cache:  fixtures.NewFakeCache(),
+		Log:    fixtures.NoopLogger{},
+		DLQ:    dlq,
+	}
+	c, err := buildConsumer("http://queue/membership-authz-q", deps, func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Start(ctx) }()
+
+	require.Eventually(t, func() bool { return len(dlq.Sent()) == 1 }, 3*time.Second, 10*time.Millisecond)
+	assert.Equal(t, "not an envelope", string(dlq.Sent()[0].Body))
+	require.Eventually(t, func() bool { return client.deletes.Load() == 1 }, 3*time.Second, 10*time.Millisecond,
+		"deleted from the source queue only after the forward")
+
+	cancel()
+	assert.NoError(t, c.Stop())
+	<-done
+}
+
+func TestQueueName(t *testing.T) {
+	assert.Equal(t, "user-authz-q", queueName("http://sqs.local/000000000000/user-authz-q"))
+	assert.Equal(t, "user-authz-q", queueName("http://sqs.local/000000000000/user-authz-q/"))
+	assert.Equal(t, "bare", queueName("bare"))
 }

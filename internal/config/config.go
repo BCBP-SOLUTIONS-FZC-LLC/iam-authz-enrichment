@@ -10,7 +10,10 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // Config is the fully-resolved runtime configuration.
@@ -25,16 +28,26 @@ type Config struct {
 	ValkeyDialTimeout  time.Duration
 	ValkeyReadTimeout  time.Duration
 	ValkeyWriteTimeout time.Duration
+	// ValkeyEventTimeout is the dial/read/write timeout of the separate Valkey
+	// client SQS event processing uses (evictions, ae:restricted/ae:realm
+	// writes, the ae:processed ledger). Event handling has no 15ms budget, so
+	// it gets generous timeouts instead of the request path's 10ms ones.
+	ValkeyEventTimeout time.Duration
 
 	OrgMembershipBaseURL string
+	// OrgMembershipTimeout bounds each I-8/I-14 call. Default 40ms (LLD §16
+	// AE-37): Org & Membership's own I-8 p99 targets are 15ms on its cache
+	// hit and 30ms on a miss, so a timeout below 30ms fails a share of calls
+	// even when the sibling meets its SLO — and a failed call here is a deny
+	// or a stale answer, not a slow one.
 	OrgMembershipTimeout time.Duration
 
 	// TenderACLBaseURL/TenderACLTimeout back I-12 (GetTenderACL) only, since
 	// ADR-0007 Wave 3 Phase 4 repoints that one call at iam-tender-acl —
-	// I-8/I-14 stay on OrgMembershipBaseURL above. A separate, tighter
-	// timeout than OrgMembershipTimeout's 10ms default: iam-tender-acl's own
-	// TAC-4 SLO is 5ms cache-hit/20ms cache-miss (its LLD §14.1), and this
-	// client has no visibility into which case a given call will hit.
+	// I-8/I-14 stay on OrgMembershipBaseURL above. Default 30ms (AE-37):
+	// iam-tender-acl's TAC-4 targets are 5ms cache-hit / 20ms cache-miss (its
+	// LLD §14.1), plus headroom for the mesh hop — this client cannot know
+	// which case a given call will hit.
 	TenderACLBaseURL string
 	TenderACLTimeout time.Duration
 
@@ -72,8 +85,12 @@ type Config struct {
 	GRPCMaxConcurrentStreams uint32
 	GRPCKeepAliveTime        time.Duration
 	GRPCKeepAliveTimeout     time.Duration
-	GRPCMaxRecvMsgSizeBytes  int
-	GRPCMaxSendMsgSizeBytes  int
+	// GRPCRequestTimeout caps every Check call's deadline server-side
+	// (grpccommon.TimeoutUnaryInterceptor). Envoy normally sends its own
+	// shorter grpc-timeout, which wins; this bounds callers that don't.
+	GRPCRequestTimeout      time.Duration
+	GRPCMaxRecvMsgSizeBytes int
+	GRPCMaxSendMsgSizeBytes int
 
 	// GRPCTLSCertFile/GRPCTLSKeyFile: when both are set, the gRPC server
 	// terminates TLS itself instead of listening in plaintext. Optional —
@@ -140,13 +157,29 @@ const devOrgMembershipBaseURL = "http://localhost:8081"
 // convention as devOrgMembershipBaseURL.
 const devTenderACLBaseURL = "http://localhost:8086"
 
+// ResolveAppEnv returns the one environment name this process uses for
+// everything — metrics, tracing, logging and its own dev/prod checks: APP_ENV,
+// then ENVIRONMENT, trimmed and lowercased, defaulting to "dev". This is the
+// precedence platform-gincommon, platform-events and platform-pgcommon apply
+// on their own, and iam-org-membership's resolveAppEnv, so a deployment that
+// sets only ENVIRONMENT can't get one environment label from the libraries and
+// another from this service.
+func ResolveAppEnv() string {
+	for _, key := range []string{"APP_ENV", "ENVIRONMENT"} {
+		if v := strings.ToLower(strings.TrimSpace(os.Getenv(key))); v != "" {
+			return v
+		}
+	}
+	return "dev"
+}
+
 // Load reads Config from the environment, applying the same conventions as
 // the rest of the IAM fleet (plain os.Getenv + default fallback, no
 // viper/envconfig — see iam-user-profile's main.go envOr()).
 func Load() (Config, error) {
 	cfg := Config{
 		AppName: envOr("APP_NAME", "iam-authz-enrichment"),
-		AppEnv:  envOr("APP_ENV", "dev"),
+		AppEnv:  ResolveAppEnv(),
 		AppPort: envOr("APP_PORT", "8080"),
 		// /metrics is served on its own dedicated port/listener, separate
 		// from AppPort — mirrors iam-org-membership's/iam-tender-acl's/
@@ -195,10 +228,16 @@ func Load() (Config, error) {
 	if cfg.ValkeyWriteTimeout, err = envDuration("VALKEY_WRITE_TIMEOUT", 10*time.Millisecond); err != nil {
 		return Config{}, err
 	}
-	if cfg.OrgMembershipTimeout, err = envDuration("ORG_MEMBERSHIP_TIMEOUT", 10*time.Millisecond); err != nil {
+	if cfg.ValkeyEventTimeout, err = envDuration("VALKEY_EVENT_TIMEOUT", 500*time.Millisecond); err != nil {
 		return Config{}, err
 	}
-	if cfg.TenderACLTimeout, err = envDuration("TENDER_ACL_TIMEOUT", 20*time.Millisecond); err != nil {
+	if cfg.ValkeyEventTimeout <= 0 {
+		return Config{}, fmt.Errorf("VALKEY_EVENT_TIMEOUT must be positive, got %s", cfg.ValkeyEventTimeout)
+	}
+	if cfg.OrgMembershipTimeout, err = envDuration("ORG_MEMBERSHIP_TIMEOUT", 40*time.Millisecond); err != nil {
+		return Config{}, err
+	}
+	if cfg.TenderACLTimeout, err = envDuration("TENDER_ACL_TIMEOUT", 30*time.Millisecond); err != nil {
 		return Config{}, err
 	}
 	if cfg.AeCtxTTL, err = envDuration("AE_CTX_TTL", 60*time.Second); err != nil {
@@ -234,6 +273,12 @@ func Load() (Config, error) {
 	}
 	if cfg.GRPCKeepAliveTimeout, err = envDuration("GRPC_KEEPALIVE_TIMEOUT", 5*time.Second); err != nil {
 		return Config{}, err
+	}
+	if cfg.GRPCRequestTimeout, err = envDuration("GRPC_REQUEST_TIMEOUT", 250*time.Millisecond); err != nil {
+		return Config{}, err
+	}
+	if cfg.GRPCRequestTimeout <= 0 {
+		return Config{}, fmt.Errorf("GRPC_REQUEST_TIMEOUT must be positive, got %s", cfg.GRPCRequestTimeout)
 	}
 	streams, err := envPositiveInt("GRPC_MAX_CONCURRENT_STREAMS", 1000)
 	if err != nil {
@@ -298,6 +343,16 @@ func Load() (Config, error) {
 	// legitimately optional (ResolveTenant falls back to RealmTenantMapSeed
 	// for dedicated-realm-only platforms — see tenant_resolve.go), so main.go
 	// logs a warning for that case instead of failing here.
+	// A VALKEY_URL that looks like a URL must parse: the cache adapter falls
+	// back to treating an unparseable value as a plain host:port, so a typo in
+	// a rediss:// URL would start with TLS silently off (or unreachable) and,
+	// since /readyz deliberately ignores Valkey, fail every request closed.
+	if strings.Contains(cfg.ValkeyURL, "://") {
+		if _, perr := redis.ParseURL(cfg.ValkeyURL); perr != nil {
+			return Config{}, fmt.Errorf("VALKEY_URL is not a valid redis:// or rediss:// URL: %w", perr)
+		}
+	}
+
 	if cfg.AppEnv != "dev" && cfg.OrgMembershipBaseURL == devOrgMembershipBaseURL {
 		return Config{}, fmt.Errorf(
 			"ORG_MEMBERSHIP_BASE_URL is left at its local-dev default (%s) with APP_ENV=%q — set it to the real Org & Membership service address",

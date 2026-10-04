@@ -70,6 +70,23 @@ func (c receiveTrackingClient) ReceiveMessage(ctx context.Context, params *awssq
 	return out, err
 }
 
+// queueAttributesAPI is the optional method platform-events' queue-depth
+// sampler (SQS_QUEUE_DEPTH_INTERVAL) looks for on a consumer's client.
+type queueAttributesAPI interface {
+	GetQueueAttributes(ctx context.Context, params *awssqs.GetQueueAttributesInput, optFns ...func(*awssqs.Options)) (*awssqs.GetQueueAttributesOutput, error)
+}
+
+// GetQueueAttributes delegates to the real client. Without it the wrapper
+// hides the method (SQSClientLike doesn't declare it), and platform-events
+// silently skips platform_queue_depth / platform_dlq_depth sampling.
+func (c receiveTrackingClient) GetQueueAttributes(ctx context.Context, params *awssqs.GetQueueAttributesInput, optFns ...func(*awssqs.Options)) (*awssqs.GetQueueAttributesOutput, error) {
+	api, ok := c.SQSClientLike.(queueAttributesAPI)
+	if !ok {
+		return nil, errors.New("sqs client does not implement GetQueueAttributes")
+	}
+	return api.GetQueueAttributes(ctx, params, optFns...)
+}
+
 // receiveWatchdog tracks, per queue, how many consecutive polls saw at least
 // one new ReceiveMessage error and not a single successful receive. A queue
 // that is merely flaky has a success between polls and its streak resets; a

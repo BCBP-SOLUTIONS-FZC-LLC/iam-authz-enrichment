@@ -15,7 +15,7 @@ The service is organised in concentric Clean Architecture layers. Inner layers h
 ```mermaid
 graph TD
     subgraph cmd["Composition Root  —  cmd/"]
-        main["server/main.go\nwires config → logger → metrics → cache → org client\n→ realm map / restricted-tender set → Checker / Invalidator\n→ gRPC server (ext_authz) + HTTP server (health only) + metrics server (own port)\n+ 5 SQS consumers, each with its own events.WithConcurrency\ngraceful shutdown order: gRPC → HTTP → metrics → consumers → cancel bg work → cache.Close"]
+        main["server/main.go\nwires config → logger → tracing → metrics → cache + eventCache → org client\n→ realm map / restricted-tender set (factstore.go: reads on cache, writes on eventCache)\n→ Checker / Invalidator (Invalidator + consumers on eventCache, VALKEY_EVENT_TIMEOUT)\n→ gRPC server (ext_authz, TimeoutUnaryInterceptor = GRPC_REQUEST_TIMEOUT)\n+ HTTP server (health only) + metrics server (own port)\n+ 5 SQS consumers, each with its own events.WithConcurrency + DLQ forwarding\n+ receive_watchdog.go; every background failure → fatalErr → non-zero exit\ngraceful shutdown order: gRPC → HTTP+metrics → consumers → cancel bg work → eventCache/cache.Close"]
     end
 
     subgraph adapters_in["Inbound Adapters  —  internal/adapter/inbound/"]
@@ -42,8 +42,8 @@ graph TD
     subgraph adapters_out["Outbound Adapters  —  internal/adapter/outbound/"]
         valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
         org_a["orgmembership/\nClient — I-8 memberships + I-14 mfa-freshness against Org & Membership,\nTAC-4 tender-acl (formerly I-12) against iam-tender-acl since ADR-0007\nWave 3 Phase 4 — two base URLs/timeouts, one Go package\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
-        metrics_a["metrics/\nRecorder — Prometheus iam_authz_enrichment_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
-        postgres_a["postgres/\nplatform-pgcommon DSN / PoolConfig / Zap logger /\nOTel tracer / OpenPool wrapper — no live pool (HLD §5.4)"]
+        metrics_a["metrics/\nRecorder — Prometheus iam_authz_enrichment_* series (§10),\nbuilt via gincommon's registry-validated constructors\non an injectable Registerer for test isolation"]
+        postgres_a["postgres/\nplatform-pgcommon DSN / PoolConfig / Zap logger /\ngincommon.NewSpanTracer / OpenPool wrapper — no live pool (HLD §5.4)"]
     end
 
     subgraph config_g["Config  —  internal/config/"]
@@ -146,11 +146,13 @@ sequenceDiagram
 
     Server ->> Server: decodeClaims(MetadataContext)<br/>decodeRequestFacts(ContextExtensions + tender_id from URL path)
 
+    Server ->> Checker: Check(CheckInput)
+    Note over Server,Checker: always handed to Checker — even with no subject — so every<br/>decision is timed and counted in decisions_total / deny_reason_total
+
     alt claims.Subject is empty
-        Server -->> Envoy: Denied 401 DENY_MALFORMED_IDENTITY
-        Note over Server: short-circuits before Checker is ever called
+        Checker -->> Server: Denied — DENY_MALFORMED_IDENTITY (401)
+        Note over Checker: §8.1 — first check in Checker.check, before tenant resolution
     else subject present
-        Server ->> Checker: Check(CheckInput)
         Checker ->> Checker: ResolveTenant(claims, realmMap, sharedRealmIssuer)
 
         alt iss matches neither a dedicated realm nor the shared realm
@@ -168,7 +170,7 @@ sequenceDiagram
                     Note over Checker,Cache: §4.3 — collapses the repeat rebuild call<br/>without ever calling Org & Membership
                 else no negative-cache short-circuit
                     Checker ->> Org: GetMemberships(tenant, user)
-                    Note over Checker,Org: singleflight-coalesced — concurrent callers<br/>for the same (tenant,user) share one call (§4.5)
+                    Note over Checker,Org: singleflight-coalesced — concurrent callers<br/>for the same (tenant,user) share one call (§4.5),<br/>run on context.WithoutCancel so one cancelled caller<br/>can't fail the rest (bounded by ORG_MEMBERSHIP_TIMEOUT)
 
                     alt 404 (ErrNotFound)
                         Org -->> Checker: not found
@@ -315,7 +317,7 @@ flowchart TD
 
 ## Event flow
 
-This service **consumes only** — it publishes nothing. Five SQS queues keep the cache honest; DLQ routing is entirely an SQS-native redrive policy, not application code. This section covers the dedup/handler mechanics — for the full per-queue event-type/effect tables, see [`README.md` § Event architecture](README.md#event-architecture) or [the LLD's §7.1–§7.9](docs/lld/iam-lld-authz-enrichment.md), including §7.8's AsyncAPI-contract reference and §7.9's `EVT-#` invariants.
+This service **consumes only** — it publishes nothing. Five SQS queues keep the cache honest; each queue's DLQ is its own RedrivePolicy target, and platform-events forwards poison messages there (LLD §16 AE-36). This section covers the dedup/handler mechanics — for the full per-queue event-type/effect tables, see [`README.md` § Event architecture](README.md#event-architecture) or [the LLD's §7.1–§7.9](docs/lld/iam-lld-authz-enrichment.md), including §7.8's AsyncAPI-contract reference and §7.9's `EVT-#` invariants.
 
 > Source: [`docs/architecture/mermaid/event-flow.mmd`](docs/architecture/mermaid/event-flow.mmd)
 
@@ -330,7 +332,7 @@ sequenceDiagram
     participant DLQ as SQS -dlq
 
     SQS ->> Consumer: ReceiveMessage (long poll)
-    Note over Consumer: GlueDecoder strips the 18-byte Glue header when the envelope's<br/>dataschema is set (producers Glue-encode once their registry is configured).<br/>A plain-JSON envelope passes through untouched.
+    Note over Consumer: events.GlueDecodeCodec strips the 18-byte Glue header when the envelope's<br/>dataschema is set (producers Glue-encode once their registry is configured).<br/>A plain-JSON envelope passes through untouched.
     alt 5th delivery (ApproximateReceiveCount above 4)
         Consumer ->> Consumer: DeadLetterHandler — log "exhausted retries", return error (never acks)
     end
@@ -362,7 +364,7 @@ sequenceDiagram
     end
 
     Consumer -->> SQS: DeleteMessage (only on nil)
-    Note over SQS,DLQ: A message left undeleted becomes visible again after its\nvisibility timeout and is redelivered. After 5 receives, SQS's own\nredrive policy — not application code — moves it to the -dlq (§5).\nDeadLetterHandler only observes that 5th delivery.\nA DLQ'd message degrades to stale-until-TTL-expiry, not a\ncorrectness failure requiring replay.
+    Note over SQS,DLQ: A message left undeleted becomes visible again after its\nvisibility timeout and is redelivered. On the 5th receive, DeadLetterHandler logs it and\nplatform-events forwards it to the queue's RedrivePolicy -dlq\n(SQS's own redrive is the backstop). A malformed body is\nforwarded on its first receive (AE-36).\nA DLQ'd message degrades to stale-until-TTL-expiry, not a\ncorrectness failure requiring replay.
 ```
 
 **Consumed event types:**
@@ -430,7 +432,10 @@ flowchart TD
 | **Both Valkey and Org & Membership** | Unreachable | All requests denied | `DENY_SERVICE_UNAVAILABLE` (503) — distinct from a 403 so operators can tell "degraded" from "not authorized" |
 | **iam-tender-acl — TAC-4 (tender-ACL, formerly Org & Membership's I-12) only** | Times out / errors | Only the tender-scoped aspect of the request is denied | `DENY_TENDER_ACL_INSUFFICIENT` — scoped to the overlay, never escalates |
 | **Org & Membership — I-14 (MFA-freshness) only** | Times out / errors | Only approver-gated requests affected | `DENY_MFA_STALE` — fails closed; the client's remedy (re-auth) is the same as for a genuinely stale assertion |
-| **One SQS queue / its DLQ** | Consumer or handler failure | That queue's cache facts go stale until the message is redelivered or DLQ'd | SQS's own `maxReceiveCount=5` redrive policy; degrades to "stale until TTL expiry", never a correctness failure requiring replay |
+| **One SQS queue / its DLQ** | Consumer or handler failure | That queue's cache facts go stale until the message is redelivered or DLQ'd | Forwarded to the queue's DLQ on the 5th delivery (platform-events, SQS redrive as backstop); degrades to "stale until TTL expiry", never a correctness failure requiring replay |
+| **Org & Membership / iam-tender-acl — slow, not down** | Responds, but slower than the client timeout | A timed-out call is a deny or a stale answer, not a slow one | Timeouts sized above each sibling's own p99 target — `ORG_MEMBERSHIP_TIMEOUT` 40ms, `TENDER_ACL_TIMEOUT` 30ms — never below it; `GRPC_REQUEST_TIMEOUT` (250ms) caps a whole `Check` server-side when Envoy sends no shorter `grpc-timeout` (LLD §16 AE-37) |
+| **Envoy cancels one request while others wait on the same cache miss** | The first singleflight caller's deadline fires | Previously every coalesced request for that `(tenant, user)` failed with it → `DENY_SERVICE_UNAVAILABLE` | The shared I-8 call runs on `context.WithoutCancel`, bounded by `ORG_MEMBERSHIP_TIMEOUT`; each caller keeps its own deadline afterwards (LLD rev 1.32) |
+| **Valkey slow for a moment during event processing** | One round trip exceeds the request path's 10ms timeout | An eviction or `TenderRestricted` write fails and waits a full 30s visibility timeout — indefinitely wrong for `ae:restricted` (no TTL) | Consumers write through a second Valkey client (`Cache.WithTimeouts`, `VALKEY_EVENT_TIMEOUT` 500ms); `cmd/server/factstore.go` routes `SetRealm`/`SetRestricted` there while reads stay on the request client (LLD §3.4) |
 | **OTel Collector** | Unreachable | Spans not exported | Metrics and logs unaffected; trace IDs still valid but not persisted |
 | **Panic in `Check()`** | Any panic | The gRPC panic-recovery interceptor returns an error response | Recorded in metrics and logs; other in-flight requests unaffected |
 | **A wedged Envoy connection / in-flight `Check()` during shutdown (SIGTERM)** | Deliberate shutdown, not a runtime dependency failure | Previously unbounded — `grpcServer.GracefulStop()` blocked until every connection drained, stalling every later shutdown step (HTTP shutdown, consumer drain, `cache.Close()`) | Bounded to 10s (`grpcGracefulStopTimeout`), falling back to a hard `Stop()` — the rebalanced shutdown budget (grpc 10s + HTTP/metrics 10s + consumer drain ~35s = 55s) fits `terminationGracePeriodSeconds` (60s) with a 5s margin (LLD §16 AE-33) |
@@ -452,7 +457,8 @@ graph LR
         tracing_i["tracing"]
         metrics_i["metrics"]
         logging_i["logging"]
-        panic --> reqid --> tracing_i --> metrics_i --> logging_i
+        timeout_i["timeout (innermost)\nTimeoutUnaryInterceptor —\nGRPC_REQUEST_TIMEOUT"]
+        panic --> reqid --> tracing_i --> metrics_i --> logging_i --> timeout_i
     end
 
     subgraph spans["OTel spans (child of the outer ext_authz span)"]
@@ -475,8 +481,8 @@ graph LR
         p6["iam_authz_enrichment_stale_if_error_served_total\n— nonzero rate should page"]
         p7["iam_authz_enrichment_singleflight_coalesced_total"]
         p8["iam_authz_enrichment_i8_call_latency_seconds"]
-        p9["iam_authz_enrichment_i12_call_latency_seconds"]
-        p10["standard gRPC server metrics\n(from the interceptor chain)"]
+        p9["iam_authz_enrichment_i12_call_latency_seconds\n/ iam_authz_enrichment_i14_call_latency_seconds"]
+        p10["platform_grpc_server_* (interceptor chain,\ngrpc_method bounded by RegisterKnownMethods)\n+ platform_messages_* / platform_dlq_* / queue depth\n(platform-events) — full inventory:\ndocs/observability/metric-registry.md"]
     end
 
     subgraph logs["Structured logs (zap, JSON in non-dev)"]
@@ -493,7 +499,9 @@ graph LR
 
 **SLOs (§10):** decision latency p99 > 50ms for 5 min → SEV-2. Availability < 99.5% over 10 min → SEV-1. `iam_authz_enrichment_stale_if_error_served_total` at a nonzero rate means a live dependency outage is in progress — page on it directly rather than waiting for the SLO windows above to trip. These thresholds are validated against a single-machine, loopback-network `test/load` run only (README § Testing) — not yet measured against a real cluster/network path.
 
-**A gap Prometheus can't cover:** DLQ depth is a CloudWatch-native metric, and DLQ routing is entirely SQS-native (no application code ever reads a `-dlq` queue — see the "DLQ routing is infra-only" invariant above). `deploy/monitoring/dlq-alarms.tf.example` is the only alerting on a message actually landing in one; without it, a permanently-undeliverable message sits there unmonitored indefinitely. See `docs/runbook.md` for what to do when it fires.
+**Full metric inventory:** [`docs/observability/`](docs/observability/) — `metric-registry.md` (generated by `make metrics-inventory`, drift-checked by `make metrics-check` in CI) lists every `platform_*` series platform-gincommon/platform-events emit alongside the `iam_authz_enrichment_*` business series above; `runbooks.md` has per-alert triage. Alert rules live only in `deploy/monitoring/app-alerts.yml` (the Helm `PrometheusRule` is rendered from it by `make prometheusrule`, and both are promtool-tested in `deploy/monitoring/tests/`). Every observability entry point goes through `pkg/gincommon` — `InitTracingWithConfig` (same identity as the metrics config), `MetricsHandler`, `NewTracer`, `NewSpanTracer`, `InjectTraceContext` — no local tracer/propagator/`promhttp` copies.
+
+**A gap Prometheus can't cover:** DLQ depth is a CloudWatch-native metric, and no application code ever reads a `-dlq` queue (see the "DLQ target is infra-owned" invariant above); `platform_dlq_messages_total` counts forwards, but nothing on `/metrics` says a message is still sitting there. `deploy/monitoring/dlq-alarms.tf.example` is the only alerting on a message actually landing in one; without it, a permanently-undeliverable message sits there unmonitored indefinitely. See `docs/runbook.md` for what to do when it fires.
 
 ---
 
@@ -509,14 +517,18 @@ graph LR
 | The first failing check in the §3.1 precedence order wins | `usecase.Checker.check` evaluates steps 1–5 in a fixed, linear order with no reordering based on cost or code-path convenience |
 | A tender-ACL failure fails closed for that overlay only | `usecase/check.go` returns `DENY_TENDER_ACL_INSUFFICIENT` directly at the TAC-4 (formerly I-12) call site, independent of `DecideDependencyOutcome` |
 | Consumer idempotency never double-applies an eviction, and never permanently swallows a bad message | `MarkProcessed` (SET NX) before dispatch; `EvictProcessed` on handler failure so a redelivery is a real retry, not a false-positive dedup skip |
-| DLQ routing is infra-only | SQS's native redrive policy does the counting and the move (see `scripts/init-localstack.sh`). The only application code is observability: `WithMaxReceiveCount(4)` + `DeadLetterHandler`, which logs the 5th and last delivery and always returns an error — so it never acks, and it is what stops platform-events deleting a message past its max receive count |
-| Glue-encoded events are decoded, never dead-lettered for their wire format | `GlueDecoder` (`WithConsumerCodec`) strips the 18-byte Glue header whenever `dataschema` is set — every sibling producer Glue-encodes once its registry is configured |
+| DLQ target is infra-owned, poison messages are never deleted | Each queue's DLQ is its own RedrivePolicy target (`scripts/init-localstack.sh`, Terraform); nothing in this repo names or creates one, and a consumer refuses to start on a queue without one. platform-events' `WithDLQForwarding` sends a malformed body, a failed Glue decode, or a 5th delivery (after `WithMaxReceiveCount(4)` failures, logged first by `DeadLetterHandler`) to that DLQ before deleting it, preserving body and attributes. SQS's own redrive after the 5th receive is the backstop when a forward fails. No replay mechanism (§5) — LLD §16 AE-36 |
+| Glue-encoded events are decoded, never dead-lettered for their wire format | platform-events' `GlueDecodeCodec` (`WithConsumerCodec`) strips the 18-byte Glue header whenever `dataschema` is set — every sibling producer Glue-encodes once its registry is configured |
 | Stale-if-error never exceeds its hard cap regardless of configuration | `internal/config/config.go` clamps `AE_STALE_IF_ERROR_MAX_AGE` to 5 minutes even if a higher value is configured |
 | Realm-map freshness survives the direct-paid-signup edge case | Both `TenantConverted` and `TenantRealmReady` update the realm map; only the latter fires for a tenant that never went through conversion |
 | A deployment left pointed at the local-dev Org & Membership URL fails at startup, not silently on every request | `internal/config/config.go`'s `Load()` returns an error when `OrgMembershipBaseURL` is still `http://localhost:8081` and `APP_ENV != "dev"` |
 | The five SQS consumers stop concurrently, not sequentially, on shutdown | `cmd/server/main.go`'s shutdown path uses a `sync.WaitGroup`, bounding worst-case shutdown to one drain window instead of five |
 | A consumer whose `ReceiveMessage` calls fail forever is still detected and restarts the pod | `platform-events`' consumer loop never returns an error for this case — it retries internally, forever, logging only. `cmd/server/receive_watchdog.go` wraps each consumer's SQS client to count that queue's own `ReceiveMessage` errors and successes, and pushes to `fatalErr` after several minutes of errors with no successful receive (no dependency on a metric name), closing a gap `fatalErr` alone could not detect |
 | Two `*_AUTHZ_QUEUE_URL` env vars can never silently point at the same queue | `internal/config/config.go`'s `Load()` fails fast on a duplicate — undetected, it would also corrupt the receive-error watchdog's per-URL streak tracking (two aliases racing to update/reset the same counter every poll) |
+| A fatal background failure exits non-zero; SIGTERM exits 0 | `run()` returns the `fatalErr` cause after the graceful shutdown, so a restart caused by a dead server or consumer shows up as `Error`/`CrashLoopBackOff`, not `Completed` — pinned by `test/e2e/startup_test.go` |
+| A request with no verified subject is still counted | `Server.Check` always calls `Checker.Check`, which denies `DENY_MALFORMED_IDENTITY` as its first step — so it lands in `decisions_total`/`deny_reason_total` like every other decision |
+| One environment name everywhere | `config.ResolveAppEnv` (`APP_ENV`, then `ENVIRONMENT`, trimmed, lowercased, default `dev`) — the precedence the platform libraries apply, so metric/trace `environment` labels can't disagree with this service's dev/prod checks |
+| A malformed `VALKEY_URL` fails at startup | `Load()` runs `redis.ParseURL` on any value containing `://` — otherwise a typo'd `rediss://` URL silently fell back to a plain address with TLS off, and failed every request closed behind a green `/readyz` |
 | An unexpected death of the gRPC/HTTP/metrics server itself — not just a consumer — still restarts the pod | `values.yaml`'s liveness/readiness probes are `httpGet` against the HTTP server only, with no `grpc:` probe against the gRPC port's health service; `cmd/server/main.go`'s three server goroutines report any non-graceful `Serve`/`ListenAndServe` exit to the same `fatalErr` channel a stuck consumer feeds, so a dead gRPC server (the entire ext_authz decision path) can't run indefinitely behind a healthy-looking `/healthz` (LLD §16 AE-28) |
 
 ---

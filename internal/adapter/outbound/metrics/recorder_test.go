@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -16,73 +17,77 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
 
-func TestConstLabelsOrNil(t *testing.T) {
-	t.Parallel()
-	assert.Nil(t, constLabelsOrNil(nil))
-	assert.Nil(t, constLabelsOrNil(prometheus.Labels{}))
-	assert.Equal(t, prometheus.Labels{"service": "s"}, constLabelsOrNil(prometheus.Labels{"service": "s"}))
-}
-
-func histogramSampleCount(t *testing.T, h prometheus.Histogram) uint64 {
-	t.Helper()
-	var m dto.Metric
-	require.NoError(t, h.Write(&m))
-	return m.GetHistogram().GetSampleCount()
-}
-
-// newTestRecorder builds a Recorder on its own private registry, so tests
-// never collide with each other (or with a real New() call elsewhere in the
-// process) over the process-wide default Prometheus registry.
-func newTestRecorder(t *testing.T) *Recorder {
-	t.Helper()
-	return newRecorder(prometheus.NewRegistry())
-}
-
-func TestNew_RegistersOnDefaultRegisterer(t *testing.T) {
-	// The only test allowed to touch the real default registry — proves New()
-	// wires newRecorder to prometheus.DefaultRegisterer as documented.
-	// Deliberately not t.Parallel() to avoid racing any other test that
-	// might also touch the default registry.
-	r := New()
-	assert.NotNil(t, r)
-}
-
-func TestNew_RegistersOnExplicitRegisterer(t *testing.T) {
-	t.Parallel()
-	// Proves New(reg) wires newRecorder to the given registerer instead of
-	// silently falling back to prometheus.DefaultRegisterer — the case
-	// cmd/server exercises by passing gincommon.MetricsRegisterer().
-	reg := prometheus.NewRegistry()
-	r := New(reg)
-	assert.NotNil(t, r)
-
-	mfs, err := reg.Gather()
-	require.NoError(t, err)
-	assert.NotEmpty(t, mfs, "iam_authz_enrichment_* metrics should be registered on the explicit registerer")
-}
-
-func TestNew_AppliesGincommonConstLabels(t *testing.T) {
-	// Not t.Parallel: ObservabilityMiddlewares' metrics.Init is process-wide
-	// sync.Once, and this test must run after TestNew_RegistersOnDefaultRegisterer
-	// so that test still exercises gincommonLabels' empty-before-init path.
+// TestMain initialises gincommon's metrics identity once for this test
+// binary: gincommon's Tier 3 constructors refuse to build a collector before
+// it exists (cmd/server calls ObservabilityMiddlewares before metrics.New),
+// and v1.4.0+ rejects a second, different identity in the same process.
+func TestMain(m *testing.M) {
 	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
 		ServiceName:  "iam-authz-enrichment",
 		BuildVersion: "test",
 		Domain:       "iam",
 		Environment:  "test",
 	})
+	os.Exit(m.Run())
+}
+
+func histogramSampleCount(t *testing.T, h *gincommon.HistogramVec) uint64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, h.WithLabelValues().(prometheus.Histogram).Write(&m))
+	return m.GetHistogram().GetSampleCount()
+}
+
+// newTestRecorder builds a Recorder on its own private registry, so tests
+// never collide with each other over gincommon's process-wide registerer.
+func newTestRecorder(t *testing.T) *Recorder {
+	t.Helper()
+	r, err := New(prometheus.NewRegistry())
+	require.NoError(t, err)
+	return r
+}
+
+func TestNew_ReturnsRegistrationError(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	_, err := New(reg)
+	require.NoError(t, err)
+
+	r, err := New(reg)
+	require.Error(t, err, "a second registration of the same collectors must fail, not panic")
+	assert.Nil(t, r)
+	assert.Contains(t, err.Error(), "iam_authz_enrichment_decisions_total")
+	assert.Contains(t, err.Error(), "iam_authz_enrichment_i14_call_latency_seconds",
+		"every failing collector is reported, not only the first")
+}
+
+func TestLatencyBuckets(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, prometheus.ExponentialBuckets(0.0005, 2, 16), latencyBuckets)
+}
+
+func TestNew_AppliesGincommonConstLabels(t *testing.T) {
+	t.Parallel()
 	want := gincommon.MetricsConstLabels()
 	require.Equal(t, "iam-authz-enrichment", want["service"])
 	require.Equal(t, "iam", want["domain"])
 	require.Equal(t, "test", want["environment"])
 	_, hasVersion := want["version"]
 	require.False(t, hasVersion, "version is only on platform_build_info, never a const label")
-	require.Equal(t, want, gincommonLabels())
-	require.Equal(t, want, constLabelsOrNil(want))
 
 	reg := prometheus.NewRegistry()
-	r := New(reg)
+	r, err := New(reg)
+	require.NoError(t, err)
 	r.ObserveDecision("", true)
+	r.ObserveDecision(domain.DenyRoleInsufficient, false)
+	r.ObserveCacheHit(true)
+	r.ObserveNegativeCacheHit(true)
+	r.ObserveStaleIfErrorServed()
+	r.ObserveSingleflightCoalesced()
+	r.ObserveDecisionLatency(time.Millisecond)
+	r.ObserveI8Latency(time.Millisecond)
+	r.ObserveI12Latency(time.Millisecond)
+	r.ObserveI14Latency(time.Millisecond)
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
@@ -132,7 +137,7 @@ func TestObserveDecision_Deny(t *testing.T) {
 	r.ObserveDecision(domain.DenyRoleInsufficient, false)
 
 	assert.Equal(t, float64(1), testutil.ToFloat64(r.decisionsTotal.WithLabelValues("deny")))
-	assert.Equal(t, float64(1), testutil.ToFloat64(r.denyReasonTotal.WithLabelValues(string(domain.DenyRoleInsufficient))))
+	assert.Equal(t, float64(1), testutil.ToFloat64(r.denyReasonTotal.WithLabelValues("deny_role_insufficient")))
 }
 
 func TestObserveCacheHit(t *testing.T) {
