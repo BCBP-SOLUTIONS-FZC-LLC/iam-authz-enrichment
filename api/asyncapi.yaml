@@ -356,6 +356,16 @@ channels:
         deadLetterQueue:
           name: tenant-authz-q-dlq
           maxReceiveCount: 5
+      sns:
+        consumers:
+          - protocol: sqs
+            endpoint:
+              url: "https://sqs.ap-south-1.amazonaws.com/000000000000/tenant-authz-q"
+            filterPolicy:
+              type:
+                - TenantConverted
+                - TenantRealmReady
+            filterPolicyScope: MessageAttributes
 
   tender-authz-q:
     address: tender-authz-q
