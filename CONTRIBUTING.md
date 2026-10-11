@@ -6,7 +6,7 @@ test requirements, and the PR process.
 
 ## Prerequisites
 
-- Go 1.26.6+ (matches `go.mod`)
+- Go 1.26.9+ (matches `go.mod`)
 - Docker (required for the Valkey + LocalStack SQS integration tier)
 - `golangci-lint` and `go-arch-lint` are managed as Go tools — no separate install needed
 - `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (private module access)

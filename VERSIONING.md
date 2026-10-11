@@ -138,7 +138,7 @@ Both match `release.yml`'s tag trigger (`v[0-9]*.[0-9]*.[0-9]*-*`) and produce a
 
 | iam-authz-enrichment | Go (`go.mod`) | Envoy `ext_authz` API | `go-control-plane` |
 |---|---|---|---|
-| `v0.1.x` | `1.26.6+` | `V3` (`transport_api_version: V3`) | `v1.37.0` |
+| `v0.1.x` | `1.26.9+` | `V3` (`transport_api_version: V3`) | `v1.37.0` |
 
 Key runtime dependencies pinned in `go.mod` at the time of a given release (see `CHANGELOG.md` for exact per-release bumps): `platform-gincommon` (gRPC observability interceptors, health handler), `platform-events` (SQS consumer loop, `Envelope[T]` decoding), `platform-pgcommon` (DSN/pool config, Zap logger adapter, OTel query tracer — no live pool; HLD §5.4). None are re-exported — a consumer of this *service* never needs any as a direct dependency.
 

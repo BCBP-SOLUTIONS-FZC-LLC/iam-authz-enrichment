@@ -3,7 +3,7 @@
 Real-time authorization decisions for the platform: enriches every authenticated request with tenant, role, and permission context via a low-latency, cache-backed policy engine.
 
 **Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment`
-**Module:** Go 1.26.6+ · private module · stateless, 5–20 replicas, HPA on RPS · **no database**
+**Module:** Go 1.26.9+ · private module · stateless, 5–20 replicas, HPA on RPS · **no database**
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full layer model, request-flow/cache/event/failure-handling diagrams, and the threat model.
 
@@ -263,7 +263,7 @@ The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) �
 
 ### Prerequisites
 
-- Go 1.26.6+
+- Go 1.26.9+
 - Docker (for `make docker-up` — Valkey + floci SQS, plus floci-ui, a web console for floci)
 - SSH key or `GO_PRIVATE_TOKEN` registered for `github.com/BCBP-SOLUTIONS-FZC-LLC` (for `platform-gincommon`/`platform-events`/`platform-pgcommon`)
 

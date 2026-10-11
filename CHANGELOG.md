@@ -77,6 +77,7 @@ This service has no production deployment yet — pre-1.0, still in active devel
 
 ### Fixed
 
+- **`make vuln-check` / Trivy failed on 9 reachable standard-library vulnerabilities** (GO-2026-6603/6605/6607/6608/6610/6611/6612/6613/6617 in `net/http`, `crypto/tls`, `mime/multipart`). Bumped `go.mod`'s `go` directive 1.26.6 → 1.26.9 and `golang.org/x/net` v0.59.0 → v0.60.0; re-pinned the Dockerfile's `golang:1.26.9-alpine` builder digest via `make pin-base-images`.
 - **A fatal shutdown exited 0.** When a background component failed (a dead gRPC/HTTP/metrics server, a consumer that cannot start — e.g. a queue without a RedrivePolicy — or the receive watchdog), `cmd/server` shut down gracefully and then returned nil, so the pod showed "Completed" instead of an error and crash-loops were invisible to restart-count alerting. It now exits non-zero with the cause; a SIGTERM shutdown still exits 0. Found by the new startup e2e tests.
 - **A clean SIGTERM shutdown exited 1 on Linux.** `run()` returned the logger flush error from `grpccommon.Shutdown`, and zap's `Sync` fails with `EINVAL` when stderr is a pipe — true under every container runtime — so every rolling restart looked like a failure. A flush error is now only logged (as iam-org-membership does) and never sets the exit code. Found by `TestShutdown_SIGTERM_ExitsZero` in CI.
 
