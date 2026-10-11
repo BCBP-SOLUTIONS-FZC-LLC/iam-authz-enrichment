@@ -1,9 +1,12 @@
 package consumer
 
 import (
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
+	"os"
+	"strings"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/config"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/outbox"
 )
 
 // PlatformConfig is the platform-events composition-root bundle
@@ -34,6 +37,7 @@ func LoadPlatform(log Logger, region, endpointURL string) PlatformConfig {
 	sqsEnv := config.LoadSQS()
 	snsEnv := config.LoadSNS()
 	outboxEnv := config.LoadOutbox()
+	outboxEnv.Warnings = dropMissingDSNWarning(outboxEnv.Warnings, outboxEnv.DatabaseURL)
 
 	var snsCfg events.SNSConfig
 	var outboxCfg outbox.Config
@@ -71,6 +75,26 @@ func LoadPlatform(log Logger, region, endpointURL string) PlatformConfig {
 		SNSTopicARN:       snsEnv.TopicARN,
 		OutboxDatabaseURL: outboxEnv.DatabaseURL,
 	}
+}
+
+// dropMissingDSNWarning removes platform-pgcommon's "PG_USER/PG_DBNAME are
+// required to build a DSN" warning when no DATABASE_URL is set either. This
+// service has no database (HLD §5.4), so with no database env at all the
+// warning is noise on every startup — the same rule cmd/server applies to
+// postgres.PoolConfig's warnings. A partially set PG_* config (DSN still
+// unbuildable) keeps the warning.
+func dropMissingDSNWarning(warnings []string, databaseURL string) []string {
+	if databaseURL != "" {
+		return warnings
+	}
+	kept := warnings[:0:0]
+	for _, w := range warnings {
+		if strings.Contains(w, "PG_USER/PG_DBNAME") && os.Getenv("PG_USER") == "" && os.Getenv("PG_DBNAME") == "" {
+			continue
+		}
+		kept = append(kept, w)
+	}
+	return kept
 }
 
 // SNSPublisherSkipReason is non-empty when SNS_TOPIC_ARN is set on this

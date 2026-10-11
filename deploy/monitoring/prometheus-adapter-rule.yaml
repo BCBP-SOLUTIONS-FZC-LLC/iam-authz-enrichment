@@ -1,5 +1,5 @@
-# Prometheus Adapter ConfigMap — maps authz_decisions_total to the Custom
-# Metrics API so the HPA can scale on authz_decisions_per_second.
+# Prometheus Adapter ConfigMap — maps iam_authz_enrichment_decisions_total to the Custom
+# Metrics API so the HPA can scale on iam_authz_enrichment_decisions_per_second.
 #
 # Deploy into the namespace where prometheus-adapter runs (typically kube-system
 # or monitoring). Merge with any existing prometheus-adapter ConfigMap rather
@@ -21,13 +21,13 @@ metadata:
 data:
   config.yaml: |
     rules:
-      # Expose per-pod decision rate as authz_decisions_per_second so the HPA
-      # can use type: Pods / metric: authz_decisions_per_second. Every
-      # Check() call increments authz_decisions_total exactly once (allow or
+      # Expose per-pod decision rate as iam_authz_enrichment_decisions_per_second so the HPA
+      # can use type: Pods / metric: iam_authz_enrichment_decisions_per_second. Every
+      # Check() call increments iam_authz_enrichment_decisions_total exactly once (allow or
       # deny), so this is a direct decision-rate signal, computed from the
       # counter scraped by the ServiceMonitor (serviceMonitor.enabled: true
       # in Helm values).
-      - seriesQuery: 'authz_decisions_total{namespace!="",pod!=""}'
+      - seriesQuery: 'iam_authz_enrichment_decisions_total{namespace!="",pod!=""}'
         resources:
           overrides:
             namespace:

@@ -1,7 +1,7 @@
 package postgres
 
 import (
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/domain"
 )
 
 // Logger is the structured logging interface LoggerAdapter wraps. Matches

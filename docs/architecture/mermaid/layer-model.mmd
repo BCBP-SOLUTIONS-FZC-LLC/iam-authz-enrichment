@@ -1,6 +1,6 @@
 graph TD
     subgraph cmd["Composition Root  —  cmd/"]
-        main["server/main.go\nwires config → logger → metrics → cache → org client\n→ realm map / restricted-tender set → Checker / Invalidator\n→ gRPC server (ext_authz) + HTTP server (health only) + metrics server (own port)\n+ 5 SQS consumers, each with its own events.WithConcurrency\ngraceful shutdown order: gRPC → HTTP → metrics → consumers → cancel bg work → cache.Close"]
+        main["server/main.go\nwires config → logger → tracing → metrics → cache + eventCache → org client\n→ realm map / restricted-tender set (factstore.go: reads on cache, writes on eventCache)\n→ Checker / Invalidator (Invalidator + consumers on eventCache, VALKEY_EVENT_TIMEOUT)\n→ gRPC server (ext_authz, TimeoutUnaryInterceptor = GRPC_REQUEST_TIMEOUT)\n+ HTTP server (health only) + metrics server (own port)\n+ 5 SQS consumers, each with its own events.WithConcurrency + DLQ forwarding\n+ receive_watchdog.go; every background failure → fatalErr → non-zero exit\ngraceful shutdown order: gRPC → HTTP+metrics → consumers → cancel bg work → eventCache/cache.Close"]
     end
 
     subgraph adapters_in["Inbound Adapters  —  internal/adapter/inbound/"]
@@ -27,8 +27,8 @@ graph TD
     subgraph adapters_out["Outbound Adapters  —  internal/adapter/outbound/"]
         valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
         org_a["orgmembership/\nClient — I-8 memberships + I-14 mfa-freshness against Org & Membership,\nTAC-4 tender-acl (formerly I-12) against iam-tender-acl since ADR-0007\nWave 3 Phase 4 — two base URLs/timeouts, one Go package\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
-        metrics_a["metrics/\nRecorder — Prometheus authz_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
-        postgres_a["postgres/\nplatform-pgcommon DSN / PoolConfig / Zap logger /\nOTel tracer / OpenPool wrapper — no live pool (HLD §5.4)"]
+        metrics_a["metrics/\nRecorder — Prometheus iam_authz_enrichment_* series (§10),\nbuilt via gincommon's registry-validated constructors\non an injectable Registerer for test isolation"]
+        postgres_a["postgres/\nplatform-pgcommon DSN / PoolConfig / Zap logger /\ngincommon.NewSpanTracer / OpenPool wrapper — no live pool (HLD §5.4)"]
     end
 
     subgraph config_g["Config  —  internal/config/"]

@@ -8,7 +8,7 @@ sequenceDiagram
     participant DLQ as SQS -dlq
 
     SQS ->> Consumer: ReceiveMessage (long poll)
-    Note over Consumer: GlueDecoder strips the 18-byte Glue header when the envelope's<br/>dataschema is set (producers Glue-encode once their registry is configured).<br/>A plain-JSON envelope passes through untouched.
+    Note over Consumer: events.GlueDecodeCodec strips the 18-byte Glue header when the envelope's<br/>dataschema is set (producers Glue-encode once their registry is configured).<br/>A plain-JSON envelope passes through untouched.
     alt 5th delivery (ApproximateReceiveCount above 4)
         Consumer ->> Consumer: DeadLetterHandler — log "exhausted retries", return error (never acks)
     end
@@ -40,4 +40,4 @@ sequenceDiagram
     end
 
     Consumer -->> SQS: DeleteMessage (only on nil)
-    Note over SQS,DLQ: A message left undeleted becomes visible again after its\nvisibility timeout and is redelivered. After 5 receives, SQS's own\nredrive policy — not application code — moves it to the -dlq (§5).\nDeadLetterHandler only observes that 5th delivery.\nA DLQ'd message degrades to stale-until-TTL-expiry, not a\ncorrectness failure requiring replay.
+    Note over SQS,DLQ: A message left undeleted becomes visible again after its\nvisibility timeout and is redelivered. On the 5th receive, DeadLetterHandler logs it and\nplatform-events forwards it to the queue's RedrivePolicy -dlq\n(SQS's own redrive is the backstop). A malformed body is\nforwarded on its first receive (AE-36).\nA DLQ'd message degrades to stale-until-TTL-expiry, not a\ncorrectness failure requiring replay.

@@ -2,10 +2,12 @@
 # This file is *illustrative*, not applied by the application. Platform
 # Terraform owns the authoritative version of this resource.
 #
-# Why this exists: DLQ routing is entirely SQS-native (see
-# internal/adapter/inbound/consumer's package doc comment and
-# ARCHITECTURE.md's "DLQ routing is infra-only" invariant) — no application
-# code ever reads a -dlq queue. Without an explicit alarm, a message that
+# Why this exists: poison messages are forwarded to each queue's RedrivePolicy
+# DLQ (platform-events WithDLQForwarding, with SQS's redrive as backstop —
+# internal/adapter/inbound/consumer's package doc comment, ARCHITECTURE.md's
+# "DLQ target is infra-owned" invariant), but no application code ever reads
+# a -dlq queue. platform_dlq_messages_total counts forwards, not what is still
+# sitting there. Without an explicit alarm, a message that
 # lands in one sits there completely unmonitored: nothing pages anyone, and
 # nothing but a human manually checking `awslocal sqs get-queue-attributes`
 # would ever notice. Prometheus can't cover this gap either — SQS queue

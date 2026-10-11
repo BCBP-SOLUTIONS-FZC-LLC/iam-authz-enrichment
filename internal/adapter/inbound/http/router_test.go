@@ -18,14 +18,15 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
-// testGinConfig satisfies gincommon.ObservabilityMiddlewares's requirement
-// that ServiceName be non-empty; Logger is left nil, which gincommon
-// documents as disabling logging (no-op) rather than panicking.
+// testGinConfig satisfies gincommon.ObservabilityMiddlewares's requirements
+// (non-empty ServiceName, a registry Domain and a standard Environment);
+// Logger is left nil, which gincommon documents as disabling logging (no-op)
+// rather than panicking.
 func testGinConfig() gincommon.Config {
-	return gincommon.Config{ServiceName: "iam-authz-enrichment-test"}
+	return gincommon.Config{ServiceName: "iam-authz-enrichment-test", Domain: "iam", Environment: "test"}
 }
 
-// testDocsConfig leaves Environment empty (not "production"), so
+// testDocsConfig leaves Environment empty (not "prod"), so
 // DocsConfig.active() is true — the AsyncAPI viewer is mounted the same
 // way it would be outside production in a real deployment.
 func testDocsConfig() httpadapter.DocsConfig {

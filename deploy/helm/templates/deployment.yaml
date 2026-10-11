@@ -1,3 +1,6 @@
+{{- if and (eq (toString .Values.env.APP_ENV) "prod") (not .Values.grpcTLS.enabled) (not .Values.grpcTLS.meshProvidesMTLS) }}
+{{- fail "APP_ENV=prod with plaintext gRPC: set grpcTLS.enabled=true, or grpcTLS.meshProvidesMTLS=true once you have confirmed a service mesh / CNI encrypts traffic to this pod (values.yaml grpcTLS)." }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,11 +17,11 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      # maxSurge: 0 is required with hard pod anti-affinity on a 3-node cluster.
-      # A surge pod cannot be scheduled when every node already holds a replica —
-      # the rollout would stall indefinitely. Use maxUnavailable: 1 instead.
-      maxSurge: 0
-      maxUnavailable: 1
+      # Surge first, never drop below the desired count: with topology spread
+      # (not hard anti-affinity) a surge pod can always schedule, so a rollout
+      # never reduces capacity on the authorization path.
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels:
@@ -108,13 +111,19 @@ spec:
           secret:
             secretName: {{ .Values.grpcTLS.secretName }}
       {{- end }}
-      affinity:
-        # Hard anti-affinity: require pods to land on different nodes.
-        # preferred (soft) anti-affinity allows all replicas on one node —
-        # a single node failure would take the service to zero despite the PDB.
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  {{- include "iam-authz-enrichment.selectorLabels" . | nindent 18 }}
-              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        # values.yaml topologySpread: hard across zones, best effort across
+        # nodes — see the comment there for why this replaced hard
+        # one-pod-per-node anti-affinity.
+        - maxSkew: {{ .Values.topologySpread.zoneMaxSkew }}
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: {{ .Values.topologySpread.zoneWhenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "iam-authz-enrichment.selectorLabels" . | nindent 14 }}
+        - maxSkew: {{ .Values.topologySpread.nodeMaxSkew }}
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ .Values.topologySpread.nodeWhenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "iam-authz-enrichment.selectorLabels" . | nindent 14 }}

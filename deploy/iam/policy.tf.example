@@ -38,6 +38,11 @@ resource "aws_iam_policy" "iam_authz_enrichment" {
     billing_authz_queue_arn    = aws_sqs_queue.billing_authz.arn
     tenant_authz_queue_arn     = aws_sqs_queue.tenant_authz.arn
     tender_authz_queue_arn     = aws_sqs_queue.tender_authz.arn
+    membership_authz_dlq_arn   = aws_sqs_queue.membership_authz_dlq.arn
+    user_authz_dlq_arn         = aws_sqs_queue.user_authz_dlq.arn
+    billing_authz_dlq_arn      = aws_sqs_queue.billing_authz_dlq.arn
+    tenant_authz_dlq_arn       = aws_sqs_queue.tenant_authz_dlq.arn
+    tender_authz_dlq_arn       = aws_sqs_queue.tender_authz_dlq.arn
     aws_region                 = data.aws_region.current.name
     aws_account_id             = data.aws_caller_identity.current.account_id
   })

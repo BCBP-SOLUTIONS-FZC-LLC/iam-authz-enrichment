@@ -37,3 +37,6 @@ mockorg*
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# make cover-all output
+.cover-all/

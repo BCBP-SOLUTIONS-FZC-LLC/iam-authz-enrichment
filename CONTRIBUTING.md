@@ -107,8 +107,10 @@ For full layout and flow details see [ARCHITECTURE.md](ARCHITECTURE.md).
    `templatefile` call in `deploy/iam/policy.tf.example` — the IAM role must be updated
    before the new consumer is deployed, or it fails on its first `ReceiveMessage` call.
 7. If the queue is new, also add its `-dlq` name to `deploy/monitoring/dlq-alarms.tf.example`'s
-   `authz_dlq_names` list — DLQ routing is entirely SQS-native (no application code reads a
-   `-dlq` queue), so without an alarm a message that lands there sits unmonitored indefinitely.
+   `authz_dlq_names` list, and its `-dlq` ARN to `deploy/iam/policy.json`'s
+   `ForwardPoisonMessagesToDLQ` statement (the consumer forwards poison messages there and refuses
+   to start on a queue without a RedrivePolicy). No application code reads a `-dlq` queue, so
+   without an alarm a message that lands there sits unmonitored indefinitely.
 
 ### Adding a new environment variable
 
@@ -268,12 +270,13 @@ if that's missing — a real safety net for the case where the toggle was flippe
 secret was set), optional `K8S_NAMESPACE`/`PROMETHEUS_URL` vars, and a pre-provisioned
 Kubernetes Secret named `iam-authz-enrichment-secrets` in the target namespace (the chart's
 `secret.yaml` hard-fails the Helm render via `existingSecret` otherwise). Its health query uses
-`grpc_server_handled_total{status_class="5xx"}` (from `platform-gincommon`'s gRPC interceptor
-chain) rather than `iam-user-profile`'s `http_requests_total` — this service has no HTTP
+`platform_grpc_server_handled_total{domain="iam",service="iam-authz-enrichment",status_class="5xx"}`
+(from `platform-gincommon`'s gRPC interceptor chain; registry status *proposed*) rather than
+`iam-user-profile`'s `platform_http_requests_total` — this service has no HTTP
 business traffic, and `status_class="5xx"` only fires on a genuine transport-level RPC failure
 (`internal/adapter/inbound/grpc/server.go`'s `Check()` always returns a nil error for every
 Allow/Deny outcome), so it's a clean deployment-health signal distinct from
-`authz_deny_reason_total{reason="DENY_SERVICE_UNAVAILABLE"}` (dependency health, not deployment
+`iam_authz_enrichment_deny_reason_total{reason="deny_service_unavailable"}` (dependency health, not deployment
 health — an unrelated dependency outage at deploy time shouldn't trigger a rollback).
 
 Notify the platform team on Slack if a change here affects the Envoy `ext_authz` contract

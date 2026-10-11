@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // DSNFromEnv builds a PostgreSQL connection URL by delegating

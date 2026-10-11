@@ -22,8 +22,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	"github.com/gin-gonic/gin"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
@@ -31,11 +29,11 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/grpccommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgmetrics"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/consumer"
 	grpcadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/grpc"
@@ -88,7 +86,7 @@ func run() error {
 	// Logger first, matching iam-user-profile / iam-org-membership: Zap via
 	// platform-gincommon so every subsequent startup failure (config, listen,
 	// consumers) goes through the same sink instead of stdlib log.Fatal.
-	appEnv := envOr("APP_ENV", "dev")
+	appEnv := config.ResolveAppEnv()
 	if appEnv != "dev" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -116,11 +114,11 @@ func run() error {
 		appLog.Warn("no tenant-resolution path configured — every request will get DENY_MALFORMED_IDENTITY until SHARED_REALM_ISSUER is set or a TenantConverted/TenantRealmReady event seeds the realm map", nil)
 	}
 
-	// Align the env vars platform-gincommon reads directly (InitTracingFromEnv,
-	// NewLogger, OTEL_SERVICE_NAME) with this process's identity so a
-	// deployment that only set APP_NAME still gets matching trace/metric
-	// labels — same ensureGincommonEnv pattern as iam-org-membership /
-	// iam-delegation.
+	// Align the env vars the platform libraries read directly (APP_NAME,
+	// OTEL_SERVICE_NAME — platform-events' consumer spans — and BUILD_VERSION)
+	// with this process's identity, so a deployment that sets only APP_NAME
+	// (as the Helm chart does) still gets matching trace/metric labels — same
+	// ensureGincommonEnv pattern as iam-org-membership / iam-delegation.
 	if os.Getenv("APP_NAME") == "" {
 		_ = os.Setenv("APP_NAME", cfg.AppName)
 	}
@@ -134,38 +132,73 @@ func run() error {
 	// 2. Tracing — always install gincommon's TracerProvider so in-process
 	// spans (authz.lookup_cache / i8_call / …) and outbound W3C
 	// traceparent injection get a real provider even when
-	// OTEL_EXPORTER_OTLP_ENDPOINT is unset (dev). Interceptor/middleware
+	// OTEL_EXPORTER_OTLP_ENDPOINT is unset (dev; set it to "none" to skip
+	// export entirely). InitTracingWithConfig takes the same identity as
+	// ginCfg/grpcCfg below, so trace resources (service.namespace,
+	// deployment.environment.name) can't disagree with metric labels —
+	// InitTracingFromEnv resolved domain/environment from the environment on
+	// its own. Same call as iam-org-membership. Interceptor/middleware
 	// EnsureInitTelemetry is then a no-op. Flush: shutdownTracing then
-	// grpccommon.Shutdown — same pair as iam-user-profile / iam-org-membership
-	// (those call gincommon.Shutdown; this process is gRPC-primary so it
-	// uses grpccommon.Shutdown, which is the same OTel+Zap flush).
-	shutdownTracing := gincommon.InitTracingFromEnv()
+	// grpccommon.Shutdown (this process is gRPC-primary; it is the same
+	// OTel+Zap flush as gincommon.Shutdown).
+	shutdownTracing, err := gincommon.InitTracingWithConfig(gincommon.TracingConfig{
+		ServiceName:  cfg.AppName,
+		BuildVersion: buildVersion,
+		Domain:       observabilityDomain,
+		Environment:  cfg.AppEnv,
+		Logger:       appLog,
+	})
+	if err != nil {
+		appLog.Error("init tracing", map[string]interface{}{"error": err.Error()})
+		return fmt.Errorf("init tracing: %w", err)
+	}
 
+	// Observability identity (Enterprise Platform Observability Standard):
+	// domain "iam" is fixed for this service; OBSERVABILITY_DOMAIN (set in
+	// the Helm values / compose / .env-example) is only the fallback
+	// gincommon reads when Config.Domain is empty. The environment comes
+	// from APP_ENV and must be one of local/dev/test/staging/prod —
+	// gincommon panics at startup on anything else (e.g. "production").
 	ginCfg := gincommon.Config{
 		Logger:       appLog,
 		ServiceName:  cfg.AppName,
 		BuildVersion: buildVersion,
+		Domain:       observabilityDomain,
+		Environment:  cfg.AppEnv,
 	}
 	grpcCfg := grpccommon.Config{
 		ServiceName:  cfg.AppName,
 		BuildVersion: buildVersion,
 		Logger:       appLog,
+		Domain:       observabilityDomain,
+		Environment:  cfg.AppEnv,
 	}
 
 	// ObservabilityMiddlewares is gincommon's public metrics-init API. Call
-	// it here (before any collector registration) so authz_* and
+	// it here (before any collector registration) so iam_authz_enrichment_* and
 	// platform-events metrics land on gincommon.MetricsRegisterer with
-	// matching {service, version} const labels — same order as
+	// matching {domain, service, environment} const labels — same order as
 	// iam-org-membership / iam-user-profile. NewRouter applies the same
-	// middleware slice; gincommon's metrics.Init is sync.Once.
+	// middleware slice; gincommon's metrics init is first-call-wins.
 	_ = gincommon.ObservabilityMiddlewares(ginCfg)
 
-	// 3. Metrics — business collectors + platform-events consumer
-	// collectors, both on gincommon's registerer (the same /metrics scrape
-	// as HTTP/gRPC interceptor series).
-	recorder := metrics.New(gincommon.MetricsRegisterer())
-	events.InitWithRegisterer(cfg.AppName, buildVersion, gincommon.MetricsRegisterer())
-	pgmetrics.InitWithRegisterer(cfg.AppName, buildVersion, gincommon.MetricsRegisterer())
+	// 3. Metrics — business collectors + platform-events / platform-pgcommon
+	// Tier 1 collectors, all on gincommon's registerer (the same /metrics
+	// scrape as HTTP/gRPC interceptor series), with the identity gincommon
+	// resolved so every library labels the same {domain, service,
+	// environment}. pgcommon's identity is initialised before any pool
+	// would be created (this service creates none today — HLD §5.4).
+	recorder, err := metrics.New(gincommon.MetricsRegisterer())
+	if err != nil {
+		appLog.Error("init business metrics", map[string]interface{}{"error": err.Error()})
+		shutdownTracing()
+		return fmt.Errorf("init business metrics: %w", err)
+	}
+	if err := initLibraryMetrics(appLog); err != nil {
+		appLog.Error("init platform metrics", map[string]interface{}{"error": err.Error()})
+		shutdownTracing()
+		return fmt.Errorf("init platform metrics: %w", err)
+	}
 
 	// Database config — same ConfigFromEnv / DSNFromEnv / Zap logger /
 	// gincommon TracerProvider path as iam-user-profile / iam-org-membership.
@@ -199,6 +232,11 @@ func run() error {
 		ProcessedTTL:       cfg.ProcessedEventTTL,
 		StaleIfErrorMaxAge: cfg.StaleIfErrorMaxAge,
 	})
+	// eventCache: same Valkey, own pool, VALKEY_EVENT_TIMEOUT socket timeouts
+	// — for everything the SQS consumers write (see Cache.WithTimeouts). The
+	// request path keeps cache's single-digit-ms timeouts.
+	eventCache := cache.WithTimeouts(cfg.ValkeyEventTimeout, cfg.ValkeyEventTimeout, cfg.ValkeyEventTimeout)
+	facts := factStore{Cache: cache, writes: eventCache}
 
 	// 5. Org & Membership + iam-tender-acl client (I-12/GetTenderACL moved to
 	// the latter in ADR-0007 Wave 3 Phase 4 — see orgmembership.New's doc
@@ -207,16 +245,16 @@ func run() error {
 
 	// 6. In-process policy state + usecase layer.
 	realmMap := usecase.NewRealmMap(cfg.RealmTenantMapSeed, cfg.RealmNegativeTTL)
-	realmMap.BindStore(cache)
+	realmMap.BindStore(facts)
 	if err := realmMap.PersistSeed(context.Background()); err != nil {
 		appLog.Warn("failed to persist realm-map seed to Valkey — other replicas will not see seed mappings until they load the same env", map[string]interface{}{"error": err.Error()})
 	}
 	restricted := usecase.NewRestrictedTenderSet(cfg.RestrictedNegativeTTL)
-	restricted.BindStore(cache)
+	restricted.BindStore(facts)
 	checker := usecase.NewChecker(cache, orgClient, realmMap, restricted, appLog, recorder, usecase.CheckerConfig{
 		SharedRealmIssuer: cfg.SharedRealmIssuer,
 	})
-	invalidator := usecase.NewInvalidator(cache, realmMap, restricted, appLog)
+	invalidator := usecase.NewInvalidator(eventCache, realmMap, restricted, appLog)
 
 	// 7. gRPC server (primary inbound adapter): panic-recovery -> request-id
 	// -> tracing -> metrics -> logging, from platform-gincommon. Not
@@ -227,7 +265,13 @@ func run() error {
 	// listens in plaintext unless GRPC_TLS_CERT_FILE/GRPC_TLS_KEY_FILE are
 	// set, for deployments with no such layer.
 	serverOpts := []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(grpccommon.ObservabilityUnaryInterceptors(grpcCfg)...),
+		// TimeoutUnaryInterceptor goes innermost (after the observability
+		// stack, per gincommon) so metrics/logs/spans record the
+		// DeadlineExceeded Envoy receives. It caps a Check that carries no
+		// grpc-timeout (or a later one) at GRPC_REQUEST_TIMEOUT; Envoy's own
+		// shorter deadline wins when present.
+		grpc.ChainUnaryInterceptor(append(grpccommon.ObservabilityUnaryInterceptors(grpcCfg),
+			grpccommon.TimeoutUnaryInterceptor(cfg.GRPCRequestTimeout))...),
 		grpc.MaxConcurrentStreams(cfg.GRPCMaxConcurrentStreams),
 		grpc.MaxRecvMsgSize(cfg.GRPCMaxRecvMsgSizeBytes),
 		grpc.MaxSendMsgSize(cfg.GRPCMaxSendMsgSizeBytes),
@@ -258,12 +302,18 @@ func run() error {
 	// health (§7 — see ReadinessProbe's doc comment for why).
 	healthServer := health.NewServer()
 	healthgrpc.RegisterHealthServer(grpcServer, healthServer)
-	if cfg.AppEnv != "production" {
+	if cfg.AppEnv != "prod" {
 		// Lets grpcurl/grpcui/Postman discover and call Check without a local
 		// copy of the envoy ext_authz .proto — same non-production-only
 		// convention iam-user-profile uses for its Swagger/AsyncAPI viewers.
 		reflection.Register(grpcServer)
 	}
+	// Limit the grpc_method metric label and server span name to the
+	// methods registered above (Check, Health, reflection); anything else
+	// (a probe of an unknown service) is recorded as "unknown" instead of
+	// minting a new label value per path. Must run after every Register*
+	// call and before Serve.
+	grpccommon.RegisterKnownMethods(grpcServer)
 	var lc net.ListenConfig
 	grpcLis, err := lc.Listen(context.Background(), "tcp", ":"+cfg.GRPCPort)
 	if err != nil {
@@ -294,7 +344,7 @@ func run() error {
 	// carries no business API to protect from a shared-port NetworkPolicy
 	// grant, since the actual authz decision path is exclusively gRPC).
 	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/metrics", metricsScrapeHandler())
+	metricsMux.Handle("/metrics", gincommon.MetricsHandler())
 	metricsServer := &http.Server{
 		Addr:              ":" + cfg.MetricsPort,
 		Handler:           metricsMux,
@@ -313,7 +363,7 @@ func run() error {
 	// first fatal source to fire never blocks on a send nobody is receiving
 	// yet.
 	fatalErr := make(chan error, 1)
-	consumers, queueURLs, err := startConsumers(ctx, cfg, cache, invalidator, appLog, fatalErr)
+	consumers, receiveTrackers, err := startConsumers(ctx, cfg, eventCache, invalidator, appLog, fatalErr)
 	if err != nil {
 		cancelBackgroundWork()
 		appLog.Error("start consumers", map[string]interface{}{"error": err.Error()})
@@ -322,13 +372,13 @@ func run() error {
 
 	// Safety net for fatalErr: platform-events' sqsConsumer.Start() never
 	// returns an error for a persistently failing ReceiveMessage loop (IAM
-	// permissions revoked, queue deleted, etc.) — it logs
-	// sqs_receive_errors_total and retries forever internally, so fatalErr
-	// above would otherwise never fire for that failure mode. This watchdog
-	// polls that same counter (platform-events' own "alert when non-zero"
-	// metric) and treats staleAfter consecutive polls with no successful
-	// receive as stuck.
-	go runReceiveErrorWatchdog(ctx, gincommon.MetricsRegisterer(), queueURLs, 30*time.Second, 6, fatalErr, appLog)
+	// permissions revoked, queue deleted, etc.) — it logs and retries
+	// forever internally, so fatalErr above would otherwise never fire for
+	// that failure mode. Each consumer's SQS client is wrapped to record its
+	// own ReceiveMessage outcomes (receive_watchdog.go); the watchdog treats
+	// staleAfter consecutive polls with errors and no successful receive as
+	// stuck.
+	go runReceiveErrorWatchdog(ctx, receiveTrackers, 30*time.Second, 6, fatalErr, appLog)
 
 	// reportFatal is a non-blocking send — fatalErr is 1-buffered and only
 	// the first fatal source needs to win; a second concurrent failure
@@ -369,10 +419,16 @@ func run() error {
 	// work cancellation -> cache -> tracing/logging flush.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	// fatalCause is returned after the graceful shutdown below, so main()
+	// exits non-zero: a restart caused by a dead server or consumer must show
+	// up as a failure (Error/CrashLoopBackOff, restart-count alerts), not as a
+	// clean exit 0 ("Completed"). A SIGTERM shutdown still exits 0.
+	var fatalCause error
 	select {
 	case <-quit:
 		appLog.Info("shutting down", nil)
 	case err := <-fatalErr:
+		fatalCause = err
 		appLog.Error("fatal error — shutting down so the orchestrator restarts this pod", map[string]interface{}{"error": err.Error()})
 	}
 
@@ -423,34 +479,56 @@ func run() error {
 	wg.Wait()
 	cancelBackgroundWork()
 
+	if err := eventCache.Close(); err != nil {
+		appLog.Warn("event cache close error", map[string]interface{}{"error": err.Error()})
+	}
 	if err := cache.Close(); err != nil {
 		appLog.Warn("cache close error", map[string]interface{}{"error": err.Error()})
 	}
 
 	shutdownTracing()
-	return grpccommon.Shutdown(appLog)
+	// A flush error never decides the exit code — same as iam-org-membership.
+	// Zap's Sync fsyncs stderr, which fails with EINVAL on Linux whenever
+	// stderr is a pipe (every container runtime, and the e2e harness), so
+	// returning it made every clean SIGTERM shutdown exit 1.
+	if err := grpccommon.Shutdown(appLog); err != nil {
+		appLog.Warn("logger/tracer flush error", map[string]interface{}{"error": err.Error()})
+	}
+	if fatalCause != nil {
+		return fmt.Errorf("fatal: %w", fatalCause)
+	}
+	return nil
 }
 
-// metricsScrapeHandler serves /metrics from gincommon's registerer — the
-// same registry ObservabilityMiddlewares, authz_* collectors, and
-// platform-events InitWithRegisterer write to. promhttp.Handler() always
-// scrapes prometheus.DefaultGatherer; after ObservabilityMiddlewares that
-// is the same registry, but scraping MetricsRegisterer() keeps this
-// listener correct if gincommon ever switches tests/prod onto an isolated
-// registry (the contract MetricsRegisterer documents).
-func metricsScrapeHandler() http.Handler {
+// observabilityDomain is this service's business domain in the Platform
+// Observability Registry — the domain label on every metric it emits.
+const observabilityDomain = "iam"
+
+// initLibraryMetrics registers platform-events' and platform-pgcommon's Tier 1
+// platform_* metrics on gincommon's registerer with the identity
+// ObservabilityMiddlewares resolved (gincommon.MetricsConstLabels), so all
+// three libraries report identical {domain, service, environment} labels.
+// MetricsRegisterer — never a LabeledRegisterer wrapper — because both
+// libraries inject the identity labels themselves. An invalid identity is an
+// error; a metric that cannot be registered is fail-soft and only logged.
+func initLibraryMetrics(log usecase.Logger) error {
+	labels := gincommon.MetricsConstLabels()
 	reg := gincommon.MetricsRegisterer()
-	if g, ok := reg.(prometheus.Gatherer); ok {
-		return promhttp.HandlerFor(g, promhttp.HandlerOpts{})
+	evWarnings, err := events.InitMetrics(events.MetricsIdentityFromLabels(labels), reg)
+	if err != nil {
+		return fmt.Errorf("platform-events metrics: %w", err)
 	}
-	return promhttp.Handler()
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	for _, w := range evWarnings {
+		log.Warn("platform-events metric disabled", map[string]interface{}{"metric": w.Metric, "error": w.Error()})
 	}
-	return def
+	pgWarnings, err := pgmetrics.InitWithIdentity(pgmetrics.IdentityFromLabels(labels), reg)
+	if err != nil {
+		return fmt.Errorf("platform-pgcommon metrics: %w", err)
+	}
+	for _, w := range pgWarnings {
+		log.Warn("platform-pgcommon metric disabled", map[string]interface{}{"metric": w.Metric, "error": w.Error()})
+	}
+	return nil
 }
 
 // loadServerTLS builds the gRPC server's TLS credentials from
@@ -492,8 +570,9 @@ var (
 // startConsumers builds and starts the five §5 SQS consumers. A consumer
 // whose queue URL is unconfigured degrades to a no-op (idle) consumer rather
 // than failing startup — useful for partial local-dev setups. Also returns
-// the configured (non-idle) queues by name, for the receive-error watchdog.
-func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache, inv *usecase.Invalidator, appLog usecase.Logger, fatal chan<- error) ([]events.Consumer, map[string]string, error) {
+// a ReceiveMessage tracker per configured (non-idle) queue, by name, for the
+// receive-error watchdog.
+func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache, inv *usecase.Invalidator, appLog usecase.Logger, fatal chan<- error) ([]events.Consumer, map[string]*receiveTracker, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
 		return nil, nil, fmt.Errorf("load aws config: %w", err)
@@ -524,12 +603,23 @@ func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache,
 		appLog.Warn(reason, nil)
 	}
 
+	// DLQ forwarding (LLD §16 AE-36): poison messages — a malformed body, a
+	// failed Glue decode, a 5th delivery — go to the queue's own
+	// RedrivePolicy DLQ instead of being deleted. Built over the plain
+	// client, not the watchdog's receive-tracking wrapper. Same publisher
+	// iam-org-membership wires.
+	dlq, err := consumer.NewDLQPublisher(sqsClient, cfg.AppName, appLog)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build DLQ publisher: %w", err)
+	}
+
 	deps := consumer.Deps{
 		Client:      sqsClient,
 		SQS:         plat.SQS,
 		Cache:       cache,
 		Log:         appLog,
 		Invalidator: inv,
+		DLQ:         dlq,
 	}
 
 	builders := []struct {
@@ -546,16 +636,21 @@ func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache,
 	}
 
 	consumers := make([]events.Consumer, 0, len(builders))
-	queueURLs := make(map[string]string, len(builders))
+	trackers := make(map[string]*receiveTracker, len(builders))
 	for _, b := range builders {
+		// Each consumer gets its own SQS client wrapper so the watchdog sees
+		// that consumer's ReceiveMessage outcomes and nothing else.
+		qDeps := deps
 		if b.queueURL != "" {
-			queueURLs[b.name] = b.queueURL
+			tr := &receiveTracker{}
+			trackers[b.name] = tr
+			qDeps.Client = receiveTrackingClient{SQSClientLike: sqsClient, tracker: tr}
 		}
 		// events.WithConcurrency sets how many messages this consumer hands
 		// to handler goroutines at once; the platform-events default is 1
 		// (fully serial per queue), which would bottleneck cache-eviction
 		// under a burst of events (e.g. a bulk department restructuring).
-		c, err := b.build(b.queueURL, deps, events.WithConcurrency(b.concurrency))
+		c, err := b.build(b.queueURL, qDeps, events.WithConcurrency(b.concurrency))
 		if err != nil {
 			return nil, nil, fmt.Errorf("build %s consumer: %w", b.name, err)
 		}
@@ -570,5 +665,5 @@ func startConsumers(ctx context.Context, cfg config.Config, cache *valkey.Cache,
 			}
 		}(b.name, c)
 	}
-	return consumers, queueURLs, nil
+	return consumers, trackers, nil
 }

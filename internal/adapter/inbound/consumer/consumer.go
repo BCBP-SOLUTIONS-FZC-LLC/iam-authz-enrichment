@@ -8,17 +8,22 @@
 // ackUnknown (same helpers as those siblings); the store is Valkey SET NX
 // because there is no processed_events table (LLD AE-6).
 //
-// DLQ handling (§5) is deliberately NOT implemented in application code: the
-// "maxReceiveCount=5 before landing in its own -dlq" behavior is SQS's own
-// native redrive policy, configured on the queue resource itself (see
-// scripts/init-localstack.sh for the local/LocalStack equivalent of the
-// Terraform-managed RedrivePolicy in real AWS). A handler returning a
-// non-nil error simply leaves the message undeleted for redelivery — SQS
-// does the counting and the eventual DLQ move on its own. Building a
-// second, application-level DLQ mechanism on top of that would be exactly
-// the "special-case DLQ-replay mechanism" §5 says not to build. The one
-// addition is observability-only: DeadLetterHandler logs a message's last
-// delivery before SQS moves it, and never acks it (see dlqObserveReceiveCount).
+// DLQ handling (§5, LLD §16 AE-36): the DLQ is each queue's own RedrivePolicy
+// target (Terraform in AWS, scripts/init-localstack.sh / init-floci.sh
+// locally) — nothing here names or creates a DLQ. With Deps.DLQ set (always,
+// in cmd/server), platform-events' WithDLQForwarding sends poison messages to
+// that target itself, preserving the original body and attributes and
+// deleting only after the send succeeds:
+//
+//   - a body that is not a valid envelope, or a Glue frame that fails to
+//     decode — without forwarding, platform-events DELETES these, so the
+//     eviction they carried would be lost with no trace in any DLQ;
+//   - a message on its 5th delivery (after dlqObserveReceiveCount failures),
+//     which DeadLetterHandler logs first. SQS's own redrive after the 5th
+//     receive stays the backstop if a forward fails.
+//
+// Start also refuses a queue with no usable RedrivePolicy. There is still no
+// replay mechanism (§5): a DLQ message is investigated and replayed by hand.
 package consumer
 
 import (
@@ -27,8 +32,8 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/config"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/usecase"
 )
@@ -53,6 +58,11 @@ type Deps struct {
 	Cache       IdempotencyStore
 	Log         Logger
 	Invalidator *usecase.Invalidator
+	// DLQ forwards poison messages to each queue's RedrivePolicy DLQ
+	// (events.NewSQSDLQPublisherWithClient). nil — tests only — keeps the
+	// older observe-only behaviour: malformed bodies are deleted and SQS's
+	// redrive alone moves a message after its 5th delivery.
+	DLQ events.DLQPublisher
 }
 
 // idleConsumer is a no-op Consumer used when a queue URL is unconfigured —
@@ -69,12 +79,10 @@ func (idleConsumer) Stop() error                 { return nil }
 // VisibilityTimeout, and Concurrency come from the same env-derived struct
 // iam-org-membership / iam-user-profile use — not a hand-rolled SQSConfig.
 //
-// The env's MaxReceiveCount is ignored: this service's DLQ is SQS-native
-// redrive on the queue resource, and SQS_MAX_RECEIVE_COUNT passed through
-// SQSConsumerOptions WITHOUT a dead-letter handler would make platform-events
-// delete the message in-process instead of leaving it for the queue's
-// RedrivePolicy. Instead WithMaxReceiveCount(dlqObserveReceiveCount) is
-// always paired with DeadLetterHandler, which observes and never acks.
+// The env's MaxReceiveCount is ignored: the threshold is pinned to
+// dlqObserveReceiveCount, one short of every queue's RedrivePolicy
+// maxReceiveCount=5, and always paired with DeadLetterHandler (and
+// WithDLQForwarding when deps.DLQ is set).
 //
 // opts passes through to events.NewSQSConsumerWithClient — mainly used by
 // tests to tune WithVisibilityTimeout for a fast DLQ cycle, and by
@@ -87,15 +95,24 @@ func buildConsumer(queueURL string, deps Deps, handler events.Handler, opts ...e
 	env.QueueURL = queueURL
 	env.MaxReceiveCount = 0 // replaced below by dlqObserveReceiveCount + DeadLetterHandler
 	cfg := config.SQSConfigFromEnv(env, eventsLogger{deps.Log})
-	// GlueDecoder strips the Glue wire header producers add once their
-	// registry is configured. Decode only runs when Envelope.SchemaID is
-	// non-empty, so plain-JSON envelopes pass through untouched.
-	built := []events.ConsumerOption{events.WithConsumerCodec(GlueDecoder{})}
+	// platform-events' GlueDecodeCodec strips the Glue wire header producers
+	// add once their registry is configured (no Glue client or IAM
+	// permission needed) and rejects a non-JSON payload with a clear error.
+	// Decode only runs when Envelope.SchemaID is non-empty, so plain-JSON
+	// envelopes pass through untouched. Same codec as iam-org-membership.
+	// Without it the framed bytes reach every handler unstripped,
+	// json.Unmarshal fails on every Glue-encoded event, and each one
+	// dead-letters with its cache eviction never applied — for
+	// TenderRestricted (ae:restricted has no TTL) indefinitely.
+	built := []events.ConsumerOption{events.WithConsumerCodec(events.GlueDecodeCodec{})}
 	built = append(built, config.SQSConsumerOptions(env)...)
 	built = append(built,
 		events.WithMaxReceiveCount(dlqObserveReceiveCount),
-		events.WithDeadLetterHandler(DeadLetterHandler(queueName(queueURL), deps.Log)),
+		events.WithDeadLetterHandler(DeadLetterHandler(queueName(queueURL), deps.Log, deps.DLQ != nil)),
 	)
+	if deps.DLQ != nil {
+		built = append(built, events.WithDLQForwarding(deps.DLQ))
+	}
 	built = append(built, opts...)
 	return events.NewSQSConsumerWithClient(cfg, deps.Client, processedHandler(deps, handler), built...)
 }
@@ -110,23 +127,48 @@ var _ events.Handler = func(context.Context, events.Envelope[json.RawMessage]) e
 // (api/asyncapi.yaml, scripts/init-localstack.sh). At 5 the dead-letter
 // handler would never fire: SQS never makes a 6th delivery, it redrives
 // after the 5th. So the handler sees deliveries 1-4 and DeadLetterHandler
-// the 5th, just before SQS moves the message.
+// the 5th.
 const dlqObserveReceiveCount = 4
 
-// DeadLetterHandler logs a message's last delivery before SQS's own
-// redrive moves it to the queue's DLQ — the first actionable signal, ahead
-// of the DLQ-depth alert. Observability-only: it always returns an error,
-// so platform-events never deletes the message and the move stays SQS's
-// job (no application-level DLQ mechanism, §5).
-func DeadLetterHandler(queue string, log Logger) events.Handler {
+// DeadLetterHandler logs a message's last delivery — the first actionable
+// signal, ahead of the DLQ-depth alarm.
+//
+// With forwarding (a DLQ publisher is wired) it returns nil, which is what
+// lets platform-events forward the message to the DLQ, delete it from the
+// source queue and count it in platform_dlq_messages_total
+// {reason="max_receive_count"}. Without forwarding it returns an error, so
+// platform-events never deletes the message and SQS's redrive moves it.
+func DeadLetterHandler(queue string, log Logger, forwarding bool) events.Handler {
 	return func(_ context.Context, env events.Envelope[json.RawMessage]) error {
 		if log != nil {
-			log.Error("message exhausted retries, SQS will move it to the DLQ — its cache eviction was never applied", map[string]interface{}{
-				"queue": queue, "event_id": env.ID, "event_type": env.Type, "tenant_id": env.TenantID,
+			log.Error("message exhausted retries, moving it to the DLQ — its cache eviction was never applied", map[string]interface{}{
+				"queue": queue, "event_id": env.ID, "event_type": env.Type, "tenant_id": env.TenantID, "forwarded_by": dlqMover(forwarding),
 			})
 		}
-		return errors.New("dead-letter handler: observability-only, leaving the DLQ move to SQS's redrive policy")
+		if forwarding {
+			return nil
+		}
+		return errors.New("dead-letter handler: no DLQ publisher, leaving the DLQ move to SQS's redrive policy")
 	}
+}
+
+func dlqMover(forwarding bool) string {
+	if forwarding {
+		return "platform-events"
+	}
+	return "sqs-redrive"
+}
+
+// NewDLQPublisher builds platform-events' SQS DLQ publisher. It resolves each
+// queue's DLQ from that queue's own RedrivePolicy (cached, re-read on
+// expiry), so the target can never drift from the infra-configured one.
+// client is the plain *sqs.Client — it needs GetQueueAttributes on the
+// source queues, and GetQueueUrl/SendMessage on their DLQs (deploy/iam).
+func NewDLQPublisher(client events.DLQClientLike, consumerName string, log Logger) (events.DLQPublisher, error) {
+	return events.NewSQSDLQPublisherWithClient(events.DLQConfig{
+		ConsumerName: consumerName,
+		Logger:       eventsLogger{log},
+	}, client)
 }
 
 // queueName is the last path segment of an SQS queue URL.

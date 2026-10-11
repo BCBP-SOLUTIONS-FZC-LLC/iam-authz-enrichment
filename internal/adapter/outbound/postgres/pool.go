@@ -3,19 +3,20 @@ package postgres
 import (
 	"context"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // PoolConfig builds the pgcommon.Config siblings pass to NewPool:
 // ConfigFromEnv for pool sizing / PG_BOUNCER_MODE / slow-query threshold,
 // DSNFromEnv (adds PG_STATEMENT_TIMEOUT on the PG_* path), Zap via
-// NewLoggerAdapter, and gincommon's TracerProvider via NewOTelTracer.
+// NewLoggerAdapter, and gincommon's TracerProvider via gincommon.NewSpanTracer.
 // GUCProvider is left nil — this service has no RLS tables.
 func PoolConfig(log Logger, serviceName string) (pgcommon.Config, []pgcommon.ConfigWarning) {
 	cfg, warnings := pgcommon.ConfigFromEnv()
 	cfg.DSN = DSNFromEnv()
 	cfg.GUCProvider = nil
-	cfg.Tracer = NewOTelTracer(serviceName)
+	cfg.Tracer = gincommon.NewSpanTracer(serviceName)
 	if log != nil {
 		cfg.Logger = NewLoggerAdapter(log)
 	} else {
@@ -27,7 +28,7 @@ func PoolConfig(log Logger, serviceName string) (pgcommon.Config, []pgcommon.Con
 // SystemPoolConfig returns pgcommon.Config for a BYPASSRLS system pool,
 // matching iam-user-profile / iam-org-membership: ConfigFromEnv pool
 // sizing, no GUCProvider, PGBouncerMode forced true, Tracer left unset
-// (call sites wire NewOTelTracer). cmd/server does not open this pool.
+// (call sites wire gincommon.NewSpanTracer). cmd/server does not open this pool.
 func SystemPoolConfig(dsn string, log Logger) pgcommon.Config {
 	cfg, _ := pgcommon.ConfigFromEnv()
 	cfg.DSN = ApplyStatementTimeout(dsn)

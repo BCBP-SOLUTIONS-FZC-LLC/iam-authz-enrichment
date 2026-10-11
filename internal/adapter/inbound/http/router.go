@@ -49,8 +49,14 @@ type DocsConfig struct {
 	AuthToken   string
 }
 
+// prodEnv is the production APP_ENV value. The Enterprise Platform
+// Observability Standard's environment vocabulary (local, dev, test, staging,
+// prod) is enforced by platform-gincommon at startup, which rejects
+// "production", so "prod" is the only spelling a running process can see.
+const prodEnv = "prod"
+
 func (d DocsConfig) active() bool {
-	return d.Environment != "production" || d.Enabled
+	return d.Environment != prodEnv || d.Enabled
 }
 
 // NewRouter builds the health/readiness-only Gin engine, plus (when active)
@@ -98,7 +104,7 @@ func registerDocsRoutes(engine *gin.Engine, docs DocsConfig) {
 		return
 	}
 	asyncGroup := engine.Group("")
-	if docs.Environment == "production" && docs.AuthToken != "" {
+	if docs.Environment == prodEnv && docs.AuthToken != "" {
 		asyncGroup.Use(docsAuthMiddleware(docs.AuthToken))
 	}
 	asyncGroup.Use(envMiddleware(docs.Environment))
