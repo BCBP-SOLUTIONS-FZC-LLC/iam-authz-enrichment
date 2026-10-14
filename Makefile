@@ -15,6 +15,18 @@ export GONOSUMDB  ?= github.com/BCBP-SOLUTIONS-FZC-LLC/*
 
 export APP_NAME APP_ENV BUILD_VERSION
 
+# The integration and e2e tiers read VALKEY_URL / AWS_ENDPOINT_URL from the
+# environment and otherwise default to CI's LocalStack/Valkey ports (4566 /
+# 6379). Locally those ports usually belong to another repo's stack, so pass
+# this repo's .env values through when it sets them (CI has no .env and keeps
+# its own environment).
+ifneq ($(strip $(VALKEY_URL)),)
+test-integration test-e2e: export VALKEY_URL := $(VALKEY_URL)
+endif
+ifneq ($(strip $(AWS_ENDPOINT_URL)),)
+test-integration test-e2e: export AWS_ENDPOINT_URL := $(AWS_ENDPOINT_URL)
+endif
+
 TEST_UNIT_PKGS := ./internal/... ./cmd/...
 TEST_INT_PKGS  := ./test/integration/...
 TEST_E2E_PKGS  := ./test/e2e/...
