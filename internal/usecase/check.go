@@ -8,8 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain/policy"
@@ -19,14 +20,7 @@ import (
 // i8_call/i12_call/mfa_freshness_call). The outer ext_authz span comes from
 // platform-gincommon's gRPC tracing interceptor via context propagation —
 // this package only ever adds children to whatever span is already on ctx.
-//
-// otel.Tracer() calls otel.GetTracerProvider(), which uses OTel's delegating
-// global TracerProvider. cmd/server/main.go calls gincommon.InitTracingFromEnv()
-// before any Check() is served; the delegate automatically picks up the real
-// provider, so all spans export through gincommon's OTLP pipeline.
-// Do NOT replace this with a locally-constructed TracerProvider — that would
-// bypass gincommon's provider and break distributed trace continuity.
-var tracer = otel.Tracer("github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/usecase")
+var tracer = gincommon.NewTracer("github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/usecase")
 
 // CheckInput is everything the inbound gRPC adapter has decoded from a
 // CheckRequest before handing off to Checker.Check. Claims come from
@@ -89,6 +83,11 @@ func (c *Checker) Check(ctx context.Context, in CheckInput) domain.Decision {
 }
 
 func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
+	// §8.1: the verified subject is the only identity input; no other claim
+	// or header substitutes for it. With none there is nothing to authorize.
+	if in.Claims.Subject == "" {
+		return domain.Denied(domain.DenyMalformedIdentity)
+	}
 	// §2 point 3 / §9: tenant resolution. Malformed identity short-circuits
 	// everything — there is no tenant to scope any subsequent call to.
 	tenant, ok := ResolveTenant(ctx, in.Claims, c.realmMap, c.cfg.SharedRealmIssuer)
@@ -229,12 +228,21 @@ func (c *Checker) resolveContext(ctx context.Context, tenant, user string) (doma
 	staleAvailable := valkeyReachable && ctxResult != domain.CacheMiss && tenantResult != domain.CacheMiss
 
 	key := tenant + ":" + user
+	// The shared call must not inherit any one caller's cancellation:
+	// singleflight hands every coalesced caller the first caller's result, so
+	// if Envoy's deadline cancelled that first request, every other request
+	// waiting on the same (tenant, user) would fail too — healthy requests
+	// denied as DENY_SERVICE_UNAVAILABLE. WithoutCancel keeps the trace and
+	// values; the call stays bounded by the org-membership client's own
+	// timeout (ORG_MEMBERSHIP_TIMEOUT). Each caller still honours its own
+	// deadline for everything after this point.
+	sharedCtx := context.WithoutCancel(ctx)
 	v, err, shared := c.sf.Do(key, func() (any, error) {
-		i8Ctx, i8Span := tracer.Start(ctx, "authz.i8_call")
+		i8Ctx, i8Span := tracer.Start(sharedCtx, "authz.i8_call")
 		defer i8Span.End()
 		i8Start := c.now()
 		m, t, sfErr := c.org.GetMemberships(i8Ctx, tenant, user)
-		c.metrics.ObserveDependencyLatency(c.now().Sub(i8Start), "org-membership", "get-memberships")
+		c.metrics.ObserveI8Latency(c.now().Sub(i8Start))
 		return sfResult{membership: m, tenant: t}, sfErr
 	})
 	if shared {
@@ -300,7 +308,7 @@ func (c *Checker) resolveTenderACL(ctx context.Context, tenant, tenderID, user s
 	i12Ctx, i12Span := tracer.Start(ctx, "authz.i12_call")
 	i12Start := c.now()
 	acl, err := c.org.GetTenderACL(i12Ctx, tenant, tenderID, user)
-	c.metrics.ObserveDependencyLatency(c.now().Sub(i12Start), "tender-acl", "get-tender-acl")
+	c.metrics.ObserveI12Latency(c.now().Sub(i12Start))
 	i12Span.End()
 	if err != nil {
 		return domain.TenderACL{}, fmt.Errorf("tender acl rebuild: %w", err)
@@ -318,7 +326,7 @@ func (c *Checker) checkMFAFreshness(ctx context.Context, tenant string, claims C
 	mfaCtx, mfaSpan := tracer.Start(ctx, "authz.mfa_freshness_call")
 	mfaStart := c.now()
 	window, err := c.org.GetMFAFreshness(mfaCtx, tenant)
-	c.metrics.ObserveDependencyLatency(c.now().Sub(mfaStart), "org-membership", "get-mfa-freshness")
+	c.metrics.ObserveI14Latency(c.now().Sub(mfaStart))
 	mfaSpan.End()
 	if err != nil {
 		// The doc gives tender-ACL its own explicit "fail closed for that

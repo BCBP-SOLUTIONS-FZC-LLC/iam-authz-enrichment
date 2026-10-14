@@ -398,3 +398,25 @@ func TestRedisNilIsTheMissSignal(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// WithTimeouts shares the Valkey and TTL settings but has its own pool and
+// socket timeouts, and leaves the original Cache untouched.
+func TestCache_WithTimeouts(t *testing.T) {
+	c, mr := newTestCache(t, 0)
+	ev := c.WithTimeouts(time.Second, 500*time.Millisecond, 400*time.Millisecond)
+	t.Cleanup(func() { _ = ev.Close() })
+
+	assert.NotSame(t, c.client, ev.client, "a separate connection pool")
+	assert.Equal(t, time.Second, ev.client.Options().DialTimeout)
+	assert.Equal(t, 500*time.Millisecond, ev.client.Options().ReadTimeout)
+	assert.Equal(t, 400*time.Millisecond, ev.client.Options().WriteTimeout)
+	assert.NotEqual(t, 500*time.Millisecond, c.client.Options().ReadTimeout, "the original keeps its timeouts")
+	assert.Equal(t, c.ctxTTL, ev.ctxTTL)
+	assert.Equal(t, c.processedTTL, ev.processedTTL)
+
+	require.NoError(t, ev.SetRestricted(context.Background(), "t1", "td1"))
+	assert.True(t, mr.Exists(restrictedFactKey("t1", "td1")), "writes reach the same Valkey")
+	got, err := c.GetRestricted(context.Background(), "t1", "td1")
+	require.NoError(t, err)
+	assert.True(t, got, "and are visible through the original")
+}

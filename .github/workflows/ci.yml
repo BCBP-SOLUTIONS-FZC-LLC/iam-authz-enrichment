@@ -12,7 +12,7 @@
 # against real Valkey/LocalStack) with race detector + 100% coverage gate.
 # All three tiers run in a single job (same service containers, one checkout) —
 # the same pattern iam-tender-acl uses. validate-quality: fmt/vet/lint/arch-lint/
-# observability-lint/metrics-lint/database-lint/events-lint/mod-verify/vuln-check.
+# observability-lint/database-lint/events-lint/image-pin-lint/metrics-check/mod-verify/vuln-check.
 # Both live in validate-test.yml/validate-quality.yml
 # (reusable workflows) so release.yml can call the exact same gate rather
 # than duplicating it — this split wasn't earning its keep before

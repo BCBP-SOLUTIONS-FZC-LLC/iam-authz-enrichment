@@ -73,7 +73,9 @@ type Recorder interface {
 	ObserveNegativeCacheHit(hit bool)
 	ObserveStaleIfErrorServed()
 	ObserveSingleflightCoalesced()
-	ObserveDependencyLatency(d time.Duration, dependency, operation string)
+	ObserveI8Latency(d time.Duration)
+	ObserveI12Latency(d time.Duration)
+	ObserveI14Latency(d time.Duration)
 	ObserveDecisionLatency(d time.Duration)
 	// ObserveTACDependencyError increments the TAC-4 error counter when
 	// resolveTenderACL returns an error — distinguishing a real iam-tender-acl
@@ -88,15 +90,17 @@ type Recorder interface {
 // NoopRecorder implements Recorder with no side effects.
 type NoopRecorder struct{}
 
-func (NoopRecorder) ObserveDecision(domain.DenyReason, bool)                {}
-func (NoopRecorder) ObserveCacheHit(bool)                                   {}
-func (NoopRecorder) ObserveNegativeCacheHit(bool)                           {}
-func (NoopRecorder) ObserveStaleIfErrorServed()                             {}
-func (NoopRecorder) ObserveSingleflightCoalesced()                          {}
-func (NoopRecorder) ObserveDependencyLatency(time.Duration, string, string) {}
-func (NoopRecorder) ObserveDecisionLatency(time.Duration)                   {}
-func (NoopRecorder) ObserveTACDependencyError()                             {}
-func (NoopRecorder) ObserveEvictionError(string)                            {}
+func (NoopRecorder) ObserveDecision(domain.DenyReason, bool) {}
+func (NoopRecorder) ObserveCacheHit(bool)                    {}
+func (NoopRecorder) ObserveNegativeCacheHit(bool)            {}
+func (NoopRecorder) ObserveStaleIfErrorServed()              {}
+func (NoopRecorder) ObserveSingleflightCoalesced()           {}
+func (NoopRecorder) ObserveI8Latency(time.Duration)          {}
+func (NoopRecorder) ObserveI12Latency(time.Duration)         {}
+func (NoopRecorder) ObserveI14Latency(time.Duration)         {}
+func (NoopRecorder) ObserveDecisionLatency(time.Duration)    {}
+func (NoopRecorder) ObserveTACDependencyError()              {}
+func (NoopRecorder) ObserveEvictionError(string)             {}
 
 // Logger mirrors platform-gincommon's port.Logger method set structurally —
 // that type lives in an internal package we cannot import directly, so every

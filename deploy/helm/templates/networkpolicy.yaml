@@ -78,11 +78,22 @@ spec:
         - port: 4317
           protocol: TCP
 
-    # Org & Membership (ORG_MEMBERSHIP_BASE_URL) and iam-tender-acl
-    # (TENDER_ACL_BASE_URL, ADR-0007 Wave 3 Phase 4) have no fixed port
-    # convention the way Valkey/AWS do — add a rule for each via
-    # additionalEgressRules, e.g. the in-cluster port each service actually
-    # listens on.
+    # Org & Membership (ORG_MEMBERSHIP_BASE_URL, I-8/I-14) and iam-tender-acl
+    # (TENDER_ACL_BASE_URL, TAC-4, ADR-0007 Wave 3 Phase 4): each rule admits
+    # only that service's pods, on its HTTP port (networkPolicy.upstreamEgress).
+    {{- range .Values.networkPolicy.upstreamEgress }}
+    # {{ .name }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podSelector | nindent 14 }}
+      ports:
+        - port: {{ .port }}
+          protocol: TCP
+    {{- end }}
     {{- with .Values.networkPolicy.additionalEgressRules }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

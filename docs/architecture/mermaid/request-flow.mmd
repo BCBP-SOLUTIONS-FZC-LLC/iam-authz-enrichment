@@ -12,11 +12,13 @@ sequenceDiagram
 
     Server ->> Server: decodeClaims(MetadataContext)<br/>decodeRequestFacts(ContextExtensions + tender_id from URL path)
 
+    Server ->> Checker: Check(CheckInput)
+    Note over Server,Checker: always handed to Checker — even with no subject — so every<br/>decision is timed and counted in decisions_total / deny_reason_total
+
     alt claims.Subject is empty
-        Server -->> Envoy: Denied 401 DENY_MALFORMED_IDENTITY
-        Note over Server: short-circuits before Checker is ever called
+        Checker -->> Server: Denied — DENY_MALFORMED_IDENTITY (401)
+        Note over Checker: §8.1 — first check in Checker.check, before tenant resolution
     else subject present
-        Server ->> Checker: Check(CheckInput)
         Checker ->> Checker: ResolveTenant(claims, realmMap, sharedRealmIssuer)
 
         alt iss matches neither a dedicated realm nor the shared realm
@@ -34,7 +36,7 @@ sequenceDiagram
                     Note over Checker,Cache: §4.3 — collapses the repeat rebuild call<br/>without ever calling Org & Membership
                 else no negative-cache short-circuit
                     Checker ->> Org: GetMemberships(tenant, user)
-                    Note over Checker,Org: singleflight-coalesced — concurrent callers<br/>for the same (tenant,user) share one call (§4.5)
+                    Note over Checker,Org: singleflight-coalesced — concurrent callers<br/>for the same (tenant,user) share one call (§4.5),<br/>run on context.WithoutCancel so one cancelled caller<br/>can't fail the rest (bounded by ORG_MEMBERSHIP_TIMEOUT)
 
                     alt 404 (ErrNotFound)
                         Org -->> Checker: not found
@@ -48,7 +50,7 @@ sequenceDiagram
                         Checker ->> Checker: DecideDependencyOutcome (§7)
                         alt Valkey reachable and a Stale entry exists
                             Checker ->> Checker: serve the Stale entry
-                            Note over Checker: authz_stale_if_error_served_total++ —<br/>nonzero rate should page (§10)
+                            Note over Checker: iam_authz_enrichment_stale_if_error_served_total++ —<br/>nonzero rate should page (§10)
                         else nothing to fall back on
                             Checker -->> Server: Denied — DENY_SERVICE_UNAVAILABLE (503)
                             Note over Checker,Server: 5xx, not 403 — distinguishes a degraded<br/>authz system from a genuine not-authorized answer (§9)

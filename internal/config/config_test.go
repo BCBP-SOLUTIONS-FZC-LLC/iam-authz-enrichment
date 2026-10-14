@@ -16,18 +16,17 @@ import (
 // test, but not between subtests sharing a parent unless each gets its own
 // t.Setenv call).
 var allEnvVars = []string{
-	"APP_NAME", "APP_ENV", "APP_PORT", "METRICS_PORT", "GRPC_PORT",
-	"VALKEY_URL", "VALKEY_DIAL_TIMEOUT", "VALKEY_READ_TIMEOUT", "VALKEY_WRITE_TIMEOUT",
+	"APP_NAME", "APP_ENV", "ENVIRONMENT", "APP_PORT", "METRICS_PORT", "GRPC_PORT",
+	"VALKEY_URL", "VALKEY_DIAL_TIMEOUT", "VALKEY_READ_TIMEOUT", "VALKEY_WRITE_TIMEOUT", "VALKEY_EVENT_TIMEOUT",
 	"ORG_MEMBERSHIP_BASE_URL", "ORG_MEMBERSHIP_TIMEOUT",
 	"TENDER_ACL_BASE_URL", "TENDER_ACL_TIMEOUT",
 	"SHARED_REALM_ISSUER", "JWT_METADATA_NAMESPACE", "JWT_PAYLOAD_KEY",
 	"AE_CTX_TTL", "AE_CTX_JITTER", "AE_TENDER_ACL_TTL", "AE_NEG_TTL", "AE_RESTRICTED_NEG_TTL", "AE_REALM_NEG_TTL",
 	"AE_PROCESSED_EVENT_TTL", "AE_STALE_IF_ERROR_MAX_AGE",
-	"GRPC_KEEPALIVE_TIME", "GRPC_KEEPALIVE_TIMEOUT", "GRPC_MAX_CONCURRENT_STREAMS",
+	"GRPC_KEEPALIVE_TIME", "GRPC_KEEPALIVE_TIMEOUT", "GRPC_REQUEST_TIMEOUT", "GRPC_MAX_CONCURRENT_STREAMS",
 	"GRPC_MAX_RECV_MSG_SIZE_BYTES", "GRPC_MAX_SEND_MSG_SIZE_BYTES",
 	"GRPC_TLS_CERT_FILE", "GRPC_TLS_KEY_FILE", "GRPC_TLS_CLIENT_CA_FILE",
 	"DOCS_ENABLED", "DOCS_AUTH_TOKEN",
-	"SQS_MAX_RECEIVE_COUNT",
 	"AWS_REGION", "AWS_ENDPOINT_URL",
 	"MEMBERSHIP_AUTHZ_QUEUE_URL", "USER_AUTHZ_QUEUE_URL", "BILLING_AUTHZ_QUEUE_URL",
 	"TENANT_AUTHZ_QUEUE_URL", "TENDER_AUTHZ_QUEUE_URL",
@@ -58,8 +57,9 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 20*time.Millisecond, cfg.ValkeyDialTimeout)
 	assert.Equal(t, 10*time.Millisecond, cfg.ValkeyReadTimeout)
 	assert.Equal(t, 10*time.Millisecond, cfg.ValkeyWriteTimeout)
+	assert.Equal(t, 500*time.Millisecond, cfg.ValkeyEventTimeout)
 	assert.Equal(t, "http://localhost:8081", cfg.OrgMembershipBaseURL)
-	assert.Equal(t, 10*time.Millisecond, cfg.OrgMembershipTimeout)
+	assert.Equal(t, 40*time.Millisecond, cfg.OrgMembershipTimeout)
 	assert.Equal(t, "http://localhost:8086", cfg.TenderACLBaseURL)
 	assert.Equal(t, 30*time.Millisecond, cfg.TenderACLTimeout)
 	assert.Equal(t, "", cfg.SharedRealmIssuer)
@@ -75,6 +75,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 5*time.Minute, cfg.StaleIfErrorMaxAge)
 	assert.Equal(t, 30*time.Second, cfg.GRPCKeepAliveTime)
 	assert.Equal(t, 5*time.Second, cfg.GRPCKeepAliveTimeout)
+	assert.Equal(t, 250*time.Millisecond, cfg.GRPCRequestTimeout)
 	assert.EqualValues(t, 1000, cfg.GRPCMaxConcurrentStreams)
 	assert.Equal(t, 256*1024, cfg.GRPCMaxRecvMsgSizeBytes)
 	assert.Equal(t, 256*1024, cfg.GRPCMaxSendMsgSizeBytes)
@@ -135,7 +136,6 @@ func TestLoad_CustomValues(t *testing.T) {
 	t.Setenv("GRPC_TLS_CLIENT_CA_FILE", "/tls/ca.crt")
 	t.Setenv("DOCS_ENABLED", "true")
 	t.Setenv("DOCS_AUTH_TOKEN", "secret-token")
-	t.Setenv("SQS_MAX_RECEIVE_COUNT", "3")
 	t.Setenv("AWS_REGION", "eu-west-1")
 	t.Setenv("AWS_ENDPOINT_URL", "http://localstack:4566")
 	t.Setenv("MEMBERSHIP_AUTHZ_QUEUE_URL", "http://q/membership")
@@ -228,10 +228,10 @@ func TestLoad_StaleIfErrorMaxAge_BelowCapPassesThrough(t *testing.T) {
 // field's error-return branch individually.
 func TestLoad_InvalidDuration_EachField(t *testing.T) {
 	fields := []string{
-		"VALKEY_DIAL_TIMEOUT", "VALKEY_READ_TIMEOUT", "VALKEY_WRITE_TIMEOUT",
+		"VALKEY_DIAL_TIMEOUT", "VALKEY_READ_TIMEOUT", "VALKEY_WRITE_TIMEOUT", "VALKEY_EVENT_TIMEOUT",
 		"ORG_MEMBERSHIP_TIMEOUT", "TENDER_ACL_TIMEOUT", "AE_CTX_TTL", "AE_CTX_JITTER", "AE_TENDER_ACL_TTL",
 		"AE_NEG_TTL", "AE_RESTRICTED_NEG_TTL", "AE_REALM_NEG_TTL", "AE_PROCESSED_EVENT_TTL", "AE_STALE_IF_ERROR_MAX_AGE",
-		"GRPC_KEEPALIVE_TIME", "GRPC_KEEPALIVE_TIMEOUT",
+		"GRPC_KEEPALIVE_TIME", "GRPC_KEEPALIVE_TIMEOUT", "GRPC_REQUEST_TIMEOUT",
 	}
 	for _, field := range fields {
 		t.Run(field, func(t *testing.T) {
@@ -341,7 +341,7 @@ func TestLoad_InvalidRealmTenantMapSeed_JSON(t *testing.T) {
 // request that isn't a cache hit.
 func TestLoad_OrgMembershipDevDefault_FailsOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	t.Setenv("VALKEY_URL", "rediss://valkey.iam.svc.cluster.local:6379")
 	t.Setenv("SHARED_REALM_ISSUER", "https://keycloak.example.com/realms/shared") // avoid earlier check
 	// ORG_MEMBERSHIP_BASE_URL left unset — resolves to the dev default.
@@ -370,7 +370,7 @@ func TestLoad_OrgMembershipDevDefault_AllowedInDev(t *testing.T) {
 // deployment must not be blocked by this validation.
 func TestLoad_OrgMembershipOverridden_PassesOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	setRequiredProductionEnv(t)
 	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
 	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8080")
@@ -405,7 +405,7 @@ func setRequiredProductionEnv(t *testing.T) {
 
 func TestLoad_QueueURLRequiredOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	setRequiredProductionEnv(t)
 	// Override TENDER_AUTHZ_QUEUE_URL to blank to test the missing-queue check.
 	t.Setenv("TENDER_AUTHZ_QUEUE_URL", "")
@@ -456,7 +456,7 @@ func TestLoad_DuplicateQueueURL_BlanksExempt(t *testing.T) {
 
 func TestLoad_TenderACLDevDefault_FailsOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	t.Setenv("VALKEY_URL", "rediss://valkey.iam.svc.cluster.local:6379")
 	t.Setenv("SHARED_REALM_ISSUER", "https://keycloak.example.com/realms/shared") // avoid earlier check
 	// ORG_MEMBERSHIP_BASE_URL must be overridden too, or that check fires
@@ -486,7 +486,7 @@ func TestLoad_TenderACLDevDefault_AllowedInDev(t *testing.T) {
 
 func TestLoad_ValkeyTLS_PlaintextFailsOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	t.Setenv("VALKEY_URL", "localhost:6379") // plain host:port — no TLS
 
 	_, err := config.Load()
@@ -498,7 +498,7 @@ func TestLoad_ValkeyTLS_PlaintextFailsOutsideDev(t *testing.T) {
 
 func TestLoad_ValkeyTLS_RedisSchemeFailsOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	t.Setenv("VALKEY_URL", "redis://valkey:6379") // redis:// is plaintext
 
 	_, err := config.Load()
@@ -509,13 +509,84 @@ func TestLoad_ValkeyTLS_RedisSchemeFailsOutsideDev(t *testing.T) {
 
 func TestLoad_ValkeyTLS_RedissPassesOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	setRequiredProductionEnv(t) // sets rediss:// Valkey URL + other required vars
 
 	cfg, err := config.Load()
 
 	require.NoError(t, err)
 	assert.True(t, len(cfg.ValkeyURL) > 0)
+}
+
+// APP_ENV, then ENVIRONMENT, trimmed and lowercased, default "dev" — the same
+// precedence the platform libraries apply on their own, so this service's
+// environment label can never disagree with theirs.
+func TestResolveAppEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name, appEnv, environment, want string
+	}{
+		{"default", "", "", "dev"},
+		{"APP_ENV wins", "staging", "prod", "staging"},
+		{"ENVIRONMENT fallback", "", "prod", "prod"},
+		{"blank APP_ENV falls through", "   ", "test", "test"},
+		{"trimmed and lowercased", " PROD ", "", "prod"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("APP_ENV", tc.appEnv)
+			t.Setenv("ENVIRONMENT", tc.environment)
+			assert.Equal(t, tc.want, config.ResolveAppEnv())
+		})
+	}
+}
+
+func TestLoad_AppEnvFromENVIRONMENT(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("ENVIRONMENT", "dev")
+
+	cfg, err := config.Load()
+
+	require.NoError(t, err)
+	assert.Equal(t, "dev", cfg.AppEnv)
+}
+
+func TestLoad_NonPositiveTimeouts_Fail(t *testing.T) {
+	for _, key := range []string{"GRPC_REQUEST_TIMEOUT", "VALKEY_EVENT_TIMEOUT"} {
+		for _, v := range []string{"0s", "-1s"} {
+			t.Run(key+"="+v, func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv(key, v)
+				_, err := config.Load()
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), key)
+			})
+		}
+	}
+}
+
+// A VALKEY_URL that looks like a URL must parse; a plain host:port still works.
+func TestLoad_ValkeyURL(t *testing.T) {
+	for _, tc := range []struct {
+		url     string
+		wantErr bool
+	}{
+		{"localhost:6379", false},
+		{"rediss://user:pass@cache.example:6380/0", false},
+		{"redis://cache.example:6379", false},
+		{"rediss://cache.example:notaport", true},
+		{"http://cache.example:6379", true},
+	} {
+		t.Run(tc.url, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("VALKEY_URL", tc.url)
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "VALKEY_URL")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestLoad_ValkeyTLS_PlaintextAllowedInDev(t *testing.T) {
@@ -536,7 +607,7 @@ func TestLoad_ValkeyTLS_PlaintextAllowedInDev(t *testing.T) {
 
 func TestLoad_SharedRealmIssuerBothEmpty_FailsOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	t.Setenv("VALKEY_URL", "rediss://valkey.iam.svc.cluster.local:6379")
 	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
 	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8086")
@@ -563,7 +634,7 @@ func TestLoad_SharedRealmIssuerBothEmpty_AllowedInDev(t *testing.T) {
 
 func TestLoad_SharedRealmIssuerSet_PassesOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	setRequiredProductionEnv(t) // includes SHARED_REALM_ISSUER
 
 	cfg, err := config.Load()
@@ -574,7 +645,7 @@ func TestLoad_SharedRealmIssuerSet_PassesOutsideDev(t *testing.T) {
 
 func TestLoad_RealmMapSeedSet_PassesOutsideDev(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("APP_ENV", "production")
+	t.Setenv("APP_ENV", "prod")
 	t.Setenv("VALKEY_URL", "rediss://valkey.iam.svc.cluster.local:6379")
 	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org-membership.iam.svc.cluster.local:8080")
 	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl.iam.svc.cluster.local:8086")

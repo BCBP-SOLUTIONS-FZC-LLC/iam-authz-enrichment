@@ -195,9 +195,16 @@ INIT_METRICS=$(grep -n 'events\.InitMetrics' cmd/server/main.go 2>/dev/null || t
 if [ -z "$INIT_METRICS" ]; then
   fail "events.InitMetrics not called in cmd/server/main.go — platform-events sqs_* counters will not appear on /metrics:"
 else
-  # Verify it references gincommon.MetricsRegisterer() on the same line or nearby
+  # Verify it references gincommon.MetricsRegisterer() on the same line, or a
+  # `reg` local bound to it (initLibraryMetrics shares one reg between
+  # platform-events and platform-pgcommon).
   METRICS_WITH_GINCOMMON=$(grep -n 'events\.InitMetrics.*gincommon\.MetricsRegisterer\|gincommon\.MetricsRegisterer.*events\.InitMetrics' \
     cmd/server/main.go 2>/dev/null || true)
+  if [ -z "$METRICS_WITH_GINCOMMON" ] \
+    && grep -q 'reg := gincommon\.MetricsRegisterer()' cmd/server/main.go \
+    && grep -q 'events\.InitMetrics(.*, reg)' cmd/server/main.go; then
+    METRICS_WITH_GINCOMMON="via reg"
+  fi
   if [ -z "$METRICS_WITH_GINCOMMON" ]; then
     fail "events.InitMetrics found but not passed gincommon.MetricsRegisterer() — sqs_* metrics will land on a different registry:"
     echo "$INIT_METRICS" | sed 's/^/    /'

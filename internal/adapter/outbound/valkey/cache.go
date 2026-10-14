@@ -298,3 +298,18 @@ func (c *Cache) Health(ctx context.Context) error {
 func (c *Cache) Close() error {
 	return c.client.Close()
 }
+
+// WithTimeouts returns a Cache over the same Valkey with the same TTL
+// settings but its own connection pool and socket timeouts. cmd/server uses
+// it for SQS event processing: the request path's single-digit-ms timeouts
+// exist for the 15ms decision budget, but an eviction has no such budget, and
+// failing one on a momentary blip delays it by a whole SQS visibility
+// timeout (30s) — indefinitely wrong state for ae:restricted, which has no
+// TTL. The returned Cache must be closed separately.
+func (c *Cache) WithTimeouts(dial, read, write time.Duration) *Cache {
+	opts := *c.client.Options()
+	opts.DialTimeout, opts.ReadTimeout, opts.WriteTimeout = dial, read, write
+	clone := *c
+	clone.client = redis.NewClient(&opts)
+	return &clone
+}

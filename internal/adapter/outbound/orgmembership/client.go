@@ -21,6 +21,8 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
 
@@ -69,11 +71,11 @@ func New(baseURL string, timeout time.Duration, tenderACLBaseURL string, tenderA
 // instrumentedHTTPClient matches iam-org-membership's httpx.NewClient:
 // otelhttp wraps the transport so every I-8/I-12/I-14 call emits a client
 // span and injects W3C traceparent through the TracerProvider
-// gincommon.InitTracingFromEnv installed. Without this, outbound calls
+// gincommon.InitTracingWithConfig installed. Without this, outbound calls
 // start a parentless trace at the sibling.
 func instrumentedHTTPClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
-		timeout = 10 * time.Millisecond
+		timeout = 40 * time.Millisecond // config.Load's ORG_MEMBERSHIP_TIMEOUT default
 	}
 	return &http.Client{
 		Timeout:   timeout,
@@ -185,7 +187,7 @@ func (c *Client) GetTenderACL(ctx context.Context, tenant, tenderID, user string
 	if err != nil {
 		return domain.TenderACL{}, fmt.Errorf("%w: build request: %v", ErrUnavailable, err)
 	}
-	propagateTraceparent(ctx, req)
+	gincommon.InjectTraceContext(ctx, req.Header)
 
 	resp, err := c.tenderACLHTTP.Do(req)
 	if err != nil {
@@ -267,7 +269,7 @@ func (c *Client) GetBatchTenderACL(ctx context.Context, tenant string, items []d
 		return nil, fmt.Errorf("%w: build batch-check request: %v", ErrUnavailable, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	propagateTraceparent(ctx, req)
+	gincommon.InjectTraceContext(ctx, req.Header)
 
 	resp, err := c.tenderACLHTTP.Do(req)
 	if err != nil {
@@ -354,7 +356,7 @@ func (c *Client) getJSON(ctx context.Context, tenant, u string, out any) error {
 }
 
 func (c *Client) doRequest(ctx context.Context, httpClient *http.Client, req *http.Request, out any) error {
-	propagateTraceparent(ctx, req)
+	gincommon.InjectTraceContext(ctx, req.Header)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)

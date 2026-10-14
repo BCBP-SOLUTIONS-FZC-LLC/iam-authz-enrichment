@@ -89,9 +89,8 @@ func TestSQS_MembershipConsumer_EndToEnd(t *testing.T) {
 	defer func() { _ = c.Stop() }()
 
 	sendEnvelope(t, client, qURL, map[string]any{
-		"id": uuid.NewString(), "type": "DepartmentMembershipGranted", "tenant_id": tenant,
-		"source": "iam-org-membership", // platform-events/v2 requires source to parse as a valid envelope
-		"time":   time.Now().Format(time.RFC3339), "data": map[string]string{"user_id": user},
+		"id": uuid.NewString(), "type": "DepartmentMembershipGranted", "source": "iam-authz-enrichment-it", "tenant_id": tenant,
+		"time": time.Now().Format(time.RFC3339), "data": map[string]string{"user_id": user},
 	})
 
 	require.Eventually(t, func() bool {
@@ -132,9 +131,8 @@ func TestSQS_DLQ_MessageMovesAfterMaxReceiveCount(t *testing.T) {
 	// TenderRestrictedPayload — so the handler always returns an error and
 	// the message is never deleted, forcing SQS's own redrive counting.
 	sendEnvelope(t, client, qURL, map[string]any{
-		"id": uuid.NewString(), "type": "TenderRestricted", "tenant_id": "it-dlq-tenant",
-		"source": "iam-tender-acl", // platform-events/v2 requires source; without it the message is deleted as malformed (never reaches DLQ)
-		"time":   time.Now().Format(time.RFC3339), "data": "not-an-object",
+		"id": uuid.NewString(), "type": "TenderRestricted", "source": "iam-authz-enrichment-it", "tenant_id": "it-dlq-tenant",
+		"time": time.Now().Format(time.RFC3339), "data": "not-an-object",
 	})
 
 	cache := newTestCache(t)

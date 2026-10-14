@@ -1,0 +1,143 @@
+# promtool unit tests for deploy/monitoring/app-alerts.yml (`make rules-test`).
+# Series carry the identity labels gincommon injects on every collector.
+rule_files:
+  - ../app-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Fail-closed denies page per environment, on the lowercased reason only.
+  - interval: 1m
+    input_series:
+      - series: 'iam_authz_enrichment_deny_reason_total{domain="iam",service="iam-authz-enrichment",environment="prod",reason="deny_service_unavailable"}'
+        values: '0+10x20'
+      - series: 'iam_authz_enrichment_deny_reason_total{domain="iam",service="iam-authz-enrichment",environment="prod",reason="deny_role_insufficient"}'
+        values: '0+100x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: AuthzEnrichmentServiceUnavailableSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: platform
+              domain: iam
+              service: iam-authz-enrichment
+              environment: prod
+            exp_annotations:
+              description: "A sustained rate of DENY_SERVICE_UNAVAILABLE in prod means §7's failure-handling matrix is fail-closing on an Org & Membership or Valkey outage outside the stale-if-error grace window. Check Org & Membership and Valkey health. iam-tender-acl (TAC-4) outages fail closed to DENY_TENDER_ACL_INSUFFICIENT instead and fire AuthzEnrichmentTAC4ErrorSpike, not this alert. Rate: 166.7m/s."
+              runbook: "docs/observability/runbooks.md#authzenrichmentserviceunavailablespike"
+              summary: "iam-authz-enrichment is denying requests due to an Org & Membership or Valkey failure"
+
+  # Policy denies alone never trip the dependency alert.
+  - interval: 1m
+    input_series:
+      - series: 'iam_authz_enrichment_deny_reason_total{domain="iam",service="iam-authz-enrichment",environment="prod",reason="deny_role_insufficient"}'
+        values: '0+100x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: AuthzEnrichmentServiceUnavailableSpike
+        exp_alerts: []
+
+  # TAC-4 errors page per environment; legitimate tender-ACL denials alone don't.
+  - interval: 1m
+    input_series:
+      - series: 'iam_authz_enrichment_tac4_errors_total{domain="iam",service="iam-authz-enrichment",environment="prod"}'
+        values: '0+6x10'
+      - series: 'iam_authz_enrichment_deny_reason_total{domain="iam",service="iam-authz-enrichment",environment="staging",reason="deny_tender_acl_insufficient"}'
+        values: '0+100x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AuthzEnrichmentTAC4ErrorSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: platform
+              domain: iam
+              service: iam-authz-enrichment
+              environment: prod
+            exp_annotations:
+              description: "iam_authz_enrichment_tac4_errors_total is increasing in prod: GetTenderACL is returning errors and the tender-ACL overlay is failing closed with DENY_TENDER_ACL_INSUFFICIENT for every restricted-tender request. Legitimate access-control denials do not increment this counter. Check iam-tender-acl health and iam_authz_enrichment_i12_call_latency_seconds. Rate: 100m/s."
+              runbook: "docs/observability/runbooks.md#authzenrichmenttac4errorspike"
+              summary: "iam-authz-enrichment TAC-4 (iam-tender-acl) errors — tender-ACL overlay failing closed"
+
+  # A forward to a DLQ fires immediately, carrying the reason.
+  - interval: 1m
+    input_series:
+      - series: 'platform_dlq_messages_total{domain="iam",service="iam-authz-enrichment",environment="staging",operation="consume",event_type="unknown",reason="malformed"}'
+        values: '0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AuthzEnrichmentDLQForwards
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: platform
+              domain: iam
+              service: iam-authz-enrichment
+              environment: staging
+              reason: malformed
+            exp_annotations:
+              description: "1 message(s) in staging were forwarded to their queue's DLQ in the last 15 minutes with reason=malformed. Their cache evictions were never applied, so some entries may be stale beyond their TTL — for tender-authz-q (ae:restricted, no TTL) until replayed. malformed / decode_error means a producer sent an unparseable message; max_receive_count means a handler failed five times."
+              runbook: "docs/observability/runbooks.md#authzenrichmentdlqforwards"
+              summary: "iam-authz-enrichment forwarded event messages to a DLQ"
+
+  # Stale-if-error serving pages after 1m.
+  - interval: 1m
+    input_series:
+      - series: 'iam_authz_enrichment_stale_if_error_served_total{domain="iam",service="iam-authz-enrichment",environment="prod"}'
+        values: '0+5x10'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: AuthzEnrichmentStaleIfErrorServing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              team: platform
+              domain: iam
+              service: iam-authz-enrichment
+              environment: prod
+            exp_annotations:
+              description: "iam_authz_enrichment_stale_if_error_served_total is increasing in prod, meaning §7's stale-if-error path is active: a live outage of a dependency (usually Org & Membership) is in progress right now. Page immediately rather than waiting for the latency or availability SLO alerts — this metric is the earliest signal."
+              runbook: "docs/observability/runbooks.md#authzenrichmentstaleiferrorserving"
+              summary: "iam-authz-enrichment is serving stale cache entries — live dependency outage"
+
+  # Cache hit ratio below 50% for 15m.
+  - interval: 1m
+    input_series:
+      - series: 'iam_authz_enrichment_cache_lookups_total{domain="iam",service="iam-authz-enrichment",environment="prod"}'
+        values: '0+100x40'
+      - series: 'iam_authz_enrichment_cache_hits_total{domain="iam",service="iam-authz-enrichment",environment="prod"}'
+        values: '0+20x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: AuthzEnrichmentCacheHitRatioLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: platform
+              domain: iam
+              service: iam-authz-enrichment
+              environment: prod
+            exp_annotations:
+              description: "The ae:ctx/ae:tenant cache hit ratio in prod over the last 15 minutes is 20%. A sustained low ratio increases Org & Membership (I-8) call volume and decision latency — check for a recent mass cache eviction (bulk membership/tenant event), a TTL misconfiguration, or Valkey eviction pressure."
+              runbook: "docs/observability/runbooks.md#authzenrichmentcachehitratiolow"
+              summary: "iam-authz-enrichment ae:ctx cache hit ratio below 50%"
+
+  # No healthy target → down, with the static identity labels.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="iam-authz-enrichment",instance="a"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AuthzEnrichmentDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              team: platform
+              domain: iam
+              service: iam-authz-enrichment
+            exp_annotations:
+              description: "No iam-authz-enrichment pods have been scraped as healthy for 2 minutes. Every request behind Envoy's ext_authz filter depends on this service — this is a platform-wide outage, not a degradation. Check pod readiness: kubectl get pods -l app.kubernetes.io/name=iam-authz-enrichment"
+              runbook: "docs/observability/runbooks.md#authzenrichmentdown"
+              summary: "iam-authz-enrichment has no healthy instances"

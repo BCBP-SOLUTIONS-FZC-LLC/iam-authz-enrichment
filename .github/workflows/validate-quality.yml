@@ -49,13 +49,17 @@ jobs:
       - run: make arch-lint
       - name: Observability routing lint
         run: make observability-lint
-      - name: Metrics naming lint
-        run: make metrics-lint
       - name: Database routing lint
         run: make database-lint
       - name: Events routing lint
         run: make events-lint
       - name: Go image pin lint
         run: make image-pin-lint
+      # Enterprise Platform Observability Standard (docs/observability/README.md):
+      # collector naming, proposed-metric governance, platform-gincommon's
+      # metricslint on a real scrape + refs + inventory drift, Helm
+      # PrometheusRule drift against app-alerts.yml, promtool alert tests.
+      - name: Observability standard checks
+        run: make metrics-check
       - run: make mod-verify
       - run: make vuln-check

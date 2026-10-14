@@ -138,3 +138,22 @@ func (r *recordingLogger) Warn(msg string, _ map[string]interface{}) {
 func (r *recordingLogger) Error(msg string, _ map[string]interface{}) {
 	r.errors = append(r.errors, msg)
 }
+
+func TestDropMissingDSNWarning(t *testing.T) {
+	const dsn = "platform-pgcommon: PG_USER/PG_DBNAME: both PG_USER and PG_DBNAME are required to build a DSN"
+	other := "OUTBOX_BATCH_SIZE: invalid value"
+
+	t.Run("no database env at all drops it", func(t *testing.T) {
+		t.Setenv("PG_USER", "")
+		t.Setenv("PG_DBNAME", "")
+		assert.Equal(t, []string{other}, dropMissingDSNWarning([]string{dsn, other}, ""))
+	})
+	t.Run("partial PG config keeps it", func(t *testing.T) {
+		t.Setenv("PG_USER", "u")
+		t.Setenv("PG_DBNAME", "")
+		assert.Equal(t, []string{dsn, other}, dropMissingDSNWarning([]string{dsn, other}, ""))
+	})
+	t.Run("DATABASE_URL set keeps everything", func(t *testing.T) {
+		assert.Equal(t, []string{dsn}, dropMissingDSNWarning([]string{dsn}, "postgres://x"))
+	})
+}

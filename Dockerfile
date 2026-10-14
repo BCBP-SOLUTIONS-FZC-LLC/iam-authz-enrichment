@@ -36,7 +36,7 @@ RUN CGO_ENABLED=0 GOOS=linux \
     -ldflags="-s -w -X main.buildVersion=${BUILD_VERSION}" \
     -o bin/iam-authz-enrichment ./cmd/server
 
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 ARG BUILD_VERSION=dev
 ENV BUILD_VERSION=${BUILD_VERSION}

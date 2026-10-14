@@ -8,7 +8,6 @@ import (
 
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/usecase"
 )
 
@@ -33,16 +32,12 @@ func NewServer(checker *usecase.Checker, jwt JWTMetadata) *Server {
 // identity or policy facts — see claims.go/requestfacts.go for why, and
 // §8.2's header-spoofing invariant for why that matters.
 func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.CheckResponse, error) {
-	claims := decodeClaims(req, s.jwt)
-	if claims.Subject == "" {
-		// §8.1: no other claim or header is a valid identity input. A
-		// request with no verified subject at all has nothing this service
-		// can authorize against.
-		return deniedResponse(domain.DenyMalformedIdentity), nil
-	}
-
+	// A missing verified subject is still handed to Checker.Check, which
+	// denies it as DENY_MALFORMED_IDENTITY first thing — so that deny is
+	// timed and counted in iam_authz_enrichment_decisions_total like every
+	// other decision, instead of returning from here unrecorded.
 	decision := s.checker.Check(ctx, usecase.CheckInput{
-		Claims:  claims,
+		Claims:  decodeClaims(req, s.jwt),
 		Request: decodeRequestFacts(req),
 	})
 

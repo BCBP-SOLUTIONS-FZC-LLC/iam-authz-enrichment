@@ -51,7 +51,6 @@ help:
 	@echo "  make lint            - run golangci-lint (default build + every test build tag)"
 	@echo "  make arch-lint       - enforce .go-arch-lint.yml component boundaries"
 	@echo "  make observability-lint - enforce all logs/metrics/traces route through platform-gincommon"
-	@echo "  make metrics-lint       - enforce Enterprise Platform Observability Standard (iam_authz_enrichment_* prefix)"
 	@echo "  make database-lint      - enforce all DB connections/config/ops route through platform-pgcommon"
 	@echo "  make events-lint        - enforce all events/outbox/dedup route through platform-events"
 	@echo "  make image-pin-lint     - enforce Dockerfile golang tag matches go.mod"
@@ -64,12 +63,16 @@ help:
 	@echo "  make build           - compile server binary to bin/"
 	@echo "  make cover           - coverage profile + open HTML report"
 	@echo "  make cover-func      - coverage summary by function"
-	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + observability-lint + metrics-lint + database-lint + test-ci + build"
+	@echo "  make cover-all       - whole-module coverage incl. cmd/server (unit + e2e on an instrumented binary; needs make docker-up)"
+	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + observability/database/events/image-pin lints + metrics-check + test-ci + build"
+	@echo "  make metrics-check   - observability standard: naming, governance, metricslint, inventory, PrometheusRule drift, alert tests"
+	@echo "  make metrics-inventory - regenerate docs/observability/metric-registry.md"
+	@echo "  make prometheusrule  - regenerate the Helm PrometheusRule from deploy/monitoring/app-alerts.yml"
 	@echo "  make docker-up       - start local Valkey + floci (SQS)"
 	@echo "  make docker-down     - stop local containers"
 	@echo "  make fmt-check       - verify gofmt formatting (no changes applied)"
 	@echo "  make mod-verify      - go mod verify (check module download integrity)"
-	@echo "  make vuln-check      - govulncheck on internal packages"
+	@echo "  make vuln-check      - govulncheck on the whole module (accepted exceptions: .github/govulncheck-allow.txt)"
 	@echo "  make load-test       - run the test/load harness against a running instance (manual, not part of CI)"
 	@echo "  make pin-base-images - fetch SHA digests and pin Dockerfile base images"
 	@echo "  make clean           - remove build artefacts"
@@ -137,14 +140,6 @@ database-lint:
 observability-lint:
 	@bash .github/scripts/check-observability-routing.sh
 
-# metrics-lint enforces the Enterprise Platform Observability Standard:
-#   All metric names must use the iam_authz_enrichment_ prefix (Tier 3).
-#   Counters must end with _total; histograms must end with _seconds.
-#   No high-cardinality labels (user_id, tenant_id, etc.) in metric definitions.
-.PHONY: metrics-lint
-metrics-lint:
-	@bash .github/scripts/check-metrics-naming.sh
-
 # events-lint enforces the platform-events-only routing invariant:
 #   Consumers  → events.NewSQSConsumerWithClient via buildConsumer
 #   Config     → config.LoadSQS / SQSConfigFromEnv / SQSConsumerOptions
@@ -162,6 +157,49 @@ events-lint:
 .PHONY: image-pin-lint
 image-pin-lint:
 	@bash .github/scripts/check-golang-image-pin.sh
+
+# -----------------------------
+# OBSERVABILITY (docs/observability/README.md § CI enforcement)
+# -----------------------------
+# metrics-check: every Enterprise Platform Observability Standard check —
+# collector construction/naming, proposed-metric governance, platform-gincommon's
+# metricslint on a real scrape (+ refs + inventory drift), Helm PrometheusRule
+# drift, and the promtool alert unit tests.
+.PHONY: metrics-check metrics-naming metrics-registry-lint metrics-lint metrics-inventory prometheusrule prometheusrule-check rules-test
+metrics-check: metrics-naming metrics-registry-lint metrics-lint prometheusrule-check rules-test
+
+metrics-naming:
+	bash .github/scripts/check-metric-naming.sh
+
+metrics-registry-lint:
+	bash .github/scripts/metrics-registry-lint.sh
+
+metrics-lint:
+	bash .github/scripts/metricslint.sh
+
+# metrics-inventory: regenerate docs/observability/metric-registry.md from the
+# pinned registry and a real scrape (metrics-lint fails when it is stale).
+metrics-inventory:
+	METRICS_INVENTORY_WRITE=1 bash .github/scripts/metricslint.sh
+
+# prometheusrule: regenerate the Helm PrometheusRule from deploy/monitoring/app-alerts.yml.
+prometheusrule:
+	python3 .github/scripts/render-prometheusrule.py
+
+prometheusrule-check:
+	python3 .github/scripts/render-prometheusrule.py --check
+
+# rules-test: promtool check + unit tests for the alert rules. Uses a local
+# promtool, else the pinned prom/prometheus image.
+PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0
+rules-test:
+	@if command -v promtool >/dev/null; then \
+	  promtool check rules deploy/monitoring/app-alerts.yml && \
+	  promtool test rules deploy/monitoring/tests/app-alerts.test.yml; \
+	else \
+	  docker run --rm -v "$(CURDIR)/deploy/monitoring:/rules" -w /rules --entrypoint promtool $(PROMETHEUS_IMAGE) check rules app-alerts.yml && \
+	  docker run --rm -v "$(CURDIR)/deploy/monitoring:/rules" -w /rules --entrypoint promtool $(PROMETHEUS_IMAGE) test rules tests/app-alerts.test.yml; \
+	fi
 
 # -----------------------------
 # TESTS
@@ -247,7 +285,7 @@ pin-base-images:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy fmt-check vet lint arch-lint observability-lint metrics-lint database-lint events-lint image-pin-lint test-ci build
+ci: tidy fmt-check vet lint arch-lint observability-lint database-lint events-lint image-pin-lint metrics-check test-ci build
 
 # -----------------------------
 # COVERAGE
@@ -260,6 +298,25 @@ cover: test-ci
 .PHONY: cover-func
 cover-func: test-ci
 	$(GO) tool cover -func=coverage.out
+
+# cover-all: whole-module coverage including cmd/server, which test-ci's gate
+# leaves out (its run() binds real ports and blocks on signals). Unit tests
+# write binary coverage data, the e2e suite runs a coverage-instrumented build
+# of the real binary (go build -cover), and the two are merged. Needs the same
+# Valkey + SQS emulator as test-e2e (`make docker-up`). Report only, not a gate.
+COVER_ALL_DIR ?= .cover-all
+MODULE := github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment
+.PHONY: cover-all
+cover-all:
+	rm -rf $(COVER_ALL_DIR) && mkdir -p $(COVER_ALL_DIR)/unit $(COVER_ALL_DIR)/e2e $(COVER_ALL_DIR)/merged
+	$(GO) build -cover -coverpkg=$(MODULE)/internal/...,$(MODULE)/cmd/... -o $(COVER_ALL_DIR)/iam-authz-enrichment ./cmd/server
+	$(GO) test -cover -coverpkg=$(MODULE)/internal/...,$(MODULE)/cmd/... $(TEST_UNIT_PKGS) -count=1 -args -test.gocoverdir=$(CURDIR)/$(COVER_ALL_DIR)/unit
+	GOCOVERDIR=$(CURDIR)/$(COVER_ALL_DIR)/e2e E2E_BINARY_PATH=$(CURDIR)/$(COVER_ALL_DIR)/iam-authz-enrichment \
+	  $(GO) test -tags=e2e $(TEST_E2E_PKGS) -count=1 -timeout 300s
+	$(GO) tool covdata merge -i=$(COVER_ALL_DIR)/unit,$(COVER_ALL_DIR)/e2e -o=$(COVER_ALL_DIR)/merged
+	$(GO) tool covdata textfmt -i=$(COVER_ALL_DIR)/merged -o=$(COVER_ALL_DIR)/coverage.out
+	$(GO) tool cover -func=$(COVER_ALL_DIR)/coverage.out | tail -1
+	$(GO) tool covdata percent -i=$(COVER_ALL_DIR)/merged
 
 # -----------------------------
 # CHECKS (mirror what CI runs; safe to call locally before pushing)
@@ -281,7 +338,7 @@ mod-verify:
 
 .PHONY: vuln-check
 vuln-check:
-	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./internal/...
+	bash .github/scripts/vuln-check.sh
 
 # -----------------------------
 # LOAD TEST (manual — not part of CI, see test/load)

@@ -1,19 +1,37 @@
 # Prometheus alerting rules for the iam-authz-enrichment application.
 #
-# All iam_authz_enrichment_* metrics are registered in internal/adapter/outbound/metrics/recorder.go
-# (§10). Thresholds below match the SLOs documented in ARCHITECTURE.md § Observability
-# stack — decision latency p99 > 50ms/5min → SEV-2, availability < 99.5%/10min → SEV-1,
-# iam_authz_enrichment_stale_served_total nonzero → page directly (a live dependency outage).
+# Source of truth for deploy/helm/templates/prometheusrule.yaml, which is
+# generated from this file by .github/scripts/render-prometheusrule.py
+# (`make prometheusrule`; CI fails when the two differ). Deploy this file via a
+# Prometheus --rule-files directory on non-kube-prometheus setups.
 #
-# This service has no HTTP business API (no http_requests_total, no 5xx rate) and no
-# database — its closest equivalent to a request-error rate is the DENY_SERVICE_UNAVAILABLE
-# deny reason (§7 fail-closed / dependency failure), not a generic deny rate: most denies
-# are the policy working correctly, not an error.
+# Metrics (docs/observability/metric-registry.md):
+#   iam_authz_enrichment_*  — this service's Tier 3 collectors
+#                             (internal/adapter/outbound/metrics/recorder.go)
+#   platform_messages_*, platform_dlq_messages_total — platform-events
+#   up                      — Prometheus' own scrape health (job label only)
+# Thresholds follow LLD §11.1: decision latency p99 > 50ms/5m → SEV-2,
+# availability < 99.5%/10m → SEV-1, stale-if-error nonzero → page directly.
 #
-# Deploy via PrometheusRule CRD (kube-prometheus-stack) or include in a
-# Prometheus --rule-files directory.
+# This service has no business HTTP API and no database. A policy deny is a
+# successful gRPC call (grpc_code="OK"), so the closest equivalent of a request
+# error rate is the deny_service_unavailable deny reason (§7 fail-closed on a
+# dependency failure), not a generic deny rate — most denies are the policy
+# working correctly.
 #
-# Label on all iam_authz_enrichment_* metrics: job — "iam-authz-enrichment"
+# Labels on every iam_authz_enrichment_* / platform_* series (platform-gincommon):
+#   domain, service, environment — identity ("iam", "iam-authz-enrichment", APP_ENV)
+# Metric alerts aggregate `by (domain, service, environment)`, so each fires
+# per environment and carries the identity. The up-based alerts select on the
+# scrape job and set domain/service as static labels instead (up has no
+# identity labels).
+#
+# Every alert carries:
+#   severity: critical | warning
+#   runbook:  the alert's entry in docs/observability/runbooks.md
+#   metric_status: proposed — only on alerts that query a metric still Proposed
+#             in the Platform Observability Registry (none today; the five
+#             canonical messaging metrics used below are approved).
 
 groups:
   - name: iam_authz_enrichment_availability
@@ -27,6 +45,8 @@ groups:
         labels:
           severity: critical
           team: platform
+          domain: iam
+          service: iam-authz-enrichment
         annotations:
           summary: iam-authz-enrichment has no healthy instances
           description: >-
@@ -34,6 +54,7 @@ groups:
             Every request behind Envoy's ext_authz filter depends on this service —
             this is a platform-wide outage, not a degradation.
             Check pod readiness: kubectl get pods -l app.kubernetes.io/name=iam-authz-enrichment
+          runbook: "docs/observability/runbooks.md#authzenrichmentdown"
 
       # ── Pod count below minimum ───────────────────────────────────────────────
       - alert: AuthzEnrichmentReplicasMissing
@@ -43,14 +64,17 @@ groups:
         labels:
           severity: warning
           team: platform
+          domain: iam
+          service: iam-authz-enrichment
         annotations:
           summary: iam-authz-enrichment running below minimum replica count
           description: >-
             Fewer than 2 replicas are healthy. The PDB requires minAvailable=2;
             a further disruption will block node drains.
             Current healthy count: {{ $value }}.
+          runbook: "docs/observability/runbooks.md#authzenrichmentreplicasmissing"
 
-      # ── Availability SLO (ARCHITECTURE.md §10: <99.5% over 10m → SEV-1) ───────
+      # ── Availability SLO (LLD §11.1: <99.5% over 10m → SEV-1) ─────────────────
       - alert: AuthzEnrichmentAvailabilitySLOBreach
         expr: |
           avg(avg_over_time(up{job="iam-authz-enrichment"}[10m])) < 0.995
@@ -58,22 +82,25 @@ groups:
         labels:
           severity: critical
           team: platform
+          domain: iam
+          service: iam-authz-enrichment
         annotations:
           summary: iam-authz-enrichment availability below 99.5% SLO — SEV-1
           description: >-
             Fleet-wide scrape-success ratio over the last 10 minutes is
             {{ $value | humanizePercentage }}, below the documented 99.5% SLO.
-            This is a SEV-1 per ARCHITECTURE.md §10 — escalate immediately.
+            This is a SEV-1 per LLD §11.1 — escalate immediately.
+          runbook: "docs/observability/runbooks.md#authzenrichmentavailabilityslobreach"
 
   - name: iam_authz_enrichment_latency
     rules:
 
-      # ── Decision latency SLO (ARCHITECTURE.md §10: p99 > 50ms/5m → SEV-2) ─────
+      # ── Decision latency SLO (LLD §11.1: p99 > 50ms/5m → SEV-2) ───────────────
       - alert: AuthzEnrichmentDecisionLatencySLOBreach
         expr: |
           histogram_quantile(0.99,
-            sum by (le) (
-              rate(iam_authz_enrichment_decision_latency_seconds_bucket{job="iam-authz-enrichment"}[5m])
+            sum by (domain, service, environment, le) (
+              rate(iam_authz_enrichment_decision_latency_seconds_bucket{domain="iam", service="iam-authz-enrichment"}[5m])
             )
           ) > 0.05
         for: 5m
@@ -83,19 +110,22 @@ groups:
         annotations:
           summary: iam-authz-enrichment p99 decision latency above 50ms SLO — SEV-2
           description: >-
-            The p99 Check() decision latency is {{ $value | humanizeDuration }},
-            exceeding the documented 50ms SLO. This is a SEV-2 per ARCHITECTURE.md
-            §10. Check iam_authz_enrichment_dependency_request_seconds{operation="get-memberships"} / iam_authz_enrichment_dependency_request_seconds{operation="get-tender-acl"}
-            for whether Org & Membership is the bottleneck, and Valkey round-trip
-            time if cache hit ratio has dropped.
+            The p99 Check() decision latency in {{ $labels.environment }} is
+            {{ $value | humanizeDuration }}, exceeding the documented 50ms SLO
+            (15ms design budget). Check iam_authz_enrichment_i8/i12/i14_call_latency_seconds
+            for whether a sibling is the bottleneck, and Valkey round-trip time if
+            the cache hit ratio has dropped.
+          runbook: "docs/observability/runbooks.md#authzenrichmentdecisionlatencyslobreach"
 
   - name: iam_authz_enrichment_dependency_health
     rules:
 
-      # ── Stale-if-error serving (explicit "page on it directly" per §10) ───────
+      # ── Stale-if-error serving (explicit "page on it directly", §11.2) ────────
       - alert: AuthzEnrichmentStaleIfErrorServing
         expr: |
-          rate(iam_authz_enrichment_stale_served_total{job="iam-authz-enrichment"}[5m]) > 0
+          sum by (domain, service, environment) (
+            rate(iam_authz_enrichment_stale_if_error_served_total{domain="iam", service="iam-authz-enrichment"}[5m])
+          ) > 0
         for: 1m
         labels:
           severity: critical
@@ -103,41 +133,45 @@ groups:
         annotations:
           summary: iam-authz-enrichment is serving stale cache entries — live dependency outage
           description: >-
-            iam_authz_enrichment_stale_served_total is increasing, meaning §7's
-            stale-if-error path is active: a live outage of a dependency
-            (Valkey or Org & Membership) is in progress right now. Page
-            immediately rather than waiting for the latency/availability SLO
-            alerts above to trip — this metric is the earliest signal.
+            iam_authz_enrichment_stale_if_error_served_total is increasing in
+            {{ $labels.environment }}, meaning §7's stale-if-error path is active:
+            a live outage of a dependency (usually Org & Membership) is in progress
+            right now. Page immediately rather than waiting for the latency or
+            availability SLO alerts — this metric is the earliest signal.
+          runbook: "docs/observability/runbooks.md#authzenrichmentstaleiferrorserving"
 
-      # ── Fail-closed / dependency-failure deny spike ────────────────────────────
-      # DENY_SERVICE_UNAVAILABLE fires only for Org & Membership / Valkey
-      # failures (§7 fail-closed path). TAC-4 (iam-tender-acl) outages produce
-      # DENY_TENDER_ACL_INSUFFICIENT instead — see AuthzEnrichmentTAC4ErrorSpike.
+      # ── Fail-closed / dependency-failure deny spike ───────────────────────────
       - alert: AuthzEnrichmentServiceUnavailableSpike
         expr: |
-          rate(iam_authz_enrichment_deny_reasons_total{job="iam-authz-enrichment", reason="DENY_SERVICE_UNAVAILABLE"}[5m]) > 0
-        for: 2m
+          sum by (domain, service, environment) (
+            rate(iam_authz_enrichment_deny_reason_total{domain="iam", service="iam-authz-enrichment", reason="deny_service_unavailable"}[5m])
+          ) > 0
+        for: 5m
         labels:
           severity: warning
           team: platform
         annotations:
           summary: iam-authz-enrichment is denying requests due to an Org & Membership or Valkey failure
           description: >-
-            A sustained rate of DENY_SERVICE_UNAVAILABLE means §7's failure-handling
-            matrix is fail-closing on an Org & Membership or Valkey outage outside
-            the stale-if-error grace window. Check Org & Membership and Valkey health.
-            Note: iam-tender-acl (TAC-4) outages fire AuthzEnrichmentTAC4ErrorSpike,
-            not this alert.
+            A sustained rate of DENY_SERVICE_UNAVAILABLE in {{ $labels.environment }}
+            means §7's failure-handling matrix is fail-closing on an Org & Membership
+            or Valkey outage outside the stale-if-error grace window. Check
+            Org & Membership and Valkey health. iam-tender-acl (TAC-4) outages
+            fail closed to DENY_TENDER_ACL_INSUFFICIENT instead and fire
+            AuthzEnrichmentTAC4ErrorSpike, not this alert.
             Rate: {{ $value | humanize }}/s.
+          runbook: "docs/observability/runbooks.md#authzenrichmentserviceunavailablespike"
 
-      # ── TAC-4 dependency error spike (iam-tender-acl outage) ─────────────────
-      # TAC-4 failures fail closed to DENY_TENDER_ACL_INSUFFICIENT (§7 row 4)
-      # rather than DENY_SERVICE_UNAVAILABLE — they never activate the
-      # stale-if-error path. iam_authz_enrichment_tac4_errors_total counts
-      # only the error path in resolveTenderACL, not legitimate policy denials.
+      # ── TAC-4 dependency errors (iam-tender-acl outage) ──────────────────────
+      # TAC-4 failures fail closed to DENY_TENDER_ACL_INSUFFICIENT (§7 row 4),
+      # never DENY_SERVICE_UNAVAILABLE, and never activate stale-if-error, so
+      # neither alert above sees them. iam_authz_enrichment_tac4_errors_total
+      # counts only resolveTenderACL's error path, not legitimate denials.
       - alert: AuthzEnrichmentTAC4ErrorSpike
         expr: |
-          rate(iam_authz_enrichment_tac4_errors_total{job="iam-authz-enrichment"}[5m]) > 0
+          sum by (domain, service, environment) (
+            rate(iam_authz_enrichment_tac4_errors_total{domain="iam", service="iam-authz-enrichment"}[5m])
+          ) > 0
         for: 1m
         labels:
           severity: warning
@@ -145,24 +179,25 @@ groups:
         annotations:
           summary: iam-authz-enrichment TAC-4 (iam-tender-acl) errors — tender-ACL overlay failing closed
           description: >-
-            iam_authz_enrichment_tac4_errors_total is increasing: GetTenderACL is
-            returning errors and the tender-ACL overlay is failing closed with
-            DENY_TENDER_ACL_INSUFFICIENT for all restricted-tender requests.
-            This is distinct from legitimate access-control denials (those do not
-            increment this counter). Check iam-tender-acl health and
-            iam_authz_enrichment_dependency_request_seconds{dependency="tender-acl"}.
+            iam_authz_enrichment_tac4_errors_total is increasing in
+            {{ $labels.environment }}: GetTenderACL is returning errors and the
+            tender-ACL overlay is failing closed with DENY_TENDER_ACL_INSUFFICIENT
+            for every restricted-tender request. Legitimate access-control denials
+            do not increment this counter. Check iam-tender-acl health and
+            iam_authz_enrichment_i12_call_latency_seconds.
             Rate: {{ $value | humanize }}/s.
+          runbook: "docs/observability/runbooks.md#authzenrichmenttac4errorspike"
 
   - name: iam_authz_enrichment_cache
     rules:
 
-      # ── Cache hit ratio — computed via rate() division per ARCHITECTURE.md's
-      # own guidance (never a server-computed ratio gauge).
+      # ── Cache hit ratio — computed via rate() division (never a
+      # server-computed ratio gauge).
       - alert: AuthzEnrichmentCacheHitRatioLow
         expr: |
-          sum(rate(iam_authz_enrichment_cache_hits_total{job="iam-authz-enrichment"}[15m]))
+          sum by (domain, service, environment) (rate(iam_authz_enrichment_cache_hits_total{domain="iam", service="iam-authz-enrichment"}[15m]))
             /
-          sum(rate(iam_authz_enrichment_cache_lookups_total{job="iam-authz-enrichment"}[15m]))
+          sum by (domain, service, environment) (rate(iam_authz_enrichment_cache_lookups_total{domain="iam", service="iam-authz-enrichment"}[15m]))
           < 0.5
         for: 15m
         labels:
@@ -171,63 +206,57 @@ groups:
         annotations:
           summary: iam-authz-enrichment ae:ctx cache hit ratio below 50%
           description: >-
-            The ae:ctx/ae:tenant cache hit ratio over the last 15 minutes is
-            {{ $value | humanizePercentage }}. A sustained low ratio increases
-            Org & Membership (I-8) call volume and decision latency — check for
-            a recent mass cache eviction (bulk membership/tenant event), a TTL
-            misconfiguration, or Valkey eviction pressure/capacity issues.
+            The ae:ctx/ae:tenant cache hit ratio in {{ $labels.environment }} over
+            the last 15 minutes is {{ $value | humanizePercentage }}. A sustained
+            low ratio increases Org & Membership (I-8) call volume and decision
+            latency — check for a recent mass cache eviction (bulk membership/tenant
+            event), a TTL misconfiguration, or Valkey eviction pressure.
+          runbook: "docs/observability/runbooks.md#authzenrichmentcachehitratiolow"
 
-  - name: iam_authz_enrichment_consumers
+  - name: iam_authz_enrichment_events
     rules:
 
-      # ── SQS consumer stuck: persistent ReceiveMessage errors ─────────────────
-      # platform-events retries ReceiveMessage forever internally and never
-      # surfaces the error back to the caller — sqs_receive_errors_total is
-      # the only externally-observable signal. The receive-error watchdog in
-      # cmd/server/receive_watchdog.go already pushes to fatalErr after 6
-      # consecutive polls (~3 minutes at 30s intervals), causing a pod restart.
-      # This alert catches a rising error count before the watchdog fires and is
-      # also useful if the watchdog itself is not running (e.g. during startup).
-      - alert: AuthzEnrichmentSQSReceiveErrors
+      # ── Poison messages forwarded to a DLQ (LLD §16 AE-36) ────────────────────
+      # Counted once per forward by platform-events (approved metric). The
+      # CloudWatch DLQ-depth alarms (dlq-alarms.tf.example) say a message is
+      # still there; this says one just arrived, with the reason.
+      - alert: AuthzEnrichmentDLQForwards
         expr: |
-          increase(sqs_receive_errors_total{job="iam-authz-enrichment"}[5m]) > 0
-        for: 2m
+          sum by (domain, service, environment, reason) (
+            increase(platform_dlq_messages_total{domain="iam", service="iam-authz-enrichment", operation="consume"}[15m])
+          ) > 0
         labels:
           severity: warning
           team: platform
         annotations:
-          summary: iam-authz-enrichment SQS consumer ReceiveMessage errors
+          summary: iam-authz-enrichment forwarded event messages to a DLQ
           description: >-
-            sqs_receive_errors_total for queue {{ $labels.queue }} has increased
-            in the last 5 minutes. This typically means the queue URL is wrong,
-            IAM permissions were revoked, or the queue was deleted. Cache
-            eviction events are not being received — stale authorization context
-            will persist until TTL expiry. The receive-error watchdog will restart
-            the pod after ~3 minutes of sustained failure; check SQS permissions
-            and queue configuration. Queue: {{ $labels.queue }}.
+            {{ $value | humanize }} message(s) in {{ $labels.environment }} were
+            forwarded to their queue's DLQ in the last 15 minutes with
+            reason={{ $labels.reason }}. Their cache evictions were never applied,
+            so some entries may be stale beyond their TTL — for tender-authz-q
+            (ae:restricted, no TTL) until replayed. malformed / decode_error means
+            a producer sent an unparseable message; max_receive_count means a
+            handler failed five times.
+          runbook: "docs/observability/runbooks.md#authzenrichmentdlqforwards"
 
-      # ── DLQ messages arrived: a handler exhausted all retries ─────────────────
-      # A message in the DLQ means its handler failed on all 5 deliveries
-      # (maxReceiveCount=5 redrive policy). For cache-eviction consumers this
-      # means a role/membership/tender change was NOT applied — stale context
-      # persists until the key's TTL expires. For TenderRestricted (ae:restricted
-      # has no TTL by design) a missed event permanently disables the tender-ACL
-      # overlay for that tender until a pod restart re-processes the SQS backlog
-      # or the key is manually deleted. Page immediately.
-      - alert: AuthzEnrichmentDLQMessageArrived
+      # ── A consumer is failing most of what it receives ────────────────────────
+      - alert: AuthzEnrichmentEventFailureRateHigh
         expr: |
-          increase(platform_dlq_messages_total{job="iam-authz-enrichment"}[5m]) > 0
-        for: 1m
+          sum by (domain, service, environment, queue) (rate(platform_messages_failed_total{domain="iam", service="iam-authz-enrichment"}[10m]))
+            /
+          sum by (domain, service, environment, queue) (rate(platform_messages_received_total{domain="iam", service="iam-authz-enrichment"}[10m]))
+          > 0.5
+        for: 10m
         labels:
-          severity: critical
+          severity: warning
           team: platform
         annotations:
-          summary: iam-authz-enrichment consumer sent a message to the DLQ
+          summary: iam-authz-enrichment is failing most messages on a queue
           description: >-
-            A message on queue {{ $labels.queue }} (event type {{ $labels.event_type }})
-            exhausted all 5 delivery attempts and was moved to the DLQ.
-            The corresponding cache eviction was NOT applied. For TenderRestricted
-            events, the tender-ACL overlay for that tender is permanently disabled
-            until the key is manually cleared or the pod restarts. Inspect the DLQ,
-            fix the root cause, and replay the message.
-            Queue: {{ $labels.queue }}, Event: {{ $labels.event_type }}.
+            More than half of the deliveries on {{ $labels.queue }} in
+            {{ $labels.environment }} failed over 10 minutes
+            ({{ $value | humanizePercentage }}). Cache evictions for that queue are
+            being retried and will dead-letter; check Valkey and the handler error
+            logs.
+          runbook: "docs/observability/runbooks.md#authzenrichmenteventfailureratehigh"

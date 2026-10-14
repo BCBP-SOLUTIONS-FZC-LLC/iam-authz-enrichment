@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -636,9 +637,9 @@ func TestNoopRecorder_AllMethodsAreSafeNoOps(t *testing.T) {
 	r.ObserveNegativeCacheHit(false)
 	r.ObserveStaleIfErrorServed()
 	r.ObserveSingleflightCoalesced()
-	r.ObserveDependencyLatency(time.Millisecond, "org-membership", "get-memberships")
-	r.ObserveDependencyLatency(time.Millisecond, "tender-acl", "get-tender-acl")
-	r.ObserveDependencyLatency(time.Millisecond, "org-membership", "get-mfa-freshness")
+	r.ObserveI8Latency(time.Millisecond)
+	r.ObserveI12Latency(time.Millisecond)
+	r.ObserveI14Latency(time.Millisecond)
 	r.ObserveDecisionLatency(time.Millisecond)
 }
 
@@ -679,3 +680,76 @@ func TestCheck_Singleflight_CoalescesConcurrentMisses(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// countingRecorder records only what TestCheck_MissingSubject_IsRecorded asserts.
+type countingRecorder struct {
+	usecase.NoopRecorder
+	mu      sync.Mutex
+	reasons []domain.DenyReason
+}
+
+func (r *countingRecorder) ObserveDecision(reason domain.DenyReason, allowed bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !allowed {
+		r.reasons = append(r.reasons, reason)
+	}
+}
+
+// A request with no verified subject is denied inside Check — not in the gRPC
+// adapter — so it is counted in iam_authz_enrichment_decisions_total like
+// every other decision.
+func TestCheck_MissingSubject_IsRecorded(t *testing.T) {
+	t.Parallel()
+	rec := &countingRecorder{}
+	org := &fixtures.FakeOrgMembershipClient{}
+	checker := usecase.NewChecker(fixtures.NewFakeCache(), org,
+		usecase.NewRealmMap(map[string]string{dedicatedIssuer: tenant}, 5*time.Second),
+		usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{}, rec, usecase.CheckerConfig{})
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: usecase.Claims{Issuer: dedicatedIssuer}})
+
+	assert.False(t, decision.Allow)
+	assert.Equal(t, domain.DenyMalformedIdentity, decision.Reason)
+	assert.Equal(t, []domain.DenyReason{domain.DenyMalformedIdentity}, rec.reasons)
+	assert.Zero(t, org.MembershipCalls)
+}
+
+// Regression: a coalesced I-8 call must not inherit the first caller's
+// cancellation. Request A is cancelled (e.g. Envoy's deadline) while B waits
+// on the same singleflight key; B must still get A's successful result.
+func TestCheck_Singleflight_FirstCallerCancelled_OthersUnaffected(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, _, _ string) (domain.MembershipContext, domain.TenantContext, error) {
+			started <- struct{}{}
+			select {
+			case <-ctx.Done(): // the real HTTP client aborts on a cancelled request context
+				return domain.MembershipContext{}, domain.TenantContext{}, domain.ErrUnavailable
+			case <-release:
+				return domain.MembershipContext{Roles: []string{"approver"}}, domain.TenantContext{Plan: "pro"}, nil
+			}
+		},
+	}
+	checker := newTestChecker(fixtures.NewFakeCache(), org, nil)
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	var decB domain.Decision
+	wg.Add(2)
+	go func() { defer wg.Done(); checker.Check(ctxA, usecase.CheckInput{Claims: baseClaims()}) }()
+	<-started
+	go func() {
+		defer wg.Done()
+		decB = checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+	}()
+	time.Sleep(50 * time.Millisecond) // B joins A's in-flight call
+	cancelA()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	assert.NotEqual(t, domain.DenyServiceUnavailable, decB.Reason, "a healthy request must not fail because another caller was cancelled")
+	assert.Equal(t, int64(1), atomic.LoadInt64(&org.MembershipCalls), "still one coalesced I-8 call")
+}

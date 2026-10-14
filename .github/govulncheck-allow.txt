@@ -1,0 +1,5 @@
+# Accepted, reachable vulnerabilities for `make vuln-check`
+# (.github/scripts/vuln-check.sh). One per line:
+#   <OSV id> <expires YYYY-MM-DD> <reason>
+# An entry stops applying on its expiry date, so CI fails again and the
+# exception has to be re-justified or the dependency upgraded. Keep this short.

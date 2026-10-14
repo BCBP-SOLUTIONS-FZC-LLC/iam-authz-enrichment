@@ -98,10 +98,21 @@ http_filters:
       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
       transport_api_version: V3
       metadata_context_namespaces: ["envoy.filters.http.jwt_authn"]
+      # Fail CLOSED: if this service is unreachable, times out or errors, deny
+      # the request. Never true — an authorization outage must not become an
+      # authorization bypass. (false is Envoy's default; keep it explicit.)
+      failure_mode_allow: false
+      status_on_error:
+        code: ServiceUnavailable   # 503 on an ext_authz failure, distinct from a policy 403
       grpc_service:
         envoy_grpc:
           cluster_name: iam-authz-enrichment
-        timeout: 0.02s   # single-digit ms of headroom inside the 15ms p99 budget
+        # Sent to the service as grpc-timeout. The cache-hit path (~95% of
+        # traffic) finishes far inside the 15ms p99 budget; this bounds the
+        # worst sequential miss path (Valkey + I-8 40ms + TAC-4 30ms + I-14
+        # 40ms ≈ 170ms) so a cold lookup still gets an answer instead of a
+        # timeout. Matches GRPC_REQUEST_TIMEOUT (LLD §16 AE-37).
+        timeout: 0.25s
 
 # Per-route context_extensions attach the policy_action / department_id / etc.
 # facts a raw request doesn't otherwise carry (see the Policy input table above).
@@ -123,7 +134,10 @@ iam-authz-enrichment/
 ├── api/
 │   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels, 15 event types, 0 published
 │   └── embed.go                       # //go:embed asyncapi.yaml — served at GET /asyncapi · GET /asyncapi.yaml
-├── cmd/server/                        # Composition root: config, logger, cache, org client, gRPC+HTTP servers, 5 SQS consumers
+├── cmd/server/                        # Composition root: config, logger, tracing/metrics identity, gRPC+HTTP+metrics servers, 5 SQS consumers
+│   ├── main.go                        # wiring + graceful shutdown; a fatal background failure exits non-zero (SIGTERM exits 0)
+│   ├── factstore.go                   # realm/restricted sets: reads on the request Valkey client, writes on the event client (VALKEY_EVENT_TIMEOUT)
+│   └── receive_watchdog.go            # restarts the pod when a consumer's ReceiveMessage fails forever
 ├── internal/
 │   ├── domain/                        # Decision, DenyReason, MembershipContext, TenantContext, TenderACL, sentinel errors
 │   │   └── policy/                    # Pure predicate functions — EvaluateBase, ViolatesReadOnly, MeetsDepartmentLevel (§3, no I/O)
@@ -136,18 +150,20 @@ iam-authz-enrichment/
 │   │   └── outbound/
 │   │       ├── valkey/                # Cache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed
 │   │       ├── orgmembership/         # HTTP client — I-8 memberships (Org & Membership), TAC-4/I-12 tender-acl (iam-tender-acl), I-14 mfa-freshness (Org & Membership)
-│   │       ├── postgres/              # platform-pgcommon DSN/pool config, Zap logger adapter, OTel tracer — no live pool (HLD §5.4)
-│   │       └── metrics/               # Prometheus authz_* series (§10)
+│   │       ├── postgres/              # platform-pgcommon DSN/pool config, Zap logger adapter, gincommon.NewSpanTracer — no live pool (HLD §5.4)
+│   │       └── metrics/               # Prometheus iam_authz_enrichment_* series (§10), via gincommon's registry-validated constructors
 │   └── config/                        # Load() — env vars only, no hot-reload (§11)
 ├── docs/
 │   ├── lld/iam-lld-authz-enrichment.md  # Low-Level Design — precedence chain, cache-key table, §16 AE-# register
 │   ├── architecture/                  # ARCHITECTURE.md's own supporting material — README.md + 7 Mermaid diagram sources
+│   ├── observability/                 # Platform Observability Standard: identity, tiers, metric inventory, renamed names, alert runbooks
 │   └── runbook.md                     # What to do when each Prometheus alert / CloudWatch DLQ alarm fires
 ├── deploy/
 │   ├── helm/                          # Helm chart — no Ingress/HTTPRoute; Envoy reaches the grpc Service directly by cluster DNS
 │   ├── iam/                           # Reference IAM policy + Terraform snippet (SQS consume-only — see deploy/iam/README.md)
-│   └── monitoring/                    # Prometheus alerting rules + prometheus-adapter config for HPA decision-rate scaling,
-│                                       # plus an illustrative DLQ CloudWatch-alarm Terraform snippet (see docs/runbook.md)
+│   └── monitoring/                    # app-alerts.yml (source of the Helm PrometheusRule — `make prometheusrule`) + tests/ (promtool),
+│                                       # prometheus-adapter config for HPA decision-rate scaling, and an illustrative DLQ
+│                                       # CloudWatch-alarm Terraform snippet (see docs/runbook.md)
 ├── scripts/
 │   ├── init-localstack.sh              # CI only (.github/workflows/validate-test.yml) — creates the 5 queues + their
 │   │                                    # -dlq, maxReceiveCount=5 redrive policy, against a bare LocalStack service container
@@ -159,7 +175,7 @@ iam-authz-enrichment/
     └── fixtures/                      # Hand-written fakes (FakeCache, FakeOrgMembershipClient) — no gomock/mockery
 ```
 
-Unit tests are co-located with their source (`*_test.go` next to the file under test) — 99%+ statement coverage using `miniredis` for real Valkey wire-protocol tests and a fake SQS client for consumer lifecycle tests, neither requiring Docker.
+Unit tests are co-located with their source (`*_test.go` next to the file under test) — 100% statement coverage on `internal/...` (CI-gated) using `miniredis` for real Valkey wire-protocol tests and a fake SQS client for consumer lifecycle tests, neither requiring Docker.
 
 ### Dependency rules (enforced by `go-arch-lint` in CI)
 
@@ -178,16 +194,16 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 |---------|-----------|-------|
 | **Cache** | Valkey (`go-redis/v9`) | The only persistent-ish state this service touches — no database, no ORM, no migrations |
 | **Sibling services** | Org & Membership + iam-tender-acl (HTTP, mTLS) | Org & Membership: I-8 membership rebuild, I-14 MFA-freshness. iam-tender-acl: TAC-4 tender-ACL (formerly Org & Membership's I-12, repointed here ADR-0007 Wave 3 Phase 4). Both are the source of truth behind the cache |
-| **Events (consumed)** | AWS SQS, 5 queues | `platform-events/v2` consumer; Glue-encoded envelopes decoded by the built-in `events.GlueDecodeCodec{}` (no separate decoder file, no Glue client needed); DLQ via SQS's own `maxReceiveCount=5` redrive policy — application code only logs the last delivery. Full contract: [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `/asyncapi` (§ Common commands) |
+| **Events (consumed)** | AWS SQS, 5 queues | `platform-events` consumer; Glue-encoded envelopes decoded by platform-events' `GlueDecodeCodec` (no Glue client needed); DLQ via SQS's own `maxReceiveCount=5` redrive policy — application code only logs the last delivery. Full contract: [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `/asyncapi` (§ Common commands) |
 | **Events (published)** | None | This service emits nothing to the bus |
 
 ### Shared library dependencies
 
 | Library | Version | Purpose |
 |---------|---------|---------|
-| `platform-gincommon` | v1.6.0 | zap logger, gRPC observability interceptors (panic-recovery/request-id/tracing/metrics/logging), Gin observability middlewares (`/healthz`/`/readyz`), health handler |
-| `platform-events/v2` | v2.1.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]` / `GlueDecodeCodec{}`), SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table). Import path: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2` |
-| `platform-pgcommon/v2` | v2.0.1 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, OTel query tracer, `pgmetrics.InitWithIdentity` — same wiring as iam-user-profile / iam-org-membership. **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox. Import path: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2` |
+| `platform-gincommon` | v1.6.0 | zap logger, gRPC observability interceptors (panic-recovery/request-id/tracing/metrics/logging) + `RegisterKnownMethods`, Gin observability middlewares (`/healthz`/`/readyz`), health handler, `InitTracingWithConfig`, `MetricsHandler` (`/metrics`), Tier 3 metric constructors (`NewCounterVec`/`NewCounter`/`NewHistogramVec`, registry-validated), `NewTracer`/`NewSpanTracer`/`InjectTraceContext` — the only OTel/Prometheus entry points, same as iam-org-membership |
+| `platform-events/v2` | v2.1.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]`), Glue decoding (`GlueDecodeCodec`), `InitMetrics`, SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table) |
+| `platform-pgcommon/v2` | v2.0.1 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, query tracer (`gincommon.NewSpanTracer`), `pgmetrics.InitWithIdentity` — same wiring as iam-user-profile / iam-org-membership. **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox |
 | `go-redis/v9` | v9.23.0 | Valkey/Redis client — the only non-platform library with a significant version; import path `github.com/redis/go-redis/v9` |
 
 ---
@@ -309,7 +325,7 @@ make docker-up   # start Valkey + floci (SQS) + floci-ui — scripts/init-floci.
 make run         # go run ./cmd/server
 ```
 
-`/healthz`, `/readyz` are served on `APP_PORT` (default `8080`); `/metrics` is served separately on `METRICS_PORT` (default `9090`); the `ext_authz` gRPC service listens on `GRPC_PORT` (default `9091`). `/asyncapi` (HTML event-contract viewer) and `/asyncapi.yaml` (raw spec) are also on `APP_PORT` — always on outside `APP_ENV=production`, opt-in in production via `DOCS_ENABLED` — try `http://localhost:8080/asyncapi` after `make run`.
+`/healthz`, `/readyz` are served on `APP_PORT` (default `8080`); `/metrics` is served separately on `METRICS_PORT` (default `9090`); the `ext_authz` gRPC service listens on `GRPC_PORT` (default `9091`). `/asyncapi` (HTML event-contract viewer) and `/asyncapi.yaml` (raw spec) are also on `APP_PORT` — always on outside `APP_ENV=prod`, opt-in in production via `DOCS_ENABLED` — try `http://localhost:8080/asyncapi` after `make run`.
 
 ### Common commands
 
@@ -323,14 +339,19 @@ make test-e2e         # real binary over a real gRPC connection (requires make b
 make lint              # golangci-lint
 make arch-lint          # enforce .go-arch-lint.yml component boundaries
 make cover              # coverage profile + open HTML report
-make ci                 # the full local gate: tidy + fmt-check + vet + lint + arch-lint + observability-lint + database-lint + test-ci + build
+make vuln-check         # govulncheck over ./... — exceptions only via .github/govulncheck-allow.txt (entries expire)
+make metrics-check      # observability standard: naming, governance, metricslint, inventory + PrometheusRule drift, alert tests
+make metrics-inventory  # regenerate docs/observability/metric-registry.md (never edit it by hand)
+make prometheusrule     # regenerate the Helm PrometheusRule from deploy/monitoring/app-alerts.yml
+make ci                 # the full local gate: tidy + fmt-check + vet + lint + arch-lint + observability/database/events/image-pin lints + metrics-check + test-ci + build
 make observability-lint # enforce all logs/metrics/traces pass through platform-gincommon only
 make database-lint      # enforce all DB connections/config/ops pass through platform-pgcommon only
+make events-lint        # enforce all SQS events/outbox/dedup pass through platform-events only
 ```
 
 ### Exercising the gRPC API locally
 
-There's no REST API, so there's no Swagger UI — the direct analogs for a gRPC-only service are **`grpcurl`** (curl-equivalent) and **`grpcui`** (a literal Swagger-UI-style browser form), both driven by gRPC server reflection. Reflection is registered whenever `APP_ENV != production` (same non-prod-only convention `iam-user-profile` uses for its Swagger/AsyncAPI viewers) — see `cmd/server/main.go`.
+There's no REST API, so there's no Swagger UI — the direct analogs for a gRPC-only service are **`grpcurl`** (curl-equivalent) and **`grpcui`** (a literal Swagger-UI-style browser form), both driven by gRPC server reflection. Reflection is registered whenever `APP_ENV != prod` (same non-prod-only convention `iam-user-profile` uses for its Swagger/AsyncAPI viewers) — see `cmd/server/main.go`.
 
 ```sh
 go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
@@ -386,7 +407,7 @@ cat > mockorg/api/v1/internal/users/alice/memberships <<'EOF'
 EOF
 (cd mockorg && python3 -m http.server 8081) &
 
-# restart the service pointed at the mock (default 10ms ORG_MEMBERSHIP_TIMEOUT
+# restart the service pointed at the mock (default 40ms ORG_MEMBERSHIP_TIMEOUT
 # is too tight for Python's dev server — give it real headroom). Also point
 # TENDER_ACL_BASE_URL at the same mock server up front — the tender-ACL
 # overlay walkthrough below (TAC-4, formerly I-12) reuses this one server
@@ -600,18 +621,24 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 
 | Variable | Default | Notes |
 |----------|---------|-------|
+| `APP_ENV` | `dev` | One of `local`, `dev`, `test`, `staging`, `prod` (Enterprise Platform Observability Standard; `production`/`development` fail startup). It is the `environment` label on every metric. When unset, `ENVIRONMENT` is used (trimmed, lowercased — the precedence the platform libraries apply on their own), then `dev` |
+| `OBSERVABILITY_DOMAIN` | `iam` | Registry domain for the `{domain, service, environment}` metric labels; `cmd/server` also sets `iam` explicitly |
 | `APP_PORT` / `METRICS_PORT` / `GRPC_PORT` | `8080` / `9090` / `9091` | HTTP (health only), metrics (`/metrics`, separate listener), and gRPC (`ext_authz`) listen ports |
-| `VALKEY_URL` | `localhost:6379` | `.env-example` recommends `localhost:6384` for local dev; **must use `rediss://` scheme (TLS) outside `APP_ENV=dev`** — startup fails fast on a plaintext URL in non-dev, since the cache holds authorization context |
-| `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=production`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled; startup warns when `DOCS_ENABLED=true` in production without `DOCS_AUTH_TOKEN` |
+| `VALKEY_URL` | `localhost:6379` | `.env-example` recommends `localhost:6384` for local dev (matches `docker-compose.yml`'s host-mapped port so it doesn't collide with a system-wide Redis/Valkey on the default port); **must use the `rediss://` scheme (TLS) outside `APP_ENV=dev`** — startup fails fast on a plaintext URL in non-dev, since the cache holds authorization context. A value containing `://` must parse as a `redis://`/`rediss://` URL or startup fails — an unparseable one would otherwise fall back to a plain address with TLS off |
+| `VALKEY_DIAL_TIMEOUT` / `VALKEY_READ_TIMEOUT` / `VALKEY_WRITE_TIMEOUT` | `20ms` / `10ms` / `10ms` | Request-path Valkey client — sized for the 15ms p99 decision budget (§11.1) |
+| `VALKEY_EVENT_TIMEOUT` | `500ms` | Dial/read/write timeout of the separate Valkey client SQS event processing uses (evictions, `ae:restricted`/`ae:realm` writes, the `ae:processed` ledger). The request path keeps `VALKEY_*_TIMEOUT` (10ms); an eviction has no latency budget, and failing one delays it a whole visibility timeout. Must be positive |
+| `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=prod`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled; startup warns when `DOCS_ENABLED=true` in prod without `DOCS_AUTH_TOKEN` |
 | `AE_CTX_TTL` / `AE_CTX_JITTER` | `60s` / `6s` | §4.1 — desyncs expiry across replicas |
 | `AE_TENDER_ACL_TTL` / `AE_NEG_TTL` | `15s` / `5s` | Half the sibling's own TTL / negative-cache storm collapse |
 | `AE_RESTRICTED_NEG_TTL` / `AE_REALM_NEG_TTL` | `5s` each | L1 negative-cache TTLs for `RestrictedTenderSet`/`RealmMap` — separate from `AE_NEG_TTL` since each bounds a distinct security-propagation delay (how fast a replica notices another replica's write), not a shared performance knob |
 | `AE_PROCESSED_EVENT_TTL` | `192h` (8 days) | PE-1: must be strictly > 7-day SQS message lifetime to guarantee redelivered messages are still recognized as processed |
 | `AE_STALE_IF_ERROR_MAX_AGE` | `5m` | Hard-capped at 5m regardless of configured value (§7) |
-| `ORG_MEMBERSHIP_BASE_URL` / `_TIMEOUT` | `http://localhost:8081` / `10ms` | I-8/I-14. Aggressive timeout — headroom inside the 15ms p99 budget |
-| `TENDER_ACL_BASE_URL` / `TENDER_ACL_TIMEOUT` | `http://localhost:8086` / `20ms` | TAC-4 (formerly I-12) against iam-tender-acl, ADR-0007 Wave 3 Phase 4 — sized against that service's own 5ms-hit/20ms-miss SLO, not reused from `ORG_MEMBERSHIP_TIMEOUT` |
+| `ORG_MEMBERSHIP_BASE_URL` / `_TIMEOUT` | `http://localhost:8081` / `40ms` | I-8/I-14. Covers Org & Membership's own I-8 p99 targets (15ms cache hit, 30ms miss) plus the mesh hop — a shorter timeout fails healthy calls (LLD §16 AE-37) |
+| `GRPC_REQUEST_TIMEOUT` | `250ms` | Server-side cap on each `Check` (`grpccommon.TimeoutUnaryInterceptor`); Envoy's own shorter `grpc-timeout` wins. Must be positive |
+| `GOMEMLIMIT` | _(unset)_ (Helm: `230MiB`) | Go runtime soft heap limit, ~90% of the container memory limit |
+| `TENDER_ACL_BASE_URL` / `TENDER_ACL_TIMEOUT` | `http://localhost:8086` / `30ms` | TAC-4 (formerly I-12) against iam-tender-acl, ADR-0007 Wave 3 Phase 4 — sized against that service's own 5ms-hit/20ms-miss SLO, not reused from `ORG_MEMBERSHIP_TIMEOUT` |
 | `SHARED_REALM_ISSUER` | _(empty)_ | Keycloak issuer for the shared trial realm. **At least one of `SHARED_REALM_ISSUER` or `REALM_TENANT_MAP_SEED` must be set outside `APP_ENV=dev`** — both empty causes a startup failure (every request would silently return `DENY_MALFORMED_IDENTITY`) |
-| `REALM_TENANT_MAP_SEED` | `{}` | Startup-only JSON `{"realm": "tenant_id"}` seed for dedicated realms; kept fresh at runtime by `tenant-authz-q` events, never re-read after startup |
+| `REALM_TENANT_MAP_SEED` | `{}` | Startup-only JSON seed for dedicated realms; kept fresh at runtime by events, never re-read |
 | `JWT_METADATA_NAMESPACE` / `JWT_PAYLOAD_KEY` | `envoy.filters.http.jwt_authn` / `trial` | Must match the Envoy `jwt_authn` filter config |
 | `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups (`APP_ENV=dev` only — required, and must be pairwise distinct, outside dev; `config.Load()` fails fast otherwise) |
 | `*_AUTHZ_QUEUE_CONCURRENCY` (5 vars) | `4` each | `events.WithConcurrency` per queue — messages handed to handler goroutines at once, instead of `platform-events`' library default of `1` (fully serial per queue) |
@@ -620,6 +647,13 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `test` | Dummy floci credentials (use IRSA in production — reference IAM policy + Terraform snippet under [`deploy/iam/`](deploy/iam/)) |
 | `GRPC_MAX_RECV_MSG_SIZE_BYTES` / `_SEND_` | `262144` (256KiB) | Defense-in-depth, not a real operating limit — `CheckRequest`/`CheckResponse` are small |
 | `GRPC_TLS_CERT_FILE` / `_KEY_FILE` / `_CLIENT_CA_FILE` | _(empty → plaintext)_ | App-level TLS/mTLS for deployments with no service-mesh sidecar or CNI-level encryption — see § Security |
+| `APP_NAME` | `iam-authz-enrichment` | The `service` label and OTel `service.name` (passed to gincommon explicitly, so `OTEL_SERVICE_NAME` is not needed — `cmd/server` derives it for platform-events). Keep the default: alerts select `service="iam-authz-enrichment"` |
+| `SQS_MAX_MESSAGES` / `SQS_WAIT_SECONDS` / `SQS_VISIBILITY_TIMEOUT` | `10` / `20` / `30s` | platform-events `LoadSQS`, shared by all five consumers. `SQS_MAX_RECEIVE_COUNT` is not used (the threshold is pinned to 4, LLD §16 AE-36), and `SQS_CONCURRENCY` is overridden by `*_AUTHZ_QUEUE_CONCURRENCY` |
+| `SQS_HANDLER_TIMEOUT` / `SQS_DRAIN_TIMEOUT` | _(none)_ / `30s` (Helm: `20s` / `30s`) | platform-events: per-handler deadline (keep below the visibility timeout), and how long `Stop()` waits at shutdown — the drain the `terminationGracePeriodSeconds` budget assumes |
+| `SQS_QUEUE_DEPTH_INTERVAL` | _(off)_ (Helm: `60s`) | platform-events samples `platform_queue_depth` / `platform_dlq_depth` per queue; needs `sqs:GetQueueAttributes` on the `-dlq` queues |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_INSECURE` | `localhost:4317` / plaintext in `local`/`dev` | platform-gincommon OTLP export (Helm: the cluster collector). `none` keeps trace IDs without exporting |
+| `OTEL_TRACES_SAMPLER_RATIO` / `OTEL_PROPAGATOR_BAGGAGE` / `OTEL_TRACES_IGNORE_REMOTE_PARENT_SAMPLED` | `0.1` / `false` / `false` | platform-gincommon sampling and propagation (same values as iam-org-membership) |
+| `LOG_LEVEL` / `LOG_SAMPLING` | `debug` in `local`/`dev`, else `info` / `false` | platform-gincommon logger |
 
 Startup fails fast (not silently) on all of the following outside `APP_ENV=dev`:
 - `ORG_MEMBERSHIP_BASE_URL` or `TENDER_ACL_BASE_URL` left at its local-dev default
@@ -629,6 +663,8 @@ Startup fails fast (not silently) on all of the following outside `APP_ENV=dev`:
 - Any two queue URLs set to the same value
 
 See `docs/runbook.md` for startup-failure troubleshooting.
+
+**In Kubernetes** the Helm chart sets both to the siblings' real Services — `http://iam-org-membership.iam.svc.cluster.local:8080` and `http://iam-tender-acl.iam.svc.cluster.local:8080` (IAM convention: namespace `iam`, Service named after the repo, port 8080) — and `networkPolicy.upstreamEgress` allows egress only to those two services' pods on 8080 (`app.kubernetes.io/name: iam-org-membership` / `tender-acl`; iam-tender-acl's pods carry its chart name, not its Service name). Override both per environment if a cluster differs. iam-tender-acl only admits TAC-4 callers it lists: its `networkPolicy.internalCallerPodSelectors` must include `app.kubernetes.io/name: iam-authz-enrichment` (iam-tender-acl README "Onboarding a TAC-4 caller").
 
 ---
 
@@ -738,6 +774,7 @@ Every `Check()` touches at most two synchronous dependencies (Valkey, Org & Memb
 - [`VERSIONING.md`](VERSIONING.md) — SemVer rules for the runtime contract, image tag scheme, maintainer release checklist.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch naming, PR checklist, commit style, how to extend each layer.
 - [`docs/architecture/`](docs/architecture/) — standalone Mermaid diagram sources.
+- [`docs/observability/`](docs/observability/README.md) — how this service implements the Enterprise Platform Observability Standard: identity, metric tiers, the [metric inventory](docs/observability/metric-registry.md), [renamed metric names](docs/observability/migration.md) and per-alert [runbooks](docs/observability/runbooks.md).
 - [`docs/runbook.md`](docs/runbook.md) — what to do when each alert fires, and the common failure modes behind them.
 - `.go-arch-lint.yml` / `.golangci.yml` — the enforced dependency and lint rules.
 

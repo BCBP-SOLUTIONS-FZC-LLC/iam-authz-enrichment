@@ -401,7 +401,7 @@ func TestEnvLabelFromGin_NonStringValue_ReturnsEmpty(t *testing.T) {
 
 func TestRegisterDocsRoutes_Active_MountsAsyncAPIRoutes(t *testing.T) {
 	engine := gin.New()
-	registerDocsRoutes(engine, DocsConfig{Environment: "development"})
+	registerDocsRoutes(engine, DocsConfig{Environment: "dev"})
 
 	for _, path := range []string{"/asyncapi", "/asyncapi.yaml"} {
 		w := httptest.NewRecorder()
@@ -413,7 +413,7 @@ func TestRegisterDocsRoutes_Active_MountsAsyncAPIRoutes(t *testing.T) {
 
 func TestRegisterDocsRoutes_Inactive_AsyncAPIRoutesAbsent(t *testing.T) {
 	engine := gin.New()
-	registerDocsRoutes(engine, DocsConfig{Environment: "production", Enabled: false})
+	registerDocsRoutes(engine, DocsConfig{Environment: "prod", Enabled: false})
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/asyncapi", http.NoBody)
@@ -423,7 +423,7 @@ func TestRegisterDocsRoutes_Inactive_AsyncAPIRoutesAbsent(t *testing.T) {
 
 func TestRegisterDocsRoutes_ProductionWithToken_RequiresBearerToken(t *testing.T) {
 	engine := gin.New()
-	registerDocsRoutes(engine, DocsConfig{Environment: "production", Enabled: true, AuthToken: "secret"})
+	registerDocsRoutes(engine, DocsConfig{Environment: "prod", Enabled: true, AuthToken: "secret"})
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/asyncapi", http.NoBody)

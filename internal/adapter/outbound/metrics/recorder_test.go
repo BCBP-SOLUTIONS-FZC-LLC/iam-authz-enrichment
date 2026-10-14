@@ -1,79 +1,95 @@
 package metrics
 
 import (
-	"strings"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/obsregistry"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
 
-func TestConstLabelsOrNil(t *testing.T) {
-	t.Parallel()
-	assert.Nil(t, constLabelsOrNil(nil))
-	assert.Nil(t, constLabelsOrNil(prometheus.Labels{}))
-	assert.Equal(t, prometheus.Labels{"service": "s"}, constLabelsOrNil(prometheus.Labels{"service": "s"}))
-}
-
-// newTestRecorder builds a Recorder on its own private registry, so tests
-// never collide with each other (or with a real New() call elsewhere in the
-// process) over the process-wide default Prometheus registry.
-func newTestRecorder(t *testing.T) *Recorder {
-	t.Helper()
-	return newRecorder(prometheus.NewRegistry())
-}
-
-func TestNew_RegistersOnDefaultRegisterer(t *testing.T) {
-	// The only test allowed to touch the real default registry — proves New()
-	// wires newRecorder to prometheus.DefaultRegisterer as documented.
-	// Deliberately not t.Parallel() to avoid racing any other test that
-	// might also touch the default registry.
-	r := New()
-	assert.NotNil(t, r)
-}
-
-func TestNew_RegistersOnExplicitRegisterer(t *testing.T) {
-	t.Parallel()
-	// Proves New(reg) wires newRecorder to the given registerer instead of
-	// silently falling back to prometheus.DefaultRegisterer — the case
-	// cmd/server exercises by passing gincommon.MetricsRegisterer().
-	reg := prometheus.NewRegistry()
-	r := New(reg)
-	assert.NotNil(t, r)
-
-	mfs, err := reg.Gather()
-	require.NoError(t, err)
-	assert.NotEmpty(t, mfs, "iam_authz_enrichment_* metrics should be registered on the explicit registerer")
-}
-
-func TestNew_AppliesGincommonConstLabels(t *testing.T) {
-	// Not t.Parallel: ObservabilityMiddlewares' metrics.Init is process-wide
-	// sync.Once, and this test must run after TestNew_RegistersOnDefaultRegisterer
-	// so that test still exercises gincommonLabels' empty-before-init path.
+// TestMain initialises gincommon's metrics identity once for this test
+// binary: gincommon's Tier 3 constructors refuse to build a collector before
+// it exists (cmd/server calls ObservabilityMiddlewares before metrics.New),
+// and v1.4.0+ rejects a second, different identity in the same process.
+func TestMain(m *testing.M) {
 	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
 		ServiceName:  "iam-authz-enrichment",
 		BuildVersion: "test",
 		Domain:       "iam",
-		Environment:  "dev",
+		Environment:  "test",
 	})
-	// gincommon v1.6.0+: MetricsConstLabels returns {domain, environment, service}
-	// — version is no longer a const label (it lives on the build_info gauge only).
+	os.Exit(m.Run())
+}
+
+func histogramSampleCount(t *testing.T, h *gincommon.HistogramVec) uint64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, h.WithLabelValues().(prometheus.Histogram).Write(&m))
+	return m.GetHistogram().GetSampleCount()
+}
+
+// newTestRecorder builds a Recorder on its own private registry, so tests
+// never collide with each other over gincommon's process-wide registerer.
+func newTestRecorder(t *testing.T) *Recorder {
+	t.Helper()
+	r, err := New(prometheus.NewRegistry())
+	require.NoError(t, err)
+	return r
+}
+
+func TestNew_ReturnsRegistrationError(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	_, err := New(reg)
+	require.NoError(t, err)
+
+	r, err := New(reg)
+	require.Error(t, err, "a second registration of the same collectors must fail, not panic")
+	assert.Nil(t, r)
+	assert.Contains(t, err.Error(), "iam_authz_enrichment_decisions_total")
+	assert.Contains(t, err.Error(), "iam_authz_enrichment_i14_call_latency_seconds",
+		"every failing collector is reported, not only the first")
+}
+
+func TestLatencyBuckets(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, prometheus.ExponentialBuckets(0.0005, 2, 16), latencyBuckets)
+}
+
+func TestNew_AppliesGincommonConstLabels(t *testing.T) {
+	t.Parallel()
 	want := gincommon.MetricsConstLabels()
 	require.Equal(t, "iam-authz-enrichment", want["service"])
 	require.Equal(t, "iam", want["domain"])
-	require.Equal(t, want, gincommonLabels())
-	require.Equal(t, want, constLabelsOrNil(want))
+	require.Equal(t, "test", want["environment"])
+	_, hasVersion := want["version"]
+	require.False(t, hasVersion, "version is only on platform_build_info, never a const label")
 
 	reg := prometheus.NewRegistry()
-	r := New(reg)
+	r, err := New(reg)
+	require.NoError(t, err)
 	r.ObserveDecision("", true)
+	r.ObserveDecision(domain.DenyRoleInsufficient, false)
+	r.ObserveCacheHit(true)
+	r.ObserveNegativeCacheHit(true)
+	r.ObserveStaleIfErrorServed()
+	r.ObserveSingleflightCoalesced()
+	r.ObserveDecisionLatency(time.Millisecond)
+	r.ObserveI8Latency(time.Millisecond)
+	r.ObserveI12Latency(time.Millisecond)
+	r.ObserveI14Latency(time.Millisecond)
+	r.ObserveTACDependencyError()
+	r.ObserveEvictionError("membership_revoked")
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
@@ -90,9 +106,20 @@ func TestNew_AppliesGincommonConstLabels(t *testing.T) {
 			labels[l.GetName()] = l.GetValue()
 		}
 		assert.Equal(t, want["service"], labels["service"])
-		assert.Equal(t, want["version"], labels["version"])
+		assert.Equal(t, want["domain"], labels["domain"])
+		assert.Equal(t, want["environment"], labels["environment"])
+		assert.NotContains(t, labels, "version")
 	}
 	assert.True(t, found, "iam_authz_enrichment_decisions_total must be gathered from the isolated registerer")
+
+	// Enterprise Platform Observability Standard: every service metric is
+	// named iam_authz_enrichment_* (Tier 3) and carries the identity labels.
+	rep, err := obsregistry.Validate(reg, obsregistry.Options{})
+	require.NoError(t, err)
+	for _, f := range rep.Errors() {
+		t.Errorf("observability standard violation: %v", f)
+	}
+	assert.Equal(t, "iam_authz_enrichment_", obsregistry.ServicePrefix("iam", "iam-authz-enrichment"))
 }
 
 func TestObserveDecision_Allow(t *testing.T) {
@@ -112,7 +139,7 @@ func TestObserveDecision_Deny(t *testing.T) {
 	r.ObserveDecision(domain.DenyRoleInsufficient, false)
 
 	assert.Equal(t, float64(1), testutil.ToFloat64(r.decisionsTotal.WithLabelValues("deny")))
-	assert.Equal(t, float64(1), testutil.ToFloat64(r.denyReasonTotal.WithLabelValues(string(domain.DenyRoleInsufficient))))
+	assert.Equal(t, float64(1), testutil.ToFloat64(r.denyReasonTotal.WithLabelValues("deny_role_insufficient")))
 }
 
 func TestObserveCacheHit(t *testing.T) {
@@ -158,76 +185,37 @@ func TestObserveSingleflightCoalesced(t *testing.T) {
 
 func TestObserveLatencies(t *testing.T) {
 	t.Parallel()
-	reg := prometheus.NewRegistry()
-	r := newRecorder(reg)
+	r := newTestRecorder(t)
 
-	r.ObserveDependencyLatency(5*time.Millisecond, "org-membership", "get-memberships")
-	r.ObserveDependencyLatency(3*time.Millisecond, "tender-acl", "get-tender-acl")
-	r.ObserveDependencyLatency(2*time.Millisecond, "org-membership", "get-mfa-freshness")
+	r.ObserveI8Latency(5 * time.Millisecond)
+	r.ObserveI12Latency(3 * time.Millisecond)
+	r.ObserveI14Latency(2 * time.Millisecond)
 	r.ObserveDecisionLatency(1 * time.Millisecond)
 
-	mfs, err := reg.Gather()
-	require.NoError(t, err)
-
-	counts := map[string]uint64{}
-	for _, mf := range mfs {
-		if strings.HasPrefix(mf.GetName(), "iam_authz_enrichment_dependency_request_seconds") ||
-			mf.GetName() == "iam_authz_enrichment_decision_latency_seconds" {
-			for _, m := range mf.GetMetric() {
-				counts[mf.GetName()] += m.GetHistogram().GetSampleCount()
-			}
-		}
-	}
-	assert.Equal(t, uint64(3), counts["iam_authz_enrichment_dependency_request_seconds"], "3 dependency observations")
-	assert.Equal(t, uint64(1), counts["iam_authz_enrichment_decision_latency_seconds"], "1 decision observation")
+	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i8Latency))
+	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i12Latency))
+	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i14Latency))
+	assert.Equal(t, uint64(1), histogramSampleCount(t, r.decisionLatency))
 }
 
-func TestRecorder_ObserveTACDependencyError_Increments(t *testing.T) {
+func TestObserveTACDependencyError(t *testing.T) {
 	t.Parallel()
-	reg := prometheus.NewRegistry()
-	r := newRecorder(reg)
+	r := newTestRecorder(t)
 
 	r.ObserveTACDependencyError()
 	r.ObserveTACDependencyError()
 
-	count, err := testutil.GatherAndCount(reg, "iam_authz_enrichment_tac4_errors_total")
-	require.NoError(t, err)
-	assert.Equal(t, 1, count)
-
-	mfs, err := reg.Gather()
-	require.NoError(t, err)
-	for _, mf := range mfs {
-		if mf.GetName() == "iam_authz_enrichment_tac4_errors_total" {
-			require.Len(t, mf.GetMetric(), 1)
-			assert.Equal(t, float64(2), mf.GetMetric()[0].GetCounter().GetValue())
-		}
-	}
+	assert.Equal(t, float64(2), testutil.ToFloat64(r.tac4ErrorsTotal))
 }
 
-func TestRecorder_ObserveEvictionError_ByEvent(t *testing.T) {
+func TestObserveEvictionError_ByEvent(t *testing.T) {
 	t.Parallel()
-	reg := prometheus.NewRegistry()
-	r := newRecorder(reg)
+	r := newTestRecorder(t)
 
 	r.ObserveEvictionError("membership_revoked")
 	r.ObserveEvictionError("membership_revoked")
 	r.ObserveEvictionError("user_deleted")
 
-	mfs, err := reg.Gather()
-	require.NoError(t, err)
-
-	counts := map[string]float64{}
-	for _, mf := range mfs {
-		if mf.GetName() == "iam_authz_enrichment_eviction_errors_total" {
-			for _, m := range mf.GetMetric() {
-				for _, lp := range m.GetLabel() {
-					if lp.GetName() == "event" {
-						counts[lp.GetValue()] = m.GetCounter().GetValue()
-					}
-				}
-			}
-		}
-	}
-	assert.Equal(t, float64(2), counts["membership_revoked"])
-	assert.Equal(t, float64(1), counts["user_deleted"])
+	assert.Equal(t, float64(2), testutil.ToFloat64(r.evictionErrors.WithLabelValues("membership_revoked")))
+	assert.Equal(t, float64(1), testutil.ToFloat64(r.evictionErrors.WithLabelValues("user_deleted")))
 }

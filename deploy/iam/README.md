@@ -22,21 +22,23 @@ Unlike `iam-user-profile`, this service has no database, no S3 bucket, no
 SNS topic (it publishes zero events — §5), and no Glue schema registry
 (§ README "is this project integrated with platform-schemagov" — no, this
 service publishes nothing to schema-govern). Its entire AWS footprint is
-**consume-only** access to its five inbound SQS queues.
+consume access to its five inbound SQS queues, plus send access to their
+five `-dlq` queues so poison messages are forwarded rather than deleted.
 
 ## Grants breakdown
 
 | Action | Purpose | Introduced |
 |---|---|---|
 | `sqs:ReceiveMessage` / `DeleteMessage` / `GetQueueAttributes` / `ChangeMessageVisibility` | The five §5 event consumers (membership/user/billing/tenant/tender-authz-q) | v0.1.0 |
+| `sqs:GetQueueUrl` / `GetQueueAttributes` / `SendMessage` on the five `-dlq` queues | `GetQueueAttributes` lets the `SQS_QUEUE_DEPTH_INTERVAL` sampler read each DLQ's depth (`platform_dlq_depth`). The rest is platform-events' DLQ forwarding (LLD §16 AE-36): a malformed body, a failed Glue decode or a 5th delivery is sent to the queue's RedrivePolicy DLQ before it is deleted. The DLQ is resolved from the source queue's RedrivePolicy, which the existing `GetQueueAttributes` grant covers. Without this grant forwards fail, the message stays on its queue and SQS's own redrive moves it after the 5th receive — except a malformed body, which is retried until then. | Unreleased |
 | `logs:CreateLogStream` / `PutLogEvents` | Container stdout to CloudWatch (if not using an OTel collector for logs) | v0.1.0 |
 
 Deliberately **not** granted, and why:
 
 | Not granted | Reason |
 |---|---|
-| `sqs:SendMessage` on any queue | This service publishes zero events (§5) — there is nothing to send |
-| Any action on the five `-dlq` queues | DLQ routing is handled entirely by SQS's own native redrive policy (`RedrivePolicy` on the primary queue) — no application code ever calls an SQS API on a `-dlq` queue directly. See `internal/adapter/inbound/consumer`'s package doc comment and `ARCHITECTURE.md`'s "DLQ routing is infra-only" invariant |
+| `sqs:SendMessage` on the five primary queues or any other queue | This service publishes zero events (§5); it only forwards poison messages to its own DLQs |
+| `sqs:ReceiveMessage` / `DeleteMessage` on the `-dlq` queues | The service never reads a DLQ — a dead-lettered message is investigated and replayed by hand (§5, no replay mechanism) |
 | `s3:*` | No database, no signature/file storage of any kind |
 | `sns:Publish` | No outbound events |
 | `glue:*` | No schema registry integration |

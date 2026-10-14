@@ -6,6 +6,68 @@ behind that filter depends on it. This runbook covers the alerts in
 and `deploy/monitoring/dlq-alarms.tf.example`, plus the failure modes those
 alerts exist to catch.
 
+Short per-alert Meaning/Triage/Mitigate entries, in the platform's standard
+format, are in [`observability/runbooks.md`](observability/runbooks.md).
+Metric definitions and label values are in
+[`observability/metric-registry.md`](observability/metric-registry.md).
+
+## Go-live checklist
+
+Items the code and chart cannot settle on their own. Each has to be done, or
+explicitly signed off, before production traffic.
+
+**Infrastructure (platform Terraform / cluster):**
+
+- [ ] IRSA role has `deploy/iam/policy.json` applied, including the
+      `ForwardPoisonMessagesToDLQ` statement (`GetQueueUrl`, `GetQueueAttributes`,
+      `SendMessage` on the five `-dlq` queues). Without it DLQ forwards fail
+      (SQS redrive takes over) and `platform_dlq_depth` logs permission errors.
+- [ ] All five queues have a RedrivePolicy (`maxReceiveCount=5`) — a consumer
+      refuses to start without one, and the pod restarts.
+- [ ] Encryption in transit to the gRPC port: confirm the mesh / CNI provides
+      mTLS and set the repo variable `MESH_PROVIDES_MTLS=true` (release.yml), or
+      enable `grpcTLS` in values. The chart refuses to render `APP_ENV=prod`
+      otherwise.
+- [ ] Production secrets come from `existingSecret` (External Secrets /
+      CSI). With IRSA, the AWS key entries in that Secret may be empty.
+- [ ] `VALKEY_URL` uses `rediss://` (TLS in transit, with AUTH if the cache
+      requires it); a malformed URL now fails startup.
+- [ ] The cluster spans the zones `topologySpread` expects (set
+      `zoneWhenUnsatisfiable: ScheduleAnyway` on a single-zone cluster).
+- [ ] The Envoy ext_authz filter matches README § Envoy configuration sketch:
+      `failure_mode_allow: false`, `timeout: 0.25s`, the jwt_authn metadata
+      namespace, and `/tenders/{id}` path segments on tender-scoped routes.
+- [ ] `serviceMonitor.enabled: true` with the Prometheus operator's selector
+      labels, the prometheus-adapter rule installed, and the CloudWatch DLQ
+      alarms (`deploy/monitoring/dlq-alarms.tf.example`) applied.
+
+**Dependencies to track:**
+
+- [ ] Upgrade `google.golang.org/grpc` to v1.85.0 when released and remove
+      GO-2026-6443 from `.github/govulncheck-allow.txt` (the exception expires
+      2026-11-15 and CI fails after that).
+- [ ] Load-test the target cluster (`make load-test`): the 50ms p99 alert and
+      the 15ms budget were validated on loopback only.
+
+**Risk acceptances that need an owner's sign-off (LLD §16):**
+
+- [ ] AE-17 — `TenantOffboarded` is not consumed. **Its rationale ("every
+      cache key is TTL-bound to 5–60s") is wrong for two keys:** `ae:realm`
+      and `ae:restricted` are written with no TTL (`valkey/cache.go`
+      `SetRealm`/`SetRestricted`), so an offboarded tenant's realm mapping and
+      tender-restriction facts stay in Valkey indefinitely. They hold IDs, not
+      personal data, but a reused realm issuer would still resolve to the old
+      tenant. Either accept that explicitly, or subscribe to
+      `TenantOffboarded` and delete the tenant's `ae:realm` / `ae:restricted`
+      keys (needs the producer's event contract).
+- [ ] §8.5.1 — `ae:restricted` has no TTL: a lost or unreplayed
+      `TenderRestricted`/`TenderUnrestricted` leaves the overlay state wrong
+      until a later event or manual fix.
+- [ ] §7 — `/readyz` reports process startup only, not Valkey or sibling
+      health (failures degrade to stale-if-error / fail-closed instead).
+- [ ] AE-37 — cache-miss decisions can take up to the siblings' own latency
+      (≤ 250ms) instead of being cut off at 10ms.
+
 ## Alert: `AuthzEnrichmentDown` (critical)
 
 No pods scraped as healthy for 2 minutes. This is a platform-wide outage —
@@ -16,9 +78,10 @@ every service behind the `ext_authz` filter is affected, not just this one.
 2. If crash-looping: `kubectl logs` the pod. A fail-fast startup error
    (`load config: ...`) means a config value is wrong outside dev — see
    "Startup fails immediately" below.
-3. If pending: check node capacity and the pod anti-affinity constraint
-   (`deploy/helm/templates/deployment.yaml` requires one pod per node —
-   a cluster with fewer nodes than `replicaCount` will stall scheduling).
+3. If pending: check node capacity and the zone spread
+   (`topologySpread` in values: pods must spread evenly across zones, so a
+   zone with no schedulable capacity blocks new pods — use
+   `zoneWhenUnsatisfiable: ScheduleAnyway` on a single-zone cluster).
 4. If running but not scraped: check the `ServiceMonitor`/NetworkPolicy —
    `networkPolicy.metricsIngress` must match wherever Prometheus actually
    runs, or the scrape itself is being dropped at the network layer.
@@ -33,7 +96,7 @@ check which specific pods are unhealthy and why.
 
 p99 `Check()` latency above 50ms for 5 minutes.
 
-1. Check `iam_authz_enrichment_dependency_request_seconds{operation="get-memberships"}` / `iam_authz_enrichment_dependency_request_seconds{operation="get-tender-acl"}` —
+1. Check `iam_authz_enrichment_i8_call_latency_seconds` / `iam_authz_enrichment_i12_call_latency_seconds` —
    is Org & Membership itself slow? If so, this is their incident, not this
    service's; `AuthzEnrichmentStaleIfErrorServing` should also be firing.
 2. Check the cache hit ratio (`rate(iam_authz_enrichment_cache_hits_total[5m]) /
@@ -52,7 +115,7 @@ p99 `Check()` latency above 50ms for 5 minutes.
 
 ## Alert: `AuthzEnrichmentStaleIfErrorServing` (critical — page directly)
 
-`iam_authz_enrichment_stale_served_total` is increasing — §7's stale-if-error path
+`iam_authz_enrichment_stale_if_error_served_total` is increasing — §7's stale-if-error path
 is active *right now*. This means Valkey is reachable but Org & Membership
 is not (or vice versa isn't relevant here — stale-if-error specifically
 requires Valkey up + sibling down + a stale entry available).
@@ -72,11 +135,12 @@ A `iam-tender-acl` outage is **not** surfaced as `DENY_SERVICE_UNAVAILABLE` —
 it fails closed with `DENY_TENDER_ACL_INSUFFICIENT` instead (§7 row 4: the
 tender-ACL overlay fails closed for that overlay only, never escalates to a
 full-service deny). On-call cannot distinguish a TAC-4 service outage from a
-legitimate access denial by looking at `iam_authz_enrichment_deny_reasons_total`
+legitimate access denial by looking at `iam_authz_enrichment_deny_reason_total`
 alone. Use the following signals to identify a TAC-4 outage specifically:
 
-1. `iam_authz_enrichment_dependency_request_seconds{dependency="tender-acl",operation="get-tender-acl"}` — a sudden spike in latency or a gap (no data) indicates TAC-4 is slow or unreachable.
-2. `iam_authz_enrichment_deny_reasons_total{reason="DENY_TENDER_ACL_INSUFFICIENT"}` — an elevated rate that is **not** explained by expected access-control denials. Cross-check with TAC-4 call latency above to distinguish "real denials" from "overlay failed closed due to outage".
+0. `iam_authz_enrichment_tac4_errors_total` — counts only TAC-4 call failures, never policy denials; a nonzero rate fires `AuthzEnrichmentTAC4ErrorSpike` (see `docs/observability/runbooks.md`).
+1. `iam_authz_enrichment_i12_call_latency_seconds` — a sudden spike in latency or a gap (no data) indicates TAC-4 is slow or unreachable.
+2. `iam_authz_enrichment_deny_reason_total{reason="deny_tender_acl_insufficient"}` — an elevated rate that is **not** explained by expected access-control denials. Cross-check with TAC-4 call latency above to distinguish "real denials" from "overlay failed closed due to outage".
 3. `iam-tender-acl`'s own health/alerts — this is almost certainly their incident manifesting in this service.
 4. Logs from this service: look for `"tender acl rebuild"` errors with non-404 causes.
 
@@ -86,18 +150,15 @@ alone. Use the following signals to identify a TAC-4 outage specifically:
 
 ## Alert: `AuthzEnrichmentServiceUnavailableSpike` (warning)
 
-Sustained `DENY_SERVICE_UNAVAILABLE` — §7 has fail-closed (no stale entry
-was available to serve instead), or the tender-ACL overlay's independent
-fail-closed rule is firing on TAC-4 failures (formerly I-12 — as of
-ADR-0007 Wave 3 Phase 4, this call goes to **iam-tender-acl**, not Org &
-Membership; check that service's health first if this alert is isolated to
-tender-scoped requests).
+Sustained `DENY_SERVICE_UNAVAILABLE` — §7 has fail-closed on an Org &
+Membership or Valkey failure (no stale entry was available to serve
+instead). TAC-4 (iam-tender-acl) failures never produce this reason — see
+the TAC-4 outage section above and `AuthzEnrichmentTAC4ErrorSpike`.
 
 1. Same dependency checks as `AuthzEnrichmentStaleIfErrorServing` — this is
    usually the same underlying outage, just past the grace window or with
    no cache warm enough to bridge it (e.g. brand-new tenants/users with no
-   existing cache entry at all). For a TAC-4-only spike, check
-   **iam-tender-acl** specifically, not Org & Membership.
+   existing cache entry at all).
 2. If this is firing with Org & Membership *healthy*, check this service's
    own logs for `"membership rebuild failed, no stale entry available"` —
    the error string in that log line is the actual dial/timeout error, not
@@ -113,9 +174,11 @@ memory pressure defeats jittered TTLs entirely).
 
 ## CloudWatch alarm: a `*-authz-q-dlq` queue is non-empty
 
-A message failed all 5 delivery attempts (SQS-native redrive — no
-application code is involved in this decision, see
-`internal/adapter/inbound/consumer`'s package doc comment). This is a
+A message was forwarded to the queue's DLQ (LLD §16 AE-36): either it failed
+4 deliveries and was forwarded on its 5th, or its body could not be parsed or
+Glue-decoded and was forwarded on first receipt (SQS's own redrive is the
+backstop if a forward failed). The DLQ copy keeps the original body and
+attributes plus `DLQReason`, `OriginalQueue` and `FailedAt`. This is a
 **correctness gap, not an availability one** — the eviction that message
 was supposed to trigger never happened, meaning some cache entry may now be
 stale beyond its intended TTL.
@@ -126,12 +189,13 @@ stale beyond its intended TTL.
 2. Check this service's logs around the time of the original delivery
    attempts for the actual handler error (`internal/usecase/invalidate.go`'s
    `Handle*` methods log on failure). The 5th delivery also logs
-   `message exhausted retries, SQS will move it to the DLQ` (with
+   `message exhausted retries, moving it to the DLQ` (with
    `queue`/`event_id`/`event_type`/`tenant_id`) — the first signal, ahead of
-   this alarm. A `glue decode:` error means the producer sent a malformed or
+   this alarm. `DLQReason=malformed` or `decode_error` means the body never
+   reached a handler. A `glue decode codec:` error means the producer sent a malformed or
    compressed Glue frame (compression is not supported); a JSON decode
    error on a Glue-encoded event can no longer happen for a well-formed
-   frame (`GlueDecoder`, LLD AE-35).
+   frame (platform-events `GlueDecodeCodec`, LLD AE-35).
 3. Once the root cause is fixed, manually replay the message (there is no
    automated DLQ replay mechanism — deliberately, per §5) by re-sending an
    equivalent event to the primary queue, or manually evicting the
@@ -160,8 +224,13 @@ visibility (the alerts above will fire again immediately if the cause is
 still present) and forces a fresh IAM/queue-config resolution.
 
 1. Check the `queue` field on the log line to identify which of the 5
-   queues is affected, then check the same `sqs_receive_errors_total{queue=...}`
-   metric this watchdog itself polls.
+   queues is affected (the watchdog tracks each consumer's own
+   `ReceiveMessage` results, so the log line is the per-queue signal). The
+   service-level metric is
+   `sum by (domain, service, environment) (rate(platform_dependency_request_seconds_count{service="iam-authz-enrichment",dependency="sqs",operation="receive_message",outcome="error"}[5m]))`
+   — it has **no** `queue` label, so it confirms receive errors but not
+   which queue (registry status: proposed). The pod's
+   `sqs: receive message failed` error logs carry the AWS error.
 2. Most likely cause: the queue was deleted, or this pod's IAM role/policy
    no longer grants `sqs:ReceiveMessage` on it (a permissions change is not
    fixed by restarting — fix the permission/queue, not the pod).
@@ -199,7 +268,20 @@ The deployment left `ORG_MEMBERSHIP_BASE_URL` at its local-dev default
 outside `APP_ENV=dev` — `internal/config/config.go` fails fast on this
 rather than starting and silently failing every non-cache-hit request. Set
 `ORG_MEMBERSHIP_BASE_URL` to the real Org & Membership service address for
-this environment.
+this environment. The same applies to `TENDER_ACL_BASE_URL`. The Helm chart
+defaults both to the IAM convention
+(`http://iam-org-membership.iam.svc.cluster.local:8080`,
+`http://iam-tender-acl.iam.svc.cluster.local:8080`), so this only happens when
+a values override blanks them.
+
+## I-8 / TAC-4 calls time out although both siblings are healthy
+
+Check the NetworkPolicy path in both directions: this chart's
+`networkPolicy.upstreamEgress` must match each sibling's real pod labels and
+namespace (`app.kubernetes.io/name: iam-org-membership` / `tender-acl` in
+`iam`), and iam-tender-acl's `networkPolicy.internalCallerPodSelectors` must
+list `app.kubernetes.io/name: iam-authz-enrichment`. A NetworkPolicy drop
+looks like a timeout, not a connection refusal.
 
 ## Startup fails immediately with `... and ... are both set to the same queue URL`
 
