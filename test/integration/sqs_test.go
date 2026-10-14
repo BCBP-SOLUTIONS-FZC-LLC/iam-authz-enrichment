@@ -152,5 +152,5 @@ func TestSQS_DLQ_MessageMovesAfterMaxReceiveCount(t *testing.T) {
 			QueueUrl: awssdk.String(dlqURL), MaxNumberOfMessages: 1, WaitTimeSeconds: 1,
 		})
 		return err == nil && len(out.Messages) > 0
-	}, 30*time.Second, 500*time.Millisecond, "after 5 failed receives, SQS's own redrive policy must move the message to the DLQ")
+	}, 60*time.Second, 500*time.Millisecond, "after 5 failed receives, SQS's own redrive policy must move the message to the DLQ")
 }

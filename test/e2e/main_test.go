@@ -123,6 +123,14 @@ func runMain(m *testing.M) int {
 		"TENDER_ACL_TIMEOUT=2s",
 		"SHARED_REALM_ISSUER="+e2eTestIssuer,
 		"DOCS_ENABLED=false",
+		// SQS_WAIT_SECONDS=1: the default 20-second long-poll wait means a
+		// message sent during an active poll can take up to 20 extra seconds
+		// to be picked up if LocalStack doesn't support immediate wakeup of
+		// long-poll sessions on new message arrival. 1-second polls keep the
+		// event-driven tests inside their eventually() windows without
+		// affecting consumer correctness (WaitSeconds controls latency, not
+		// throughput).
+		"SQS_WAIT_SECONDS=1",
 	)
 	cmd.Stdout = &logs
 	cmd.Stderr = &logs
