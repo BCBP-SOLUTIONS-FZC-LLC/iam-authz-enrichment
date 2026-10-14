@@ -21,17 +21,12 @@ ARG SOURCE_DATE_EPOCH=0
 
 COPY go.mod go.sum ./
 
-RUN --mount=type=secret,id=go_private_token,required=false \
+RUN --mount=type=secret,id=go_private_token \
     TOKEN=$(cat /run/secrets/go_private_token 2>/dev/null || true) && \
-    if [ -n "$TOKEN" ]; then \
-      git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"; \
-    else \
-      echo "WARN: go_private_token not provided — falling back to SSH or pre-cached modules"; \
-    fi && \
+    if [ -z "$TOKEN" ]; then echo "ERROR: go_private_token secret is missing or empty — pass --secret id=go_private_token,src=<token-file>"; exit 1; fi && \
+    git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/" && \
     go mod download && \
-    if [ -n "$TOKEN" ]; then \
-      git config --global --unset url."https://x-access-token:${TOKEN}@github.com/".insteadOf; \
-    fi
+    git config --global --unset url."https://x-access-token:${TOKEN}@github.com/".insteadOf
 
 COPY --link . .
 
