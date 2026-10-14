@@ -123,14 +123,20 @@ func runMain(m *testing.M) int {
 		"TENDER_ACL_TIMEOUT=2s",
 		"SHARED_REALM_ISSUER="+e2eTestIssuer,
 		"DOCS_ENABLED=false",
-		// SQS_WAIT_SECONDS=1: the default 20-second long-poll wait means a
-		// message sent during an active poll can take up to 20 extra seconds
-		// to be picked up if LocalStack doesn't support immediate wakeup of
-		// long-poll sessions on new message arrival. 1-second polls keep the
-		// event-driven tests inside their eventually() windows without
-		// affecting consumer correctness (WaitSeconds controls latency, not
-		// throughput).
+		// SQS_WAIT_SECONDS=1: keeps each ReceiveMessage call to 1 second max
+		// so LocalStack isn't held open with 20 concurrent long-poll sessions.
 		"SQS_WAIT_SECONDS=1",
+		// Concurrency=1 per queue (5 total goroutines vs the production
+		// default of 4 per queue = 20). With 20 concurrent ReceiveMessage
+		// calls against a single LocalStack process, it becomes overwhelmed,
+		// causing 3-4 second poll delays that prevent the consumer from
+		// picking up events within the test's eventually() window. 1 goroutine
+		// per queue is sufficient for sequential e2e scenarios.
+		"MEMBERSHIP_AUTHZ_QUEUE_CONCURRENCY=1",
+		"USER_AUTHZ_QUEUE_CONCURRENCY=1",
+		"BILLING_AUTHZ_QUEUE_CONCURRENCY=1",
+		"TENANT_AUTHZ_QUEUE_CONCURRENCY=1",
+		"TENDER_AUTHZ_QUEUE_CONCURRENCY=1",
 	)
 	cmd.Stdout = &logs
 	cmd.Stderr = &logs
