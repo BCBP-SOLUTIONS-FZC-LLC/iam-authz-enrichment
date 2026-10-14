@@ -149,7 +149,14 @@ func TestRoleInsufficient_ThenEventDrivenGrant_Allows(t *testing.T) {
 	org.setMembership(tenant, user, membershipFixture{Roles: []string{"tenant_admin"}})
 	sendEvent(t, "membership-authz-q", "DepartmentMembershipGranted", tenant, map[string]string{"user_id": user})
 
-	eventually(t, 15*time.Second, func() bool {
+	// Allow 2 seconds for the membership-authz-q consumer to complete its
+	// current LocalStack poll and start a new one that finds the event.
+	// LocalStack v4.4.0 may not wake up mid-poll when a new message arrives
+	// (even with WaitTimeSeconds=1), so a short sleep ensures the next poll
+	// starts fresh after the event is already in the queue.
+	time.Sleep(2 * time.Second)
+
+	eventually(t, 25*time.Second, func() bool {
 		return doCheck(t, req).GetOkResponse() != nil
 	})
 }
