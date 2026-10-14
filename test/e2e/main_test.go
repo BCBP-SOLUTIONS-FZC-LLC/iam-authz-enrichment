@@ -127,16 +127,20 @@ func runMain(m *testing.M) int {
 		// so LocalStack isn't held open with 20 concurrent long-poll sessions.
 		"SQS_WAIT_SECONDS=1",
 		// Concurrency=1 per queue (5 total goroutines vs the production
-		// default of 4 per queue = 20). With 20 concurrent ReceiveMessage
-		// calls against a single LocalStack process, it becomes overwhelmed,
-		// causing 3-4 second poll delays that prevent the consumer from
-		// picking up events within the test's eventually() window. 1 goroutine
-		// per queue is sufficient for sequential e2e scenarios.
+		// default of 4 per queue = 20). Reduces LocalStack saturation in CI.
 		"MEMBERSHIP_AUTHZ_QUEUE_CONCURRENCY=1",
 		"USER_AUTHZ_QUEUE_CONCURRENCY=1",
 		"BILLING_AUTHZ_QUEUE_CONCURRENCY=1",
 		"TENANT_AUTHZ_QUEUE_CONCURRENCY=1",
 		"TENDER_AUTHZ_QUEUE_CONCURRENCY=1",
+		// Valkey timeout: the default 10ms write timeout causes EvictMembershipContext
+		// (a DEL command) to time out when Valkey is under load after the integration
+		// test suite, which runs in the same job against the same Valkey container.
+		// A timed-out DEL returns an error, the handler fails, the consumer skips
+		// DeleteMessage, and the cache is never evicted — the eventually() condition
+		// is never satisfied. 500ms gives Valkey plenty of headroom.
+		"VALKEY_WRITE_TIMEOUT=500ms",
+		"VALKEY_READ_TIMEOUT=500ms",
 	)
 	cmd.Stdout = &logs
 	cmd.Stderr = &logs
