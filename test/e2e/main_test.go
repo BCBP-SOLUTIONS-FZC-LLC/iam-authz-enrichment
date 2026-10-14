@@ -157,6 +157,15 @@ func runMain(m *testing.M) int {
 		return 1
 	}
 
+	// Allow 3 seconds for the SQS consumers to start their first long-poll
+	// sessions and register with LocalStack. Without this, a test that sends
+	// an SQS event immediately after healthz passes may send the message
+	// before LocalStack has registered the polling connection — meaning
+	// LocalStack cannot wake up the poll, and the message is only delivered
+	// after the 20s poll window expires (past the test's eventually() timeout).
+	// 3s is well within LocalStack's connection registration time in CI.
+	time.Sleep(3 * time.Second)
+
 	conn, err := grpc.NewClient("127.0.0.1:"+e2eGRPCPort, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "e2e: failed to dial grpc server: %v\n", err)
