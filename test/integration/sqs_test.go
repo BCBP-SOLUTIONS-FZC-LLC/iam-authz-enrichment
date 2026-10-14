@@ -90,7 +90,8 @@ func TestSQS_MembershipConsumer_EndToEnd(t *testing.T) {
 
 	sendEnvelope(t, client, qURL, map[string]any{
 		"id": uuid.NewString(), "type": "DepartmentMembershipGranted", "tenant_id": tenant,
-		"time": time.Now().Format(time.RFC3339), "data": map[string]string{"user_id": user},
+		"source": "iam-org-membership", // platform-events/v2 requires source to parse as a valid envelope
+		"time":   time.Now().Format(time.RFC3339), "data": map[string]string{"user_id": user},
 	})
 
 	require.Eventually(t, func() bool {
@@ -132,7 +133,8 @@ func TestSQS_DLQ_MessageMovesAfterMaxReceiveCount(t *testing.T) {
 	// the message is never deleted, forcing SQS's own redrive counting.
 	sendEnvelope(t, client, qURL, map[string]any{
 		"id": uuid.NewString(), "type": "TenderRestricted", "tenant_id": "it-dlq-tenant",
-		"time": time.Now().Format(time.RFC3339), "data": "not-an-object",
+		"source": "iam-tender-acl", // platform-events/v2 requires source; without it the message is deleted as malformed (never reaches DLQ)
+		"time":   time.Now().Format(time.RFC3339), "data": "not-an-object",
 	})
 
 	cache := newTestCache(t)
@@ -152,5 +154,5 @@ func TestSQS_DLQ_MessageMovesAfterMaxReceiveCount(t *testing.T) {
 			QueueUrl: awssdk.String(dlqURL), MaxNumberOfMessages: 1, WaitTimeSeconds: 1,
 		})
 		return err == nil && len(out.Messages) > 0
-	}, 60*time.Second, 500*time.Millisecond, "after 5 failed receives, SQS's own redrive policy must move the message to the DLQ")
+	}, 30*time.Second, 500*time.Millisecond, "after 5 failed receives, SQS's own redrive policy must move the message to the DLQ")
 }

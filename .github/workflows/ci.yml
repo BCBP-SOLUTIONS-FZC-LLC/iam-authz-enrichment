@@ -8,8 +8,10 @@
 #                       └────────────────┤──► push       (push events only, needs quality too)
 #   validate-quality ───────────────────┘
 #
-# validate-test: race + coverage gate at 100%, unit + integration against real
-# Valkey/LocalStack service containers. validate-quality: fmt/vet/lint/arch-lint/
+# validate-test: unit + integration + e2e (real compiled binary over real gRPC
+# against real Valkey/LocalStack) with race detector + 100% coverage gate.
+# All three tiers run in a single job (same service containers, one checkout) —
+# the same pattern iam-tender-acl uses. validate-quality: fmt/vet/lint/arch-lint/
 # observability-lint/metrics-lint/database-lint/events-lint/mod-verify/vuln-check.
 # Both live in validate-test.yml/validate-quality.yml
 # (reusable workflows) so release.yml can call the exact same gate rather

@@ -149,7 +149,7 @@ func TestRoleInsufficient_ThenEventDrivenGrant_Allows(t *testing.T) {
 	org.setMembership(tenant, user, membershipFixture{Roles: []string{"tenant_admin"}})
 	sendEvent(t, "membership-authz-q", "DepartmentMembershipGranted", tenant, map[string]string{"user_id": user})
 
-	eventually(t, 25*time.Second, func() bool {
+	eventually(t, 15*time.Second, func() bool {
 		return doCheck(t, req).GetOkResponse() != nil
 	})
 }
@@ -207,7 +207,7 @@ func TestTenderACLOverlay_FullFlow(t *testing.T) {
 
 	sendEvent(t, "tender-authz-q", "TenderRestricted", tenant, map[string]string{"tender_id": restrictedTender})
 
-	eventually(t, 25*time.Second, func() bool {
+	eventually(t, 15*time.Second, func() bool {
 		r := doCheck(t, insufficientReq)
 		return r.GetOkResponse() == nil && denyReason(r) == "DENY_TENDER_ACL_INSUFFICIENT"
 	})
