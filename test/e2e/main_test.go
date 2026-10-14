@@ -133,14 +133,15 @@ func runMain(m *testing.M) int {
 		"BILLING_AUTHZ_QUEUE_CONCURRENCY=1",
 		"TENANT_AUTHZ_QUEUE_CONCURRENCY=1",
 		"TENDER_AUTHZ_QUEUE_CONCURRENCY=1",
-		// Valkey timeout: the default 10ms write timeout causes EvictMembershipContext
-		// (a DEL command) to time out when Valkey is under load after the integration
-		// test suite, which runs in the same job against the same Valkey container.
-		// A timed-out DEL returns an error, the handler fails, the consumer skips
-		// DeleteMessage, and the cache is never evicted — the eventually() condition
-		// is never satisfied. 500ms gives Valkey plenty of headroom.
+		// Valkey timeouts: the default 10ms is too tight when Valkey is under
+		// load after the integration test suite runs in the same job.
 		"VALKEY_WRITE_TIMEOUT=500ms",
 		"VALKEY_READ_TIMEOUT=500ms",
+		// SQS_VISIBILITY_TIMEOUT=3s: if the handler fails on first delivery
+		// (e.g., transient Valkey write timeout), the message becomes visible
+		// again in 3 seconds so the consumer can retry within the eventually()
+		// window. The default 30s would push the retry past the 15s window.
+		"SQS_VISIBILITY_TIMEOUT=3s",
 	)
 	cmd.Stdout = &logs
 	cmd.Stderr = &logs
