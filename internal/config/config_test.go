@@ -61,7 +61,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, "http://localhost:8081", cfg.OrgMembershipBaseURL)
 	assert.Equal(t, 10*time.Millisecond, cfg.OrgMembershipTimeout)
 	assert.Equal(t, "http://localhost:8086", cfg.TenderACLBaseURL)
-	assert.Equal(t, 20*time.Millisecond, cfg.TenderACLTimeout)
+	assert.Equal(t, 30*time.Millisecond, cfg.TenderACLTimeout)
 	assert.Equal(t, "", cfg.SharedRealmIssuer)
 	assert.Equal(t, "envoy.filters.http.jwt_authn", cfg.JWTMetadataNamespace)
 	assert.Equal(t, "trial", cfg.JWTPayloadKey)

@@ -36,9 +36,9 @@ func TestParseAsyncSpec_InvalidYAML_ReturnsError(t *testing.T) {
 
 // TestLoadAsyncSpec_RealEmbeddedSpec exercises the actual embedded
 // api/asyncapi.yaml (via loadAsyncSpec, which sync.Once-wraps this same
-// parse) end to end — this service is receive-only, so all 15 event types
+// parse) end to end — this service is receive-only, so all 20 event types
 // must come back tagged consumed, and there must be zero published
-// messages.
+// messages. Count: 6 membership + 3 user + 3 billing + 7 tenant + 1 tender.
 func TestLoadAsyncSpec_RealEmbeddedSpec_AllMessagesConsumed(t *testing.T) {
 	spec, err := loadAsyncSpec()
 	require.NoError(t, err)
@@ -46,10 +46,15 @@ func TestLoadAsyncSpec_RealEmbeddedSpec_AllMessagesConsumed(t *testing.T) {
 
 	pub, con := splitMessagesByDirection(spec.Comps.Messages)
 	assert.Empty(t, pub, "this service publishes zero events")
-	assert.Len(t, con, 15)
+	assert.Len(t, con, 20)
 	assert.Contains(t, con, "MembershipRevoked")
 	assert.Contains(t, con, "UserDeleted")
 	assert.Contains(t, con, "TenderRestricted")
+	assert.Contains(t, con, "TenantSuspended")
+	assert.Contains(t, con, "TenantReactivatedOperator")
+	assert.Contains(t, con, "TenantOffboarded")
+	assert.Contains(t, con, "TrialExpired")
+	assert.Contains(t, con, "TrialReactivated")
 }
 
 // ── asyncMessage.isConsumed / splitMessagesByDirection ────────────────────────

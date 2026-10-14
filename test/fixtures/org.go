@@ -9,9 +9,13 @@ import (
 )
 
 // FakeOrgMembershipClient implements usecase.OrgMembershipClient with
-// per-test-configurable function fields — the shape of each of the three
-// sibling calls varies enough per test scenario that a function-field fake
-// is clearer here than a stateful one.
+// per-test-configurable function fields — the shape of each sibling call
+// varies enough per test scenario that a function-field fake is clearer than
+// a stateful one.
+//
+// GetBatchTenderACL is NOT included: it lives on usecase.BatchTenderACLClient,
+// a separate narrower interface. Tests for the §3.1 Check() chain never call
+// the batch path, so it would only add dead fields to every test setup.
 type FakeOrgMembershipClient struct {
 	GetMembershipsFunc  func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error)
 	GetTenderACLFunc    func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error)

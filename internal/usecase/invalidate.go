@@ -17,11 +17,18 @@ type Invalidator struct {
 	realmMap   *RealmMap
 	restricted *RestrictedTenderSet
 	log        Logger
+	recorder   Recorder
 }
 
-// NewInvalidator builds an Invalidator.
-func NewInvalidator(cache Cache, realmMap *RealmMap, restricted *RestrictedTenderSet, log Logger) *Invalidator {
-	return &Invalidator{cache: cache, realmMap: realmMap, restricted: restricted, log: log}
+// NewInvalidator builds an Invalidator. recorder is optional (variadic so all
+// existing call sites compile unchanged); if omitted, a NoopRecorder is used.
+// cmd/server passes the real metrics.Recorder so eviction failures are counted.
+func NewInvalidator(cache Cache, realmMap *RealmMap, restricted *RestrictedTenderSet, log Logger, recorder ...Recorder) *Invalidator {
+	var rec Recorder = NoopRecorder{}
+	if len(recorder) > 0 && recorder[0] != nil {
+		rec = recorder[0]
+	}
+	return &Invalidator{cache: cache, realmMap: realmMap, restricted: restricted, log: log, recorder: rec}
 }
 
 // MembershipEventPayload is membership-authz-q's decoded payload —
@@ -72,6 +79,7 @@ func (inv *Invalidator) HandleMembershipRevoked(ctx context.Context, tenant stri
 	}
 	if err := inv.cache.EvictTenderACLForUser(ctx, tenant, p.UserID); err != nil {
 		inv.log.Warn("best-effort tender-acl eviction failed on MembershipRevoked", map[string]interface{}{"error": err.Error()})
+		inv.recorder.ObserveEvictionError("membership_revoked")
 	}
 	return nil
 }
@@ -82,22 +90,35 @@ type UserEventPayload struct {
 	ChangedFields []string `json:"changed_fields,omitempty"`
 }
 
-// IsEmailChange reports whether a UserUpdated event's changed_fields
-// includes "email" — the §5-mandated consumer-side filter (deliberately not
-// an SNS attribute filter).
-func (p UserEventPayload) IsEmailChange() bool {
+// RequiresEviction reports whether a UserUpdated event's changed_fields
+// contains a value that invalidates the AE decision cache. Two values trigger
+// eviction:
+//
+//   - "email" — the subject's identity key in Org & Membership's I-8 response
+//     changes, so the cached ae:ctx entry is stale.
+//   - "status" — the user has been enabled or disabled; a disabled user can no
+//     longer authenticate and Org & Membership's I-8 will return 404 on the
+//     next live call. Without eviction the stale ae:ctx entry serves Allow
+//     decisions for up to 60 s (AE_CTX_TTL) after disable. UserUpdated with
+//     changed_fields=["status"] fires in the same UP transaction as
+//     UserStatusChanged, but user-authz-q only subscribes to UserUpdated —
+//     this consumer-side check is the only eviction path for a status change.
+//
+// All other changed_fields values (display_name, job_title, timezone, …) are
+// no-ops — they do not affect any fact the AE decision cache holds.
+func (p UserEventPayload) RequiresEviction() bool {
 	for _, f := range p.ChangedFields {
-		if f == "email" {
+		if f == "email" || f == "status" {
 			return true
 		}
 	}
 	return false
 }
 
-// HandleUserUpdated evicts only on an email change (§5) — any other
+// HandleUserUpdated evicts on an email or status change (§5); any other
 // changed_fields value is a no-op.
 func (inv *Invalidator) HandleUserUpdated(ctx context.Context, tenant string, p UserEventPayload) error {
-	if !p.IsEmailChange() {
+	if !p.RequiresEviction() {
 		return nil
 	}
 	return inv.evictUserContext(ctx, tenant, p.UserID)
@@ -118,6 +139,7 @@ func (inv *Invalidator) HandleUserDeleted(ctx context.Context, tenant string, p 
 	}
 	if err := inv.cache.EvictTenderACLForUser(ctx, tenant, p.UserID); err != nil {
 		inv.log.Warn("best-effort tender-acl eviction failed on UserDeleted", map[string]interface{}{"error": err.Error()})
+		inv.recorder.ObserveEvictionError("user_deleted")
 	}
 	return nil
 }
@@ -136,6 +158,18 @@ func (inv *Invalidator) evictUserContext(ctx context.Context, tenant, user strin
 // TenantSubscriptionCancelled, TenantReactivated): evict the tenant-scoped
 // slice — one key, regardless of which of the three event types fired.
 func (inv *Invalidator) HandleBillingEvent(ctx context.Context, tenant string) error {
+	return inv.cache.EvictTenantContext(ctx, tenant)
+}
+
+// HandleTenantLifecycleEvent evicts ae:tenant:{tenant} for any Realm
+// Provisioner lifecycle event that changes tenant status (§5): TenantSuspended,
+// TenantReactivated (operator-sourced, distinct from billing's TenantReactivated
+// on billing-authz-q), TenantOffboarded, TrialExpired, TrialReactivated. All
+// arrive on tenant-authz-q via the iam-tenant-events SNS topic. No payload
+// decode is needed — the eviction is driven entirely by the envelope's
+// own tenant_id, and the tenant-scoped ae:tenant entry will be rebuilt
+// fresh on the next Check that needs it.
+func (inv *Invalidator) HandleTenantLifecycleEvent(ctx context.Context, tenant string) error {
 	return inv.cache.EvictTenantContext(ctx, tenant)
 }
 

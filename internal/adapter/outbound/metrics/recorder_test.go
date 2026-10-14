@@ -1,12 +1,12 @@
 package metrics
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,13 +20,6 @@ func TestConstLabelsOrNil(t *testing.T) {
 	assert.Nil(t, constLabelsOrNil(nil))
 	assert.Nil(t, constLabelsOrNil(prometheus.Labels{}))
 	assert.Equal(t, prometheus.Labels{"service": "s"}, constLabelsOrNil(prometheus.Labels{"service": "s"}))
-}
-
-func histogramSampleCount(t *testing.T, h prometheus.Histogram) uint64 {
-	t.Helper()
-	var m dto.Metric
-	require.NoError(t, h.Write(&m))
-	return m.GetHistogram().GetSampleCount()
 }
 
 // newTestRecorder builds a Recorder on its own private registry, so tests
@@ -57,7 +50,7 @@ func TestNew_RegistersOnExplicitRegisterer(t *testing.T) {
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
-	assert.NotEmpty(t, mfs, "authz_* metrics should be registered on the explicit registerer")
+	assert.NotEmpty(t, mfs, "iam_authz_enrichment_* metrics should be registered on the explicit registerer")
 }
 
 func TestNew_AppliesGincommonConstLabels(t *testing.T) {
@@ -67,10 +60,14 @@ func TestNew_AppliesGincommonConstLabels(t *testing.T) {
 	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
 		ServiceName:  "iam-authz-enrichment",
 		BuildVersion: "test",
+		Domain:       "iam",
+		Environment:  "dev",
 	})
+	// gincommon v1.6.0+: MetricsConstLabels returns {domain, environment, service}
+	// — version is no longer a const label (it lives on the build_info gauge only).
 	want := gincommon.MetricsConstLabels()
 	require.Equal(t, "iam-authz-enrichment", want["service"])
-	require.Equal(t, "test", want["version"])
+	require.Equal(t, "iam", want["domain"])
 	require.Equal(t, want, gincommonLabels())
 	require.Equal(t, want, constLabelsOrNil(want))
 
@@ -83,7 +80,7 @@ func TestNew_AppliesGincommonConstLabels(t *testing.T) {
 
 	var found bool
 	for _, mf := range mfs {
-		if mf.GetName() != "authz_decisions_total" {
+		if mf.GetName() != "iam_authz_enrichment_decisions_total" {
 			continue
 		}
 		found = true
@@ -95,7 +92,7 @@ func TestNew_AppliesGincommonConstLabels(t *testing.T) {
 		assert.Equal(t, want["service"], labels["service"])
 		assert.Equal(t, want["version"], labels["version"])
 	}
-	assert.True(t, found, "authz_decisions_total must be gathered from the isolated registerer")
+	assert.True(t, found, "iam_authz_enrichment_decisions_total must be gathered from the isolated registerer")
 }
 
 func TestObserveDecision_Allow(t *testing.T) {
@@ -161,15 +158,76 @@ func TestObserveSingleflightCoalesced(t *testing.T) {
 
 func TestObserveLatencies(t *testing.T) {
 	t.Parallel()
-	r := newTestRecorder(t)
+	reg := prometheus.NewRegistry()
+	r := newRecorder(reg)
 
-	r.ObserveI8Latency(5 * time.Millisecond)
-	r.ObserveI12Latency(3 * time.Millisecond)
-	r.ObserveI14Latency(2 * time.Millisecond)
+	r.ObserveDependencyLatency(5*time.Millisecond, "org-membership", "get-memberships")
+	r.ObserveDependencyLatency(3*time.Millisecond, "tender-acl", "get-tender-acl")
+	r.ObserveDependencyLatency(2*time.Millisecond, "org-membership", "get-mfa-freshness")
 	r.ObserveDecisionLatency(1 * time.Millisecond)
 
-	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i8Latency))
-	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i12Latency))
-	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i14Latency))
-	assert.Equal(t, uint64(1), histogramSampleCount(t, r.decisionLatency))
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	counts := map[string]uint64{}
+	for _, mf := range mfs {
+		if strings.HasPrefix(mf.GetName(), "iam_authz_enrichment_dependency_request_seconds") ||
+			mf.GetName() == "iam_authz_enrichment_decision_latency_seconds" {
+			for _, m := range mf.GetMetric() {
+				counts[mf.GetName()] += m.GetHistogram().GetSampleCount()
+			}
+		}
+	}
+	assert.Equal(t, uint64(3), counts["iam_authz_enrichment_dependency_request_seconds"], "3 dependency observations")
+	assert.Equal(t, uint64(1), counts["iam_authz_enrichment_decision_latency_seconds"], "1 decision observation")
+}
+
+func TestRecorder_ObserveTACDependencyError_Increments(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	r := newRecorder(reg)
+
+	r.ObserveTACDependencyError()
+	r.ObserveTACDependencyError()
+
+	count, err := testutil.GatherAndCount(reg, "iam_authz_enrichment_tac4_errors_total")
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "iam_authz_enrichment_tac4_errors_total" {
+			require.Len(t, mf.GetMetric(), 1)
+			assert.Equal(t, float64(2), mf.GetMetric()[0].GetCounter().GetValue())
+		}
+	}
+}
+
+func TestRecorder_ObserveEvictionError_ByEvent(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	r := newRecorder(reg)
+
+	r.ObserveEvictionError("membership_revoked")
+	r.ObserveEvictionError("membership_revoked")
+	r.ObserveEvictionError("user_deleted")
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	counts := map[string]float64{}
+	for _, mf := range mfs {
+		if mf.GetName() == "iam_authz_enrichment_eviction_errors_total" {
+			for _, m := range mf.GetMetric() {
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "event" {
+						counts[lp.GetValue()] = m.GetCounter().GetValue()
+					}
+				}
+			}
+		}
+	}
+	assert.Equal(t, float64(2), counts["membership_revoked"])
+	assert.Equal(t, float64(1), counts["user_deleted"])
 }

@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 )
 
 // glueFrame builds the Glue wire format producers emit:
@@ -20,39 +20,48 @@ func glueFrame(t *testing.T, payload string) []byte {
 	return append(append([]byte{0x03, 0x00}, id[:]...), payload...)
 }
 
-func TestGlueDecoder_StripsHeader(t *testing.T) {
-	got, err := GlueDecoder{}.Decode(context.Background(), uuid.NewString(), glueFrame(t, `{"user_id":"u1"}`))
+func TestGlueDecodeCodec_StripsHeader(t *testing.T) {
+	got, err := events.GlueDecodeCodec{}.Decode(context.Background(), uuid.NewString(), glueFrame(t, `{"user_id":"u1"}`))
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"user_id":"u1"}`, string(got))
 }
 
-func TestGlueDecoder_RejectsMalformedHeaders(t *testing.T) {
+func TestGlueDecodeCodec_RejectsMalformedHeaders(t *testing.T) {
 	for name, in := range map[string][]byte{
 		"too short":         {0x03, 0x00, 0x01},
 		"wrong version":     append([]byte{0x04, 0x00}, make([]byte, 16)...),
 		"compressed (0x05)": append([]byte{0x03, 0x05}, make([]byte, 16)...),
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := GlueDecoder{}.Decode(context.Background(), "", in)
+			_, err := events.GlueDecodeCodec{}.Decode(context.Background(), "", in)
 			assert.Error(t, err)
 		})
 	}
 }
 
-func TestGlueDecoder_EncodeAlwaysFails(t *testing.T) {
-	_, _, err := GlueDecoder{}.Encode(context.Background(), "UserUpdated", json.RawMessage(`{}`))
+func TestGlueDecodeCodec_RejectsNonJSONPayload(t *testing.T) {
+	// platform-events v1.6.1 GlueDecodeCodec adds a JSON-validity check that
+	// the hand-rolled GlueDecoder did not have — Avro-format or binary payloads
+	// behind a valid Glue header are rejected rather than forwarded to handlers
+	// as unparseable bytes.
+	_, err := events.GlueDecodeCodec{}.Decode(context.Background(), "", glueFrame(t, `not-json`))
+	assert.Error(t, err)
+}
+
+func TestGlueDecodeCodec_EncodeAlwaysFails(t *testing.T) {
+	_, _, err := events.GlueDecodeCodec{}.Encode(context.Background(), "UserUpdated", json.RawMessage(`{}`))
 	assert.Error(t, err)
 }
 
 // The regression this fixes: a Glue-framed payload reaching a handler
 // unstripped (the old events.NoopCodec) cannot be decoded at all.
-func TestGlueDecoder_FramedPayloadIsUndecodableWithoutIt(t *testing.T) {
+func TestGlueDecodeCodec_FramedPayloadIsUndecodableWithoutIt(t *testing.T) {
 	framed := glueFrame(t, `{"user_id":"u1"}`)
 	var p struct {
 		UserID string `json:"user_id"`
 	}
 	require.Error(t, json.Unmarshal(framed, &p), "precondition: raw Glue frame is not JSON")
-	stripped, err := GlueDecoder{}.Decode(context.Background(), "", framed)
+	stripped, err := events.GlueDecodeCodec{}.Decode(context.Background(), "", framed)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(stripped, &p))
 	assert.Equal(t, "u1", p.UserID)

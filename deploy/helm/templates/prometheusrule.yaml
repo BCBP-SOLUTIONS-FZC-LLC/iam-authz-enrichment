@@ -61,7 +61,7 @@ spec:
           expr: |
             histogram_quantile(0.99,
               sum by (le) (
-                rate(authz_decision_latency_seconds_bucket{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[5m])
+                rate(iam_authz_enrichment_decision_latency_seconds_bucket{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[5m])
               )
             ) > 0.05
           for: 5m
@@ -73,7 +73,7 @@ spec:
             description: >-
               The p99 Check() decision latency is {{ "{{ $value | humanizeDuration }}" }},
               exceeding the documented 50ms SLO. This is a SEV-2 per ARCHITECTURE.md
-              §10. Check authz_i8_call_latency_seconds / authz_i12_call_latency_seconds
+              §10. Check iam_authz_enrichment_dependency_request_seconds{operation="get-memberships"} / iam_authz_enrichment_dependency_request_seconds{operation="get-tender-acl"}
               for whether Org & Membership is the bottleneck, and Valkey round-trip
               time if cache hit ratio has dropped.
 
@@ -81,7 +81,7 @@ spec:
       rules:
         - alert: AuthzEnrichmentStaleIfErrorServing
           expr: |
-            rate(authz_stale_if_error_served_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[5m]) > 0
+            rate(iam_authz_enrichment_stale_served_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[5m]) > 0
           for: 1m
           labels:
             severity: critical
@@ -89,7 +89,7 @@ spec:
           annotations:
             summary: iam-authz-enrichment is serving stale cache entries — live dependency outage
             description: >-
-              authz_stale_if_error_served_total is increasing, meaning §7's
+              iam_authz_enrichment_stale_served_total is increasing, meaning §7's
               stale-if-error path is active: a live outage of a dependency
               (Valkey or Org & Membership) is in progress right now. Page
               immediately rather than waiting for the latency/availability SLO
@@ -97,7 +97,7 @@ spec:
 
         - alert: AuthzEnrichmentServiceUnavailableSpike
           expr: |
-            rate(authz_deny_reason_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}, reason="DENY_SERVICE_UNAVAILABLE"}[5m]) > 0
+            rate(iam_authz_enrichment_deny_reasons_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}, reason="DENY_SERVICE_UNAVAILABLE"}[5m]) > 0
           for: 5m
           labels:
             severity: warning
@@ -115,9 +115,9 @@ spec:
       rules:
         - alert: AuthzEnrichmentCacheHitRatioLow
           expr: |
-            sum(rate(authz_cache_hits_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[15m]))
+            sum(rate(iam_authz_enrichment_cache_hits_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[15m]))
               /
-            sum(rate(authz_cache_lookups_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[15m]))
+            sum(rate(iam_authz_enrichment_cache_lookups_total{job={{ include "iam-authz-enrichment.fullname" . | quote }}}[15m]))
             < 0.5
           for: 15m
           labels:

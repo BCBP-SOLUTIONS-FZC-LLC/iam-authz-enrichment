@@ -22,7 +22,7 @@ func init() {
 // that ServiceName be non-empty; Logger is left nil, which gincommon
 // documents as disabling logging (no-op) rather than panicking.
 func testGinConfig() gincommon.Config {
-	return gincommon.Config{ServiceName: "iam-authz-enrichment-test"}
+	return gincommon.Config{ServiceName: "iam-authz-enrichment-test", Domain: "iam"}
 }
 
 // testDocsConfig leaves Environment empty (not "production"), so

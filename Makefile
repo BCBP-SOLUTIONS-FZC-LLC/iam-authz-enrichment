@@ -51,7 +51,9 @@ help:
 	@echo "  make lint            - run golangci-lint (default build + every test build tag)"
 	@echo "  make arch-lint       - enforce .go-arch-lint.yml component boundaries"
 	@echo "  make observability-lint - enforce all logs/metrics/traces route through platform-gincommon"
+	@echo "  make metrics-lint       - enforce Enterprise Platform Observability Standard (iam_authz_enrichment_* prefix)"
 	@echo "  make database-lint      - enforce all DB connections/config/ops route through platform-pgcommon"
+	@echo "  make events-lint        - enforce all events/outbox/dedup route through platform-events"
 	@echo "  make test            - unit tests (no Docker required)"
 	@echo "  make test-ci         - unit tests with race detector + coverage (used in CI)"
 	@echo "  make test-integration - Valkey + LocalStack SQS integration tests (requires Docker)"
@@ -61,7 +63,7 @@ help:
 	@echo "  make build           - compile server binary to bin/"
 	@echo "  make cover           - coverage profile + open HTML report"
 	@echo "  make cover-func      - coverage summary by function"
-	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + observability-lint + database-lint + test-ci + build"
+	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + observability-lint + metrics-lint + database-lint + test-ci + build"
 	@echo "  make docker-up       - start local Valkey + floci (SQS)"
 	@echo "  make docker-down     - stop local containers"
 	@echo "  make fmt-check       - verify gofmt formatting (no changes applied)"
@@ -133,6 +135,25 @@ database-lint:
 .PHONY: observability-lint
 observability-lint:
 	@bash .github/scripts/check-observability-routing.sh
+
+# metrics-lint enforces the Enterprise Platform Observability Standard:
+#   All metric names must use the iam_authz_enrichment_ prefix (Tier 3).
+#   Counters must end with _total; histograms must end with _seconds.
+#   No high-cardinality labels (user_id, tenant_id, etc.) in metric definitions.
+.PHONY: metrics-lint
+metrics-lint:
+	@bash .github/scripts/check-metrics-naming.sh
+
+# events-lint enforces the platform-events-only routing invariant:
+#   Consumers  → events.NewSQSConsumerWithClient via buildConsumer
+#   Config     → config.LoadSQS / SQSConfigFromEnv / SQSConsumerOptions
+#   Glue       → events.GlueDecodeCodec{} via events.WithConsumerCodec
+#   Dedup      → Envelope.ID via MarkProcessed SET NX + EvictProcessed on error/panic
+#   Outbox     → skipped (consume-only, HLD §5.4 / EVT-2)
+#   Metrics    → events.InitMetrics → gincommon.MetricsRegisterer()
+.PHONY: events-lint
+events-lint:
+	@bash .github/scripts/check-events-routing.sh
 
 # -----------------------------
 # TESTS
@@ -218,7 +239,7 @@ pin-base-images:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy fmt-check vet lint arch-lint observability-lint database-lint test-ci build
+ci: tidy fmt-check vet lint arch-lint observability-lint metrics-lint database-lint events-lint test-ci build
 
 # -----------------------------
 # COVERAGE

@@ -8,6 +8,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Security (compatibility-check pass — 2026-10-14)
+
+- **MFA approver-gate future `auth_time` bypass fixed** (`internal/usecase/check.go`): `checkMFAFreshness()` now guards `authTime.After(c.now())` before the duration comparison. A future-dated `auth_time` claim produced a negative `time.Duration` that was never `>` the positive MFA window, silently passing all approver-gated actions. Now fails closed to `DENY_MFA_STALE` for any future-dated `auth_time` (LLD §16 AE-36).
+- **Tender-ACL overlay bypass via trailing-slash path fixed** (`internal/usecase/check.go`): `check()` now returns `DENY_MALFORMED_IDENTITY` when `RequiredAccessLevel != ""` and `TenderID == ""`. A path like `/api/v1/tenders/` produced `TenderID=""` which caused `RequiresTenderACL()` to return `false`, silently skipping the overlay for any tender-scoped route (LLD §16 AE-37).
+
+### Fixed (compatibility-check pass — 2026-10-14)
+
+- **`platform-events/v2 v2.1.0` migration** (AE-OM-GAP-001, UP-AE-GAP-002, AE-RP-GAP-001): all import paths migrated from `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/...` to `platform-events/v2/pkg/...`. The local `consumer.GlueDecoder` (AE-35) retired in favour of the built-in `events.GlueDecodeCodec{}`.
+- **`platform-pgcommon/v2 v2.0.1` migration** (UP-AE-GAP-004): all import paths migrated to `platform-pgcommon/v2/pkg/...`.
+- **`go-redis/v9 v9.23.0`** (AE-OM-GAP-003): bumped from v9.22.0.
+- **`TenderACL.AccessLevel *string`** (TAC-GAP-001): field changed from `string` to `*string` so an absent `access_level` field (iam-tender-acl omits it via `omitempty` when `HasAccess=false`) decodes as `nil` rather than `""`. `Satisfies()` short-circuits on nil.
+- **TAC-4 HTTP 400 → `ErrNotFound`** (TAC-GAP-005): `GetTenderACL` now maps HTTP 400 (invalid UUID / caller-side error) to `ErrNotFound` instead of `ErrUnavailable`, preventing the §7 stale-if-error path from activating for a protocol error. Same fix applied to `GetBatchTenderACL`.
+- **`authTimeField` Kind-check**: `authTimeField()` in `claims.go` now uses `v.Kind.(*structpb.Value_NumberValue)` type assertion before reading the value, correctly distinguishing `auth_time=0` (the number zero) from a missing/non-numeric claim.
+- **`ExpiresAt` parse layout**: `TenderACL.UnmarshalJSON` now uses `time.RFC3339Nano` instead of `time.RFC3339`, so sub-second timestamps in `expires_at` (e.g. from a test fixture using `time.Now()`) don't break the Valkey round-trip.
+- **Valkey TLS check dead guard removed** (`internal/config/config.go`): the `url != ""` condition was dead code since `envOr("VALKEY_URL", "localhost:6379")` always returns a non-empty default.
+
+### Added (compatibility-check pass — 2026-10-14)
+
+- **`make metrics-lint`** (`check-metrics-naming.sh`): CI enforcement of the Enterprise Platform Observability Standard — all metric names must use the `iam_authz_enrichment_*` prefix, counters must end with `_total`, histograms with `_seconds`, no high-cardinality labels. Wired into `make ci` and `validate-quality.yml`.
+- **`make events-lint`** (`check-events-routing.sh`): CI enforcement that all SQS consumption, outbox config, and dedup processed-message handling pass through `platform-events` only. Wired into `make ci` and `validate-quality.yml`.
+- **`iam_authz_enrichment_tac4_errors_total`** counter: incremented exclusively in `resolveTenderACL`'s error path, making a real iam-tender-acl outage distinguishable from legitimate `DENY_TENDER_ACL_INSUFFICIENT` policy denials in Prometheus.
+- **`iam_authz_enrichment_eviction_errors_total{event}`** counter: incremented when `EvictTenderACLForUser` fails during `HandleMembershipRevoked` (`event=membership_revoked`) or `HandleUserDeleted` (`event=user_deleted`), making systematic SCAN failures alertable without a log review.
+- **`AuthzEnrichmentTAC4ErrorSpike`** Prometheus alert in `deploy/monitoring/app-alerts.yml`: fires when `iam_authz_enrichment_tac4_errors_total` is increasing — the gap where a TAC-4 outage was invisible to automated alerting (neither `StaleIfErrorServing` nor `ServiceUnavailableSpike` would fire for it).
+- **`BatchTenderACLClient`** interface split from `OrgMembershipClient` (`usecase/ports.go`): `GetBatchTenderACL` (TAC-5) moved to its own narrower interface so test fakes for the §3.1 Check() chain don't need to implement a method no Check() path calls.
+- **`NewInvalidator`** now accepts an optional variadic `Recorder` parameter — `cmd/server` passes the real recorder; all existing test call sites compile unchanged (variadic, defaults to `NoopRecorder{}`). `HandleMembershipRevoked` and `HandleUserDeleted` now call `recorder.ObserveEvictionError(event)` on best-effort SCAN failure.
+- **TAC-4 outage section** in `docs/runbook.md`: explains how to distinguish a live iam-tender-acl outage from legitimate access-control denials using `iam_authz_enrichment_tac4_errors_total` and `dependency_request_seconds{dependency="tender-acl"}`.
+- **LLD v1.30** (`docs/lld/iam-lld-authz-enrichment.md`): documents AE-36 (MFA future `auth_time` fix), AE-37 (empty TenderID guard), corrects §11.2 metric names to `iam_authz_enrichment_*` namespace, adds §11.8 Prometheus alerts table, updates AE-35 to note `consumer.GlueDecoder` retired in favour of platform-events/v2 built-in.
+- **100% test coverage restored**: 9 targeted tests added to cover branches introduced by the compatibility-check fixes (`isClosedPool(nil)`, `TenderACL.UnmarshalJSON` error paths, `GetTenderACL` malformed-body path, `GetBatchTenderACL` 400/malformed/invalid-timestamp paths, `NewInvalidator` recorder branch).
+
 ### Security
 
 - **Valkey TLS enforcement**: `VALKEY_URL` must now use the `rediss://` scheme (TLS in transit) when `APP_ENV` is not `dev`. A plaintext URL fails startup with a clear error — authorization context cached in Valkey must be encrypted in transit in staging/production.

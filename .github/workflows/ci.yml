@@ -10,7 +10,8 @@
 #
 # validate-test: race + coverage gate at 100%, unit + integration against real
 # Valkey/LocalStack service containers. validate-quality: fmt/vet/lint/arch-lint/
-# mod-verify/vuln-check. Both live in validate-test.yml/validate-quality.yml
+# observability-lint/metrics-lint/database-lint/events-lint/mod-verify/vuln-check.
+# Both live in validate-test.yml/validate-quality.yml
 # (reusable workflows) so release.yml can call the exact same gate rather
 # than duplicating it — this split wasn't earning its keep before
 # release.yml existed as a second caller (see that file's header comment).

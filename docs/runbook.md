@@ -33,11 +33,11 @@ check which specific pods are unhealthy and why.
 
 p99 `Check()` latency above 50ms for 5 minutes.
 
-1. Check `authz_i8_call_latency_seconds` / `authz_i12_call_latency_seconds` —
+1. Check `iam_authz_enrichment_dependency_request_seconds{operation="get-memberships"}` / `iam_authz_enrichment_dependency_request_seconds{operation="get-tender-acl"}` —
    is Org & Membership itself slow? If so, this is their incident, not this
    service's; `AuthzEnrichmentStaleIfErrorServing` should also be firing.
-2. Check the cache hit ratio (`rate(authz_cache_hits_total[5m]) /
-   rate(authz_cache_lookups_total[5m])`) — a sudden drop means more
+2. Check the cache hit ratio (`rate(iam_authz_enrichment_cache_hits_total[5m]) /
+   rate(iam_authz_enrichment_cache_lookups_total[5m])`) — a sudden drop means more
    requests are taking the slow (I-8 call) path. Correlate with a recent
    mass membership/tenant event (bulk import, tenant migration).
 3. Check Valkey directly (`valkey-cli --latency` from inside the cluster,
@@ -52,7 +52,7 @@ p99 `Check()` latency above 50ms for 5 minutes.
 
 ## Alert: `AuthzEnrichmentStaleIfErrorServing` (critical — page directly)
 
-`authz_stale_if_error_served_total` is increasing — §7's stale-if-error path
+`iam_authz_enrichment_stale_served_total` is increasing — §7's stale-if-error path
 is active *right now*. This means Valkey is reachable but Org & Membership
 is not (or vice versa isn't relevant here — stale-if-error specifically
 requires Valkey up + sibling down + a stale entry available).
@@ -65,6 +65,24 @@ requires Valkey up + sibling down + a stale entry available).
    if the outage is short enough to stay within the 5-minute stale-if-error
    grace window (hard-capped regardless of config — see
    `internal/config/config.go`).
+
+## TAC-4 outage (`iam-tender-acl` dependency down)
+
+A `iam-tender-acl` outage is **not** surfaced as `DENY_SERVICE_UNAVAILABLE` —
+it fails closed with `DENY_TENDER_ACL_INSUFFICIENT` instead (§7 row 4: the
+tender-ACL overlay fails closed for that overlay only, never escalates to a
+full-service deny). On-call cannot distinguish a TAC-4 service outage from a
+legitimate access denial by looking at `iam_authz_enrichment_deny_reasons_total`
+alone. Use the following signals to identify a TAC-4 outage specifically:
+
+1. `iam_authz_enrichment_dependency_request_seconds{dependency="tender-acl",operation="get-tender-acl"}` — a sudden spike in latency or a gap (no data) indicates TAC-4 is slow or unreachable.
+2. `iam_authz_enrichment_deny_reasons_total{reason="DENY_TENDER_ACL_INSUFFICIENT"}` — an elevated rate that is **not** explained by expected access-control denials. Cross-check with TAC-4 call latency above to distinguish "real denials" from "overlay failed closed due to outage".
+3. `iam-tender-acl`'s own health/alerts — this is almost certainly their incident manifesting in this service.
+4. Logs from this service: look for `"tender acl rebuild"` errors with non-404 causes.
+
+**Note on HTTP 400 vs 503:** a TAC-4 400 (invalid UUID sent by this service) maps to `ErrNotFound` and does NOT activate the §7 stale-if-error path — if you see 400s, the issue is a malformed `tender_id` being sent (check `requestfacts.go`'s `tenderIDFromPath()` for the URL path this service is parsing), not a TAC-4 outage.
+
+**During a TAC-4 outage:** only tender-scoped requests (those whose URL path matches `/tenders/:id`) are affected. Non-tender requests continue to be decided normally. The blast radius is bounded to the overlay step.
 
 ## Alert: `AuthzEnrichmentServiceUnavailableSpike` (warning)
 

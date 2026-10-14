@@ -27,8 +27,8 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/config"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/usecase"
 )
@@ -87,10 +87,11 @@ func buildConsumer(queueURL string, deps Deps, handler events.Handler, opts ...e
 	env.QueueURL = queueURL
 	env.MaxReceiveCount = 0 // replaced below by dlqObserveReceiveCount + DeadLetterHandler
 	cfg := config.SQSConfigFromEnv(env, eventsLogger{deps.Log})
-	// GlueDecoder strips the Glue wire header producers add once their
-	// registry is configured. Decode only runs when Envelope.SchemaID is
-	// non-empty, so plain-JSON envelopes pass through untouched.
-	built := []events.ConsumerOption{events.WithConsumerCodec(GlueDecoder{})}
+	// GlueDecodeCodec (platform-events v1.6.1+) strips the Glue wire header
+	// producers add once their registry is configured. Decode only runs when
+	// Envelope.SchemaID is non-empty, so plain-JSON envelopes pass through
+	// untouched.
+	built := []events.ConsumerOption{events.WithConsumerCodec(events.GlueDecodeCodec{})}
 	built = append(built, config.SQSConsumerOptions(env)...)
 	built = append(built,
 		events.WithMaxReceiveCount(dlqObserveReceiveCount),

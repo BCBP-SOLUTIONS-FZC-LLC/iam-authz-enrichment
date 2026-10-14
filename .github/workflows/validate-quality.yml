@@ -49,7 +49,11 @@ jobs:
       - run: make arch-lint
       - name: Observability routing lint
         run: make observability-lint
+      - name: Metrics naming lint
+        run: make metrics-lint
       - name: Database routing lint
         run: make database-lint
+      - name: Events routing lint
+        run: make events-lint
       - run: make mod-verify
       - run: make vuln-check

@@ -11,6 +11,7 @@
 package orgmembership
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -180,11 +181,132 @@ func (c *Client) GetTenderACL(ctx context.Context, tenant, tenderID, user string
 	u := fmt.Sprintf("%s/internal/tenants/%s/tenders/%s/acl/%s",
 		c.tenderACLBaseURL, url.PathEscape(tenant), url.PathEscape(tenderID), url.PathEscape(user))
 
-	var resp domain.TenderACL
-	if err := c.getJSONWith(ctx, c.tenderACLHTTP, u, &resp); err != nil {
-		return domain.TenderACL{}, err
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return domain.TenderACL{}, fmt.Errorf("%w: build request: %v", ErrUnavailable, err)
 	}
-	return resp, nil
+	propagateTraceparent(ctx, req)
+
+	resp, err := c.tenderACLHTTP.Do(req)
+	if err != nil {
+		return domain.TenderACL{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// iam-tender-acl returns 400 for an invalid UUID or other caller-side
+	// malformed request — this service's bug, not a transient dependency
+	// outage. Map to ErrNotFound rather than ErrUnavailable as a defensive
+	// forward guard: resolveTenderACL currently has no stale-if-error path
+	// (any error fails closed to DenyTenderACLInsufficient), so the choice
+	// of sentinel has no behavioral consequence today. If a stale-if-error
+	// path is ever added to the tender-ACL overlay, ErrNotFound ensures a
+	// caller-side 400 cannot activate it, while ErrUnavailable would.
+	// 503 and all other non-2xx responses remain ErrUnavailable.
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// fall through to decode
+	case http.StatusBadRequest:
+		return domain.TenderACL{}, fmt.Errorf("%w: TAC-4 rejected the request (status 400 — check tender UUID format)", ErrNotFound)
+	default:
+		return domain.TenderACL{}, fmt.Errorf("%w: unexpected status %d", ErrUnavailable, resp.StatusCode)
+	}
+
+	var result domain.TenderACL
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return domain.TenderACL{}, fmt.Errorf("%w: decode response: %v", ErrUnavailable, err)
+	}
+	return result, nil
+}
+
+// batchCheckRequest/Response/item/resultDTO are the TAC-5 wire shapes.
+// Kept package-private — callers use domain.BatchTenderACLItem/Result.
+type batchCheckRequest struct {
+	Items []batchCheckItemDTO `json:"items"`
+}
+
+type batchCheckItemDTO struct {
+	TenderID string `json:"tender_id"`
+	UserID   string `json:"user_id"`
+}
+
+type batchCheckResponse struct {
+	Results []batchCheckResultDTO `json:"results"`
+}
+
+type batchCheckResultDTO struct {
+	TenderID    string `json:"tender_id"`
+	UserID      string `json:"user_id"`
+	HasAccess   bool   `json:"has_access"`
+	AccessLevel string `json:"access_level"`
+	// ExpiresAt decoded as a plain string so an empty-string or null value
+	// doesn't fail json.Unmarshal — converted to time.Time below.
+	ExpiresAt string `json:"expires_at"`
+}
+
+// GetBatchTenderACL calls TAC-5 (iam-tender-acl §8.4 / TAC-D14):
+// POST /internal/tenants/:id/acl/batch-check — no /api/v1 prefix, same as
+// TAC-4. Replaces N individual GetTenderACL calls for dashboard-read paths
+// (AE-30) that need to check many (tender, user) pairs in one tenant in a
+// single round-trip. Same never-404/fail-closed posture as TAC-4 — a missing
+// grant appears in the response as has_access:false, not an error. Callers
+// must chunk requests larger than 50 items; iam-tender-acl enforces that cap.
+func (c *Client) GetBatchTenderACL(ctx context.Context, tenant string, items []domain.BatchTenderACLItem) ([]domain.BatchTenderACLResult, error) {
+	u := fmt.Sprintf("%s/internal/tenants/%s/acl/batch-check",
+		c.tenderACLBaseURL, url.PathEscape(tenant))
+
+	dtoItems := make([]batchCheckItemDTO, len(items))
+	for i, item := range items {
+		dtoItems[i] = batchCheckItemDTO{TenderID: item.TenderID, UserID: item.UserID}
+	}
+	// batchCheckRequest and batchCheckItemDTO contain only string/bool fields —
+	// json.Marshal cannot fail for these types, so the error is discarded.
+	body, _ := json.Marshal(batchCheckRequest{Items: dtoItems})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("%w: build batch-check request: %v", ErrUnavailable, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	propagateTraceparent(ctx, req)
+
+	resp, err := c.tenderACLHTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Mirror GetTenderACL's status classification: 400 (malformed batch
+	// request — caller bug) → ErrNotFound so a stale-if-error path, if ever
+	// added to a batch caller, cannot activate for a protocol error.
+	if resp.StatusCode == http.StatusBadRequest {
+		return nil, fmt.Errorf("%w: TAC-5 rejected the request (status 400 — check batch item format)", ErrNotFound)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%w: unexpected status %d", ErrUnavailable, resp.StatusCode)
+	}
+
+	var wireResp batchCheckResponse
+	if err := json.NewDecoder(resp.Body).Decode(&wireResp); err != nil {
+		return nil, fmt.Errorf("%w: decode batch-check response: %v", ErrUnavailable, err)
+	}
+
+	results := make([]domain.BatchTenderACLResult, len(wireResp.Results))
+	for i, r := range wireResp.Results {
+		results[i] = domain.BatchTenderACLResult{
+			TenderID:    r.TenderID,
+			UserID:      r.UserID,
+			HasAccess:   r.HasAccess,
+			AccessLevel: r.AccessLevel,
+		}
+		if r.ExpiresAt != "" {
+			t, parseErr := time.Parse(time.RFC3339, r.ExpiresAt)
+			if parseErr != nil {
+				return nil, fmt.Errorf("%w: parse result[%d].expires_at %q: %v", ErrUnavailable, i, r.ExpiresAt, parseErr)
+			}
+			results[i].ExpiresAt = t
+		}
+	}
+	return results, nil
 }
 
 type mfaFreshnessResponse struct {
@@ -207,7 +329,7 @@ func (c *Client) GetMFAFreshness(ctx context.Context, tenant string) (time.Durat
 
 // getJSON is used by the two Org & Membership calls (GetMemberships/
 // GetMFAFreshness). Unlike iam-tender-acl's TAC-4 (mesh-only, no RBAC —
-// see GetTenderACL/getJSONWith below), Org & Membership's /internal/*
+// GetTenderACL makes its request directly), Org & Membership's /internal/*
 // routes are additionally gated by an application-level RequireSystemRole
 // check that requires x-user-id/x-tenant-id/x-tenant-roles to be present
 // on the request — verified directly against that service's own router
@@ -229,19 +351,6 @@ func (c *Client) getJSON(ctx context.Context, tenant, u string, out any) error {
 	req.Header.Set("x-tenant-id", tenant)
 	req.Header.Set("x-tenant-roles", "iam-system")
 	return c.doRequest(ctx, c.http, req, out)
-}
-
-// getJSONWith is getJSON's counterpart for a request that needs none of
-// the Org & Membership internal-identity headers above — currently only
-// GetTenderACL (TAC-4), which is deliberately mesh-only/no-RBAC on
-// iam-tender-acl's side, so sending them would misrepresent that trust
-// model even though the callee would simply ignore them.
-func (c *Client) getJSONWith(ctx context.Context, httpClient *http.Client, u string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return fmt.Errorf("%w: build request: %v", ErrUnavailable, err)
-	}
-	return c.doRequest(ctx, httpClient, req, out)
 }
 
 func (c *Client) doRequest(ctx context.Context, httpClient *http.Client, req *http.Request, out any) error {

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -78,7 +78,7 @@ func TestMembershipHandler_UnknownType_NoOp(t *testing.T) {
 	assert.Empty(t, cache.SortedCalls())
 }
 
-func TestUserHandler_UserUpdated_EmailFilter(t *testing.T) {
+func TestUserHandler_UserUpdated_NonEvictionField_IsNoOp(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
 	handler := userHandler(testDeps(cache))
@@ -87,13 +87,32 @@ func TestUserHandler_UserUpdated_EmailFilter(t *testing.T) {
 		"user_id": "alice", "changed_fields": []string{"display_name"},
 	}))
 	require.NoError(t, err)
-	assert.Empty(t, cache.SortedCalls(), "non-email UserUpdated must be a no-op")
+	assert.Empty(t, cache.SortedCalls(), "non-eviction field change must be a no-op")
+}
 
-	err = handler(context.Background(), envelope(t, "UserUpdated", "tenant-1", map[string]any{
+func TestUserHandler_UserUpdated_EmailChange_Evicts(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	handler := userHandler(testDeps(cache))
+
+	err := handler(context.Background(), envelope(t, "UserUpdated", "tenant-1", map[string]any{
 		"user_id": "alice", "changed_fields": []string{"email"},
 	}))
 	require.NoError(t, err)
 	assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:tenant-1:alice")
+}
+
+func TestUserHandler_UserUpdated_StatusChange_Evicts(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	handler := userHandler(testDeps(cache))
+
+	err := handler(context.Background(), envelope(t, "UserUpdated", "tenant-1", map[string]any{
+		"user_id": "alice", "changed_fields": []string{"status"},
+	}))
+	require.NoError(t, err)
+	assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:tenant-1:alice",
+		"a user-disable fires UserUpdated with status in changed_fields — must evict to close the 60 s stale-Allow window")
 }
 
 func TestUserHandler_DecodeError(t *testing.T) {
@@ -160,6 +179,29 @@ func TestBillingHandler_UnknownType_NoOp(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Empty(t, cache.SortedCalls())
+}
+
+func TestTenantHandler_LifecycleEvents_EvictTenantSliceOnly(t *testing.T) {
+	t.Parallel()
+	for _, eventType := range []string{
+		"TenantSuspended", "TenantReactivated", "TenantOffboarded", "TrialExpired", "TrialReactivated",
+	} {
+		t.Run(eventType, func(t *testing.T) {
+			t.Parallel()
+			cache := fixtures.NewFakeCache()
+			realmMap := usecase.NewRealmMap(nil, 5*time.Second)
+			inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+			handler := tenantHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
+
+			err := handler(context.Background(), envelope(t, eventType, "tenant-1", map[string]string{}))
+
+			require.NoError(t, err)
+			assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls(),
+				"%s must evict ae:tenant and nothing else — no realm map update, no per-user eviction", eventType)
+			_, ok := realmMap.Lookup(context.Background(), "realm-1")
+			assert.False(t, ok, "%s must not modify the realm map", eventType)
+		})
+	}
 }
 
 func TestTenantHandler_DecodeError(t *testing.T) {

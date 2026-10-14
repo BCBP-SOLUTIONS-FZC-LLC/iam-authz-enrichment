@@ -30,12 +30,14 @@ type Config struct {
 	OrgMembershipBaseURL string
 	OrgMembershipTimeout time.Duration
 
-	// TenderACLBaseURL/TenderACLTimeout back I-12 (GetTenderACL) only, since
-	// ADR-0007 Wave 3 Phase 4 repoints that one call at iam-tender-acl —
-	// I-8/I-14 stay on OrgMembershipBaseURL above. A separate, tighter
-	// timeout than OrgMembershipTimeout's 10ms default: iam-tender-acl's own
-	// TAC-4 SLO is 5ms cache-hit/20ms cache-miss (its LLD §14.1), and this
-	// client has no visibility into which case a given call will hit.
+	// TenderACLBaseURL/TenderACLTimeout back I-12 (GetTenderACL) and TAC-5
+	// (GetBatchTenderACL) only, since ADR-0007 Wave 3 Phase 4 repoints those
+	// calls at iam-tender-acl — I-8/I-14 stay on OrgMembershipBaseURL above.
+	// A separate, tighter timeout than OrgMembershipTimeout's 10ms default:
+	// iam-tender-acl's own TAC-4 SLO is 5ms cache-hit/25ms cache-miss (its
+	// LLD §14.1). The default 30ms provides a 5ms margin over the p99 miss
+	// SLO before declaring the call a failure — tighter than OrgMembership's
+	// timeout since TAC-4 makes no further synchronous calls on the hot path.
 	TenderACLBaseURL string
 	TenderACLTimeout time.Duration
 
@@ -199,7 +201,7 @@ func Load() (Config, error) {
 	if cfg.OrgMembershipTimeout, err = envDuration("ORG_MEMBERSHIP_TIMEOUT", 10*time.Millisecond); err != nil {
 		return Config{}, err
 	}
-	if cfg.TenderACLTimeout, err = envDuration("TENDER_ACL_TIMEOUT", 20*time.Millisecond); err != nil {
+	if cfg.TenderACLTimeout, err = envDuration("TENDER_ACL_TIMEOUT", 30*time.Millisecond); err != nil {
 		return Config{}, err
 	}
 	if cfg.AeCtxTTL, err = envDuration("AE_CTX_TTL", 60*time.Second); err != nil {
@@ -299,14 +301,14 @@ func Load() (Config, error) {
 	// redis:// or bare host:port URL in staging/production would expose cached
 	// membership context and tenant context to anyone on the same network
 	// segment — same enforcement as iam-user-profile / iam-org-membership.
-	if cfg.AppEnv != "dev" {
-		url := cfg.ValkeyURL
-		if url != "" && !strings.HasPrefix(url, "rediss://") {
-			return Config{}, fmt.Errorf(
-				"VALKEY_URL must use the rediss:// scheme (TLS) when APP_ENV=%q — got %q; plaintext Valkey exposes cached authorization context in transit",
-				cfg.AppEnv, url,
-			)
-		}
+	// cfg.ValkeyURL is set via envOr("VALKEY_URL", "localhost:6379") which
+	// always returns a non-empty string — the url != "" guard would be dead
+	// code, so the check is applied unconditionally once APP_ENV != "dev".
+	if cfg.AppEnv != "dev" && !strings.HasPrefix(cfg.ValkeyURL, "rediss://") {
+		return Config{}, fmt.Errorf(
+			"VALKEY_URL must use the rediss:// scheme (TLS) when APP_ENV=%q — got %q; plaintext Valkey exposes cached authorization context in transit",
+			cfg.AppEnv, cfg.ValkeyURL,
+		)
 	}
 
 	// SHARED_REALM_ISSUER + REALM_TENANT_MAP_SEED: at least one must be set

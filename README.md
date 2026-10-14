@@ -178,16 +178,17 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 |---------|-----------|-------|
 | **Cache** | Valkey (`go-redis/v9`) | The only persistent-ish state this service touches — no database, no ORM, no migrations |
 | **Sibling services** | Org & Membership + iam-tender-acl (HTTP, mTLS) | Org & Membership: I-8 membership rebuild, I-14 MFA-freshness. iam-tender-acl: TAC-4 tender-ACL (formerly Org & Membership's I-12, repointed here ADR-0007 Wave 3 Phase 4). Both are the source of truth behind the cache |
-| **Events (consumed)** | AWS SQS, 5 queues | `platform-events` consumer; Glue-encoded envelopes decoded by `GlueDecoder` (no Glue client needed); DLQ via SQS's own `maxReceiveCount=5` redrive policy — application code only logs the last delivery. Full contract: [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `/asyncapi` (§ Common commands) |
+| **Events (consumed)** | AWS SQS, 5 queues | `platform-events/v2` consumer; Glue-encoded envelopes decoded by the built-in `events.GlueDecodeCodec{}` (no separate decoder file, no Glue client needed); DLQ via SQS's own `maxReceiveCount=5` redrive policy — application code only logs the last delivery. Full contract: [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `/asyncapi` (§ Common commands) |
 | **Events (published)** | None | This service emits nothing to the bus |
 
 ### Shared library dependencies
 
 | Library | Version | Purpose |
 |---------|---------|---------|
-| `platform-gincommon` | v1.3.0 | zap logger, gRPC observability interceptors (panic-recovery/request-id/tracing/metrics/logging), Gin observability middlewares (`/healthz`/`/readyz`), health handler |
-| `platform-events` | v1.4.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]`), SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table) |
-| `platform-pgcommon` | v1.3.0 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, OTel query tracer, `pgmetrics` — same wiring as iam-user-profile / iam-org-membership. **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox |
+| `platform-gincommon` | v1.6.0 | zap logger, gRPC observability interceptors (panic-recovery/request-id/tracing/metrics/logging), Gin observability middlewares (`/healthz`/`/readyz`), health handler |
+| `platform-events/v2` | v2.1.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]` / `GlueDecodeCodec{}`), SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table). Import path: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2` |
+| `platform-pgcommon/v2` | v2.0.1 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, OTel query tracer, `pgmetrics.InitWithIdentity` — same wiring as iam-user-profile / iam-org-membership. **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox. Import path: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2` |
+| `go-redis/v9` | v9.23.0 | Valkey/Redis client — the only non-platform library with a significant version; import path `github.com/redis/go-redis/v9` |
 
 ---
 

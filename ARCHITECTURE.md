@@ -42,7 +42,7 @@ graph TD
     subgraph adapters_out["Outbound Adapters  —  internal/adapter/outbound/"]
         valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
         org_a["orgmembership/\nClient — I-8 memberships + I-14 mfa-freshness against Org & Membership,\nTAC-4 tender-acl (formerly I-12) against iam-tender-acl since ADR-0007\nWave 3 Phase 4 — two base URLs/timeouts, one Go package\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
-        metrics_a["metrics/\nRecorder — Prometheus authz_* series (§10),\nbuilt on an injectable Registerer for test isolation"]
+        metrics_a["metrics/\nRecorder — Prometheus iam_authz_enrichment_* series (§10),\nbuilt on an injectable Registerer for test isolation\nNew: tac4_errors_total (TAC-4 outage vs policy denial)\neviction_errors_total (best-effort SCAN failure)"]
         postgres_a["postgres/\nplatform-pgcommon DSN / PoolConfig / Zap logger /\nOTel tracer / OpenPool wrapper — no live pool (HLD §5.4)"]
     end
 
@@ -264,7 +264,7 @@ flowchart TD
     subgraph keys["Valkey Key Namespace (§4.1) — every key is tenant-scoped by construction"]
         k1["ae:ctx:{tenant}:{user} → MembershipContext (roles, departments)\nsoft TTL 60s ± 6s jitter · physical TTL = soft + 5m grace"]
         k2["ae:tenant:{tenant} → TenantContext (plan, feature_flags, subscription_status, read_only)\nsplit from ae:ctx so a tenant-wide event is ALWAYS a single-key eviction, never a SCAN\nsame soft-TTL/grace envelope as ae:ctx"]
-        k3["ae:tender_acl:{tenant}:{tender}:{user} → TenderACL{has_access, access_level}\nflat 15s TTL — half the sibling's own 30s TTL — no stale-if-error branch"]
+        k3["ae:tender_acl:{tenant}:{tender}:{user} → TenderACL{has_access, access_level: *string}\nflat 15s TTL — half the sibling's own 30s TTL — no stale-if-error branch\naccess_level is *string: nil when absent (HasAccess=false), non-nil on a grant"]
         k4["ae:neg:{tenant}:{user} → sentinel — subject rebuild returned 404\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
         k5["ae:processed:{event_id} → SET NX sentinel, 7-day TTL\nconsumer idempotency — the SET-NX equivalent of ON CONFLICT DO NOTHING"]
         k6["mfa_freshness_seconds  →  NEVER CACHED, no key exists (§4.4)\nfetched fresh per approver-gated request from I-14 ONLY —\nfolding it into ae:ctx would delay a tightened MFA window by up to 60s"]
@@ -336,7 +336,7 @@ sequenceDiagram
     participant DLQ as SQS -dlq
 
     SQS ->> Consumer: ReceiveMessage (long poll)
-    Note over Consumer: GlueDecoder strips the 18-byte Glue header when the envelope's<br/>dataschema is set (producers Glue-encode once their registry is configured).<br/>A plain-JSON envelope passes through untouched.
+    Note over Consumer: platform-events/v2 built-in GlueDecodeCodec strips the 18-byte Glue header<br/>when the envelope's dataschema is set (producers Glue-encode once their registry is configured).<br/>A plain-JSON envelope passes through untouched. No separate glue_decoder.go — this is now the library's own codec.
     alt 5th delivery (ApproximateReceiveCount above 4)
         Consumer ->> Consumer: DeadLetterHandler — log "exhausted retries", return error (never acks)
     end
@@ -516,7 +516,7 @@ graph LR
 | A tender-ACL failure fails closed for that overlay only | `usecase/check.go` returns `DENY_TENDER_ACL_INSUFFICIENT` directly at the TAC-4 (formerly I-12) call site, independent of `DecideDependencyOutcome` |
 | Consumer idempotency never double-applies an eviction, and never permanently swallows a bad message | `MarkProcessed` (SET NX) before dispatch; `EvictProcessed` on handler failure so a redelivery is a real retry, not a false-positive dedup skip |
 | DLQ routing is infra-only | SQS's native redrive policy does the counting and the move (see `scripts/init-localstack.sh`). The only application code is observability: `WithMaxReceiveCount(4)` + `DeadLetterHandler`, which logs the 5th and last delivery and always returns an error — so it never acks, and it is what stops platform-events deleting a message past its max receive count |
-| Glue-encoded events are decoded, never dead-lettered for their wire format | `GlueDecoder` (`WithConsumerCodec`) strips the 18-byte Glue header whenever `dataschema` is set — every sibling producer Glue-encodes once its registry is configured |
+| Glue-encoded events are decoded, never dead-lettered for their wire format | platform-events/v2's built-in `GlueDecodeCodec{}` (via `events.WithConsumerCodec`) strips the 18-byte Glue header whenever `dataschema` is set — every sibling producer Glue-encodes once its registry is configured. No separate `glue_decoder.go` needed. |
 | Stale-if-error never exceeds its hard cap regardless of configuration | `internal/config/config.go` clamps `AE_STALE_IF_ERROR_MAX_AGE` to 5 minutes even if a higher value is configured |
 | Realm-map freshness survives the direct-paid-signup edge case | Both `TenantConverted` and `TenantRealmReady` update the realm map; only the latter fires for a tenant that never went through conversion |
 | A deployment left pointed at the local-dev Org & Membership URL fails at startup, not silently on every request | `internal/config/config.go`'s `Load()` returns an error when `OrgMembershipBaseURL` is still `http://localhost:8081` and `APP_ENV != "dev"` |

@@ -126,11 +126,21 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 	}
 
 	// §3.1 step 4: tender-ACL overlay. Only evaluated because step 3 passed.
+	//
+	// Guard: a route that carries required_access_level but yields no
+	// extractable TenderID (e.g. a trailing-slash path /tenders/ or a
+	// misconfigured Envoy route) cannot be correctly evaluated. Deny
+	// rather than silently skip the overlay — the service cannot tell
+	// "no tender applies" apart from "path parsing failed" otherwise.
+	if reqFacts.RequiredAccessLevel != "" && reqFacts.TenderID == "" {
+		return domain.Denied(domain.DenyMalformedIdentity)
+	}
 	if reqFacts.RequiresTenderACL() {
 		acl, err := c.resolveTenderACL(policyCtx, tenant, reqFacts.TenderID, subject)
 		if err != nil {
 			// §7 row 4: fails closed for this overlay only — never escalates
 			// to DENY_SERVICE_UNAVAILABLE or denies non-tender-scoped aspects.
+			c.metrics.ObserveTACDependencyError()
 			return domain.Denied(domain.DenyTenderACLInsufficient)
 		}
 		if !acl.Satisfies(reqFacts.RequiredAccessLevel) {
@@ -224,7 +234,7 @@ func (c *Checker) resolveContext(ctx context.Context, tenant, user string) (doma
 		defer i8Span.End()
 		i8Start := c.now()
 		m, t, sfErr := c.org.GetMemberships(i8Ctx, tenant, user)
-		c.metrics.ObserveI8Latency(c.now().Sub(i8Start))
+		c.metrics.ObserveDependencyLatency(c.now().Sub(i8Start), "org-membership", "get-memberships")
 		return sfResult{membership: m, tenant: t}, sfErr
 	})
 	if shared {
@@ -290,7 +300,7 @@ func (c *Checker) resolveTenderACL(ctx context.Context, tenant, tenderID, user s
 	i12Ctx, i12Span := tracer.Start(ctx, "authz.i12_call")
 	i12Start := c.now()
 	acl, err := c.org.GetTenderACL(i12Ctx, tenant, tenderID, user)
-	c.metrics.ObserveI12Latency(c.now().Sub(i12Start))
+	c.metrics.ObserveDependencyLatency(c.now().Sub(i12Start), "tender-acl", "get-tender-acl")
 	i12Span.End()
 	if err != nil {
 		return domain.TenderACL{}, fmt.Errorf("tender acl rebuild: %w", err)
@@ -308,7 +318,7 @@ func (c *Checker) checkMFAFreshness(ctx context.Context, tenant string, claims C
 	mfaCtx, mfaSpan := tracer.Start(ctx, "authz.mfa_freshness_call")
 	mfaStart := c.now()
 	window, err := c.org.GetMFAFreshness(mfaCtx, tenant)
-	c.metrics.ObserveI14Latency(c.now().Sub(mfaStart))
+	c.metrics.ObserveDependencyLatency(c.now().Sub(mfaStart), "org-membership", "get-mfa-freshness")
 	mfaSpan.End()
 	if err != nil {
 		// The doc gives tender-ACL its own explicit "fail closed for that
@@ -322,5 +332,13 @@ func (c *Checker) checkMFAFreshness(ctx context.Context, tenant string, claims C
 		return true
 	}
 	authTime := time.Unix(claims.AuthTime, 0)
+	// A future auth_time is either a replayed/forged token or a clock-skew
+	// beyond any reasonable tolerance — neither should pass an approver-gate.
+	// Without this guard, now.Sub(future) is a large negative duration, which
+	// is never > window (positive), so the check would silently allow instead
+	// of deny.
+	if authTime.After(c.now()) {
+		return true
+	}
 	return c.now().Sub(authTime) > window
 }

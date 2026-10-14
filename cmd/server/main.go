@@ -31,11 +31,11 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/grpccommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgmetrics"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/consumer"
 	grpcadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/grpc"
@@ -135,11 +135,13 @@ func run() error {
 		Logger:       appLog,
 		ServiceName:  cfg.AppName,
 		BuildVersion: buildVersion,
+		Domain:       "iam",
 	}
 	grpcCfg := grpccommon.Config{
 		ServiceName:  cfg.AppName,
 		BuildVersion: buildVersion,
 		Logger:       appLog,
+		Domain:       "iam",
 	}
 
 	// ObservabilityMiddlewares is gincommon's public metrics-init API. Call
@@ -164,10 +166,24 @@ func run() error {
 
 	// 3. Metrics — business collectors + platform-events consumer
 	// collectors, both on gincommon's registerer (the same /metrics scrape
-	// as HTTP/gRPC interceptor series).
+	// as HTTP/gRPC interceptor series). identity derives from gincommon so
+	// all three share the same domain/service/environment/version labels.
 	recorder := metrics.New(gincommon.MetricsRegisterer())
-	events.InitWithRegisterer(cfg.AppName, buildVersion, gincommon.MetricsRegisterer())
-	pgmetrics.InitWithRegisterer(cfg.AppName, buildVersion, gincommon.MetricsRegisterer())
+	identity := gincommon.MetricsConstLabels()
+	if evWarns, err := events.InitMetrics(events.MetricsIdentityFromLabels(identity), gincommon.MetricsRegisterer()); err != nil {
+		panic(fmt.Sprintf("init platform-events metrics: %v", err))
+	} else {
+		for _, w := range evWarns {
+			appLog.Warn("platform-events metric disabled", map[string]interface{}{"metric": w.Metric, "error": w.Error()})
+		}
+	}
+	if pgWarns, err := pgmetrics.InitWithIdentity(pgmetrics.IdentityFromLabels(identity), gincommon.MetricsRegisterer()); err != nil {
+		panic(fmt.Sprintf("init platform-pgcommon metrics: %v", err))
+	} else {
+		for _, w := range pgWarns {
+			appLog.Warn("platform-pgcommon metric disabled", map[string]interface{}{"metric": w.Metric, "error": w.Error()})
+		}
+	}
 
 	// Database config — same ConfigFromEnv / DSNFromEnv / Zap logger /
 	// gincommon TracerProvider path as iam-user-profile / iam-org-membership.
@@ -218,7 +234,7 @@ func run() error {
 	checker := usecase.NewChecker(cache, orgClient, realmMap, restricted, appLog, recorder, usecase.CheckerConfig{
 		SharedRealmIssuer: cfg.SharedRealmIssuer,
 	})
-	invalidator := usecase.NewInvalidator(cache, realmMap, restricted, appLog)
+	invalidator := usecase.NewInvalidator(cache, realmMap, restricted, appLog, recorder)
 
 	// 7. gRPC server (primary inbound adapter): panic-recovery -> request-id
 	// -> tracing -> metrics -> logging, from platform-gincommon. Not

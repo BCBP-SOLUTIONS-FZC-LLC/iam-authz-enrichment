@@ -62,3 +62,9 @@ func TestWrapConnErr_NilPassesThrough(t *testing.T) {
 func TestWrapConnErr_NonPgErrorIsNotOperatorClass(t *testing.T) {
 	assert.False(t, isOperatorOrSystemErrorSQLState(errors.New("not a pg error")))
 }
+
+func TestIsClosedPool_NilReturnsFalse(t *testing.T) {
+	// wrapConnErr returns nil before ever calling isClosedPool(nil), so
+	// the nil path of isClosedPool itself requires a direct call here.
+	assert.False(t, isClosedPool(nil))
+}
