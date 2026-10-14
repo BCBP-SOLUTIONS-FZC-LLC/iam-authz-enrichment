@@ -2,7 +2,7 @@
 
 This document describes the internal structure, dependency rules, and runtime data flows of `iam-authz-enrichment`.
 
-`iam-authz-enrichment` is a **private, stateless Go service** (`github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment`, Go 1.26.6+) deployed as a containerised microservice (5–20 replicas, HPA on RPS). It implements Envoy's `ext_authz` v3 gRPC interface — the Policy Decision Point for every authenticated request on the platform. It owns no durable database: it is a Valkey-backed read-through cache in front of the Org & Membership service, plus policy logic expressed as plain Go predicate functions (no OPA/Rego, §3).
+`iam-authz-enrichment` is a **private, stateless Go service** (`github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment`, Go 1.26.9+) deployed as a containerised microservice (5–20 replicas, HPA on RPS). It implements Envoy's `ext_authz` v3 gRPC interface — the Policy Decision Point for every authenticated request on the platform. It owns no durable database: it is a Valkey-backed read-through cache in front of the Org & Membership service, plus policy logic expressed as plain Go predicate functions (no OPA/Rego, §3).
 
 ---
 

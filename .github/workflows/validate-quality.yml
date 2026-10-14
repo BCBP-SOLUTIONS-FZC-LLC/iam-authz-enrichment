@@ -55,5 +55,7 @@ jobs:
         run: make database-lint
       - name: Events routing lint
         run: make events-lint
+      - name: Go image pin lint
+        run: make image-pin-lint
       - run: make mod-verify
       - run: make vuln-check

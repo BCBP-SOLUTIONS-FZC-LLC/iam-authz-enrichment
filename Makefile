@@ -54,6 +54,7 @@ help:
 	@echo "  make metrics-lint       - enforce Enterprise Platform Observability Standard (iam_authz_enrichment_* prefix)"
 	@echo "  make database-lint      - enforce all DB connections/config/ops route through platform-pgcommon"
 	@echo "  make events-lint        - enforce all events/outbox/dedup route through platform-events"
+	@echo "  make image-pin-lint     - enforce Dockerfile golang tag matches go.mod"
 	@echo "  make test            - unit tests (no Docker required)"
 	@echo "  make test-ci         - unit tests with race detector + coverage (used in CI)"
 	@echo "  make test-integration - Valkey + LocalStack SQS integration tests (requires Docker)"
@@ -155,6 +156,13 @@ metrics-lint:
 events-lint:
 	@bash .github/scripts/check-events-routing.sh
 
+# image-pin-lint enforces Dockerfile's golang:<ver>-alpine tag (and
+# .docker-digests) match go.mod's go directive. The official image sets
+# GOTOOLCHAIN=local, so a lagging pin fails at `go mod download`.
+.PHONY: image-pin-lint
+image-pin-lint:
+	@bash .github/scripts/check-golang-image-pin.sh
+
 # -----------------------------
 # TESTS
 # -----------------------------
@@ -239,7 +247,7 @@ pin-base-images:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy fmt-check vet lint arch-lint observability-lint metrics-lint database-lint events-lint test-ci build
+ci: tidy fmt-check vet lint arch-lint observability-lint metrics-lint database-lint events-lint image-pin-lint test-ci build
 
 # -----------------------------
 # COVERAGE

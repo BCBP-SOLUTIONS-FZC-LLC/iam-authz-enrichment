@@ -15,6 +15,7 @@ This service has no production deployment yet — pre-1.0, still in active devel
 
 ### Fixed (compatibility-check pass — 2026-10-14)
 
+- **Dockerfile builder image lagged `go.mod`** (`golang:1.26.6-alpine` vs `go 1.26.9`): `go mod download` failed in CI with `go: go.mod requires go >= 1.26.9 (running go 1.26.6; GOTOOLCHAIN=local)`. Re-pinned to `golang:1.26.9-alpine` (digest from `make pin-base-images`). Added `make image-pin-lint` so this drift fails quality CI before the image build.
 - **`platform-events/v2 v2.1.0` migration** (AE-OM-GAP-001, UP-AE-GAP-002, AE-RP-GAP-001): all import paths migrated from `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/...` to `platform-events/v2/pkg/...`. The local `consumer.GlueDecoder` (AE-35) retired in favour of the built-in `events.GlueDecodeCodec{}`.
 - **`platform-pgcommon/v2 v2.0.1` migration** (UP-AE-GAP-004): all import paths migrated to `platform-pgcommon/v2/pkg/...`.
 - **`go-redis/v9 v9.23.0`** (AE-OM-GAP-003): bumped from v9.22.0.
