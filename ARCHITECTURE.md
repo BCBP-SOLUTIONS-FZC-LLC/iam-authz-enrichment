@@ -42,7 +42,7 @@ graph TD
     subgraph adapters_out["Outbound Adapters  —  internal/adapter/outbound/"]
         valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
         org_a["orgmembership/\nClient — I-8 memberships + I-14 mfa-freshness against Org & Membership,\nTAC-4 tender-acl (formerly I-12) against iam-tender-acl since ADR-0007\nWave 3 Phase 4 — two base URLs/timeouts, one Go package\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
-        metrics_a["metrics/\nRecorder — Prometheus iam_authz_enrichment_* series (§10),\nbuilt via gincommon's registry-validated constructors\non an injectable Registerer for test isolation"]
+        metrics_a["metrics/\nRecorder — Prometheus iam_authz_enrichment_* series (§10),\nbuilt via gincommon's registry-validated constructors\non an injectable Registerer for test isolation\nincl. tac4_errors_total (TAC-4 outage vs policy denial),\neviction_errors_total (best-effort SCAN failure)"]
         postgres_a["postgres/\nplatform-pgcommon DSN / PoolConfig / Zap logger /\ngincommon.NewSpanTracer / OpenPool wrapper — no live pool (HLD §5.4)"]
     end
 
@@ -76,7 +76,13 @@ graph TD
     metrics_a -.->|"satisfies Recorder\n(structurally — no import)"| ports
 ```
 
-**Rule:** `domain` ← `policy` ← `usecase` ← `adapter` ← `cmd`. Outbound adapters (`valkey`, `orgmembership`, `metrics`, `postgres`) depend only on `domain`/`policy` — they **never** import `usecase`, even though they implement interfaces `usecase/ports.go` declares. That inversion is the whole point: `usecase` owns the contract, adapters satisfy it structurally. Enforced in CI by `go-arch-lint check --project-path .` against `.go-arch-lint.yml`. `postgres` is config-only (no usecase port): it wraps `platform-pgcommon` so a future schema cannot bypass it with a raw `pgxpool`.
+**Rule:** `domain` ← `policy` ← `usecase` ← `adapter` ← `cmd`. Outbound adapters (`valkey`, `orgmembership`, `metrics`, `postgres`) depend only on `domain`/`policy` — they **never** import `usecase`, even though they implement interfaces `usecase/ports.go` declares. That inversion is the whole point: `usecase` owns the contract, adapters satisfy it structurally. Enforced in CI by three complementary gates:
+
+1. **`go-arch-lint check --project-path .`** against `.go-arch-lint.yml` — enforces the inward-only import direction between layers.
+2. **`make observability-lint`** (`.github/scripts/check-observability-routing.sh`) — enforces that all logs, metrics, and traces pass through `platform-gincommon` only: no direct `go.uber.org/zap`, no `prometheus.MustRegister` outside the gincommon registerer, no `otel.SetTracerProvider` in application code, no bare `http.DefaultTransport` without `otelhttp` wrapping.
+3. **`make database-lint`** (`.github/scripts/check-database-routing.sh`) — enforces that all DB connections, config, and operations pass through `platform-pgcommon` only: no raw `pgxpool.New`/`pgx.Connect`, all DSN assembly via `pgcommon.ConfigFromEnv`, `OpenPool` is the only pool constructor, and `cmd/server` never calls `NewPool`/migrate/outbox (HLD §5.4 — no schema).
+
+`postgres` is config-only (no usecase port): it wraps `platform-pgcommon` so a future schema cannot bypass it with a raw `pgxpool`.
 
 ---
 
@@ -260,7 +266,7 @@ flowchart TD
     subgraph keys["Valkey Key Namespace (§4.1) — every key is tenant-scoped by construction"]
         k1["ae:ctx:{tenant}:{user} → MembershipContext (roles, departments)\nsoft TTL 60s ± 6s jitter · physical TTL = soft + 5m grace"]
         k2["ae:tenant:{tenant} → TenantContext (plan, feature_flags, subscription_status, read_only)\nsplit from ae:ctx so a tenant-wide event is ALWAYS a single-key eviction, never a SCAN\nsame soft-TTL/grace envelope as ae:ctx"]
-        k3["ae:tender_acl:{tenant}:{tender}:{user} → TenderACL{has_access, access_level}\nflat 15s TTL — half the sibling's own 30s TTL — no stale-if-error branch"]
+        k3["ae:tender_acl:{tenant}:{tender}:{user} → TenderACL{has_access, access_level: *string}\nflat 15s TTL — half the sibling's own 30s TTL — no stale-if-error branch\naccess_level is *string: nil when absent (HasAccess=false), non-nil on a grant"]
         k4["ae:neg:{tenant}:{user} → sentinel — subject rebuild returned 404\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
         k5["ae:processed:{event_id} → SET NX sentinel, 7-day TTL\nconsumer idempotency — the SET-NX equivalent of ON CONFLICT DO NOTHING"]
         k6["mfa_freshness_seconds  →  NEVER CACHED, no key exists (§4.4)\nfetched fresh per approver-gated request from I-14 ONLY —\nfolding it into ae:ctx would delay a tightened MFA window by up to 60s"]

@@ -35,10 +35,26 @@ jobs:
             go.mod
       - name: Configure private module access
         run: git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Tidy drift check
+        run: |
+          go mod tidy
+          if ! git diff --quiet -- go.mod go.sum; then
+            echo "::error::go mod tidy produced a diff — run 'go mod tidy' locally and commit the result"
+            git diff -- go.mod go.sum
+            exit 1
+          fi
       - run: make fmt-check
       - run: make vet
       - run: make lint
       - run: make arch-lint
+      - name: Observability routing lint
+        run: make observability-lint
+      - name: Database routing lint
+        run: make database-lint
+      - name: Events routing lint
+        run: make events-lint
+      - name: Go image pin lint
+        run: make image-pin-lint
       # Enterprise Platform Observability Standard (docs/observability/README.md):
       # collector naming, proposed-metric governance, platform-gincommon's
       # metricslint on a real scrape + refs + inventory drift, Helm

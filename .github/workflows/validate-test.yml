@@ -1,11 +1,14 @@
-# Reusable workflow — test gate. Race detector (unit + integration) +
-# coverage, plus a separate e2e job that drives the real compiled binary
-# over a real gRPC connection. Called by ci.yml and release.yml so both
-# share exactly one definition of "tests pass" — this split only started
-# earning its keep once release.yml existed as a second caller (see
-# release.yml's header comment). e2e runs as its own job (not a step in
-# `test`) so a real server-process/network-port failure there is clearly
-# attributable in the Actions UI rather than buried in the `test` job's log.
+# Reusable workflow — test gate.
+# Race detector (unit + integration) + coverage gate (100%) + e2e
+# (real compiled binary over real gRPC against real Valkey/LocalStack).
+# All three tiers run in a single job against shared service containers —
+# the same pattern iam-tender-acl uses for its unit + integration + e2e
+# tiers. This avoids duplicating service container setup and checkout/module-
+# download costs across two independent jobs, and keeps the failure signal
+# for all three tiers in one place.
+#
+# Called by ci.yml and release.yml so both share exactly one definition of
+# "tests pass".
 name: Validate / Test
 
 "on":
@@ -32,7 +35,9 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25 minutes: unit (~5m) + coverage gate (~1m) + integration (~3m) +
+    # build (~2m) + e2e (~5m) + headroom for slow CI machines.
+    timeout-minutes: 25
     outputs:
       pct: ${{ steps.coverage.outputs.pct }}
     services:
@@ -93,57 +98,12 @@ jobs:
         with:
           files: coverage.out
           fail_ci_if_error: false
-
-  # Drives the real compiled binary over a real gRPC connection against real
-  # Valkey/SQS-emulator services (test/e2e's package doc has the full
-  # rationale) — the one tier that would catch a wiring regression the unit
-  # and integration tiers above structurally cannot see, since neither
-  # starts cmd/server itself. Independent of the `test` job (own services,
-  # own checkout) so it can run in parallel rather than serialize behind it.
-  e2e:
-    name: e2e
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    services:
-      valkey:
-        image: valkey/valkey:8-alpine
-        ports: ["6379:6379"]
-        options: >-
-          --health-cmd "valkey-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-      localstack:
-        image: localstack/localstack:4.4.0
-        ports: ["4566:4566"]
-        env:
-          SERVICES: sqs
-          AWS_DEFAULT_REGION: ap-south-1
-        options: >-
-          --health-cmd "awslocal sqs list-queues"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@v7.0.0
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-      - uses: actions/setup-go@v6.5.0
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: |
-            go.sum
-            go.mod
-      - name: Configure private module access
-        run: git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
-      - name: Init LocalStack queues
-        run: |
-          chmod +x scripts/init-localstack.sh
-          AWS_ACCESS_KEY_ID=localstack AWS_SECRET_ACCESS_KEY=localstack AWS_DEFAULT_REGION=ap-south-1 \
-            ./scripts/init-localstack.sh
-        env:
-          AWS_ENDPOINT_URL: http://localhost:4566
-      - name: Build binary
+      # E2E: drives the real compiled binary over a real gRPC connection
+      # against the same Valkey/LocalStack service containers already running
+      # for the integration tests above — the one tier that catches wiring
+      # regressions (startup config, graceful shutdown, consumer-to-cache path)
+      # that unit and integration tests structurally cannot see.
+      - name: Build binary (for e2e)
         run: make build
       - name: E2E tests
         run: make test-e2e

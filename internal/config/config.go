@@ -42,12 +42,12 @@ type Config struct {
 	// or a stale answer, not a slow one.
 	OrgMembershipTimeout time.Duration
 
-	// TenderACLBaseURL/TenderACLTimeout back I-12 (GetTenderACL) only, since
-	// ADR-0007 Wave 3 Phase 4 repoints that one call at iam-tender-acl —
-	// I-8/I-14 stay on OrgMembershipBaseURL above. Default 30ms (AE-37):
-	// iam-tender-acl's TAC-4 targets are 5ms cache-hit / 20ms cache-miss (its
-	// LLD §14.1), plus headroom for the mesh hop — this client cannot know
-	// which case a given call will hit.
+	// TenderACLBaseURL/TenderACLTimeout back I-12 (GetTenderACL) and TAC-5
+	// (GetBatchTenderACL) only, since ADR-0007 Wave 3 Phase 4 repoints those
+	// calls at iam-tender-acl — I-8/I-14 stay on OrgMembershipBaseURL above.
+	// Default 30ms (AE-37): iam-tender-acl's TAC-4 targets are 5ms cache-hit /
+	// 20ms cache-miss (its LLD §14.1), plus headroom for the mesh hop — this
+	// client cannot know which case a given call will hit.
 	TenderACLBaseURL string
 	TenderACLTimeout time.Duration
 
@@ -258,7 +258,12 @@ func Load() (Config, error) {
 	if cfg.RealmNegativeTTL, err = envDuration("AE_REALM_NEG_TTL", 5*time.Second); err != nil {
 		return Config{}, err
 	}
-	if cfg.ProcessedEventTTL, err = envDuration("AE_PROCESSED_EVENT_TTL", 7*24*time.Hour); err != nil {
+	// PE-1: processed-event TTL must be STRICTLY GREATER than the 7-day SQS
+	// message lifetime so a message delivered on day 6 and redelivered on
+	// day 7 is still recognised as already processed. 7 days exactly (168h)
+	// is at the boundary — use 8 days (192h) to match iam-user-profile /
+	// iam-org-membership and give a full day of margin.
+	if cfg.ProcessedEventTTL, err = envDuration("AE_PROCESSED_EVENT_TTL", 8*24*time.Hour); err != nil {
 		return Config{}, err
 	}
 	if cfg.StaleIfErrorMaxAge, err = envDuration("AE_STALE_IF_ERROR_MAX_AGE", staleIfErrorHardCap); err != nil {
@@ -331,6 +336,33 @@ func Load() (Config, error) {
 	cfg.RealmTenantMapSeed = map[string]string{}
 	if err := json.Unmarshal([]byte(seed), &cfg.RealmTenantMapSeed); err != nil {
 		return Config{}, fmt.Errorf("REALM_TENANT_MAP_SEED: invalid JSON: %w", err)
+	}
+
+	// Valkey TLS: VALKEY_URL must use rediss:// scheme in non-dev environments
+	// so the authorization context cache is encrypted in transit. A plaintext
+	// redis:// or bare host:port URL in staging/production would expose cached
+	// membership context and tenant context to anyone on the same network
+	// segment — same enforcement as iam-user-profile / iam-org-membership.
+	// cfg.ValkeyURL is set via envOr("VALKEY_URL", "localhost:6379") which
+	// always returns a non-empty string — the url != "" guard would be dead
+	// code, so the check is applied unconditionally once APP_ENV != "dev".
+	if cfg.AppEnv != "dev" && !strings.HasPrefix(cfg.ValkeyURL, "rediss://") {
+		return Config{}, fmt.Errorf(
+			"VALKEY_URL must use the rediss:// scheme (TLS) when APP_ENV=%q — got %q; plaintext Valkey exposes cached authorization context in transit",
+			cfg.AppEnv, cfg.ValkeyURL,
+		)
+	}
+
+	// SHARED_REALM_ISSUER + REALM_TENANT_MAP_SEED: at least one must be set
+	// outside dev. Both empty means no tenant-resolution path exists — every
+	// request would return DENY_MALFORMED_IDENTITY silently. Fail fast here
+	// (same philosophy as ORG_MEMBERSHIP_BASE_URL below) rather than producing
+	// a confusing runtime failure. main.go's previously-inline check is removed.
+	if cfg.AppEnv != "dev" && cfg.SharedRealmIssuer == "" && len(cfg.RealmTenantMapSeed) == 0 {
+		return Config{}, fmt.Errorf(
+			"no tenant-resolution path configured with APP_ENV=%q: set SHARED_REALM_ISSUER (shared trial realm issuer) or REALM_TENANT_MAP_SEED (dedicated-realm JSON seed) — both empty means every request returns DENY_MALFORMED_IDENTITY",
+			cfg.AppEnv,
+		)
 	}
 
 	// ORG_MEMBERSHIP_BASE_URL left at its local-dev default outside dev is

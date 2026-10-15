@@ -40,11 +40,28 @@ type Cache interface {
 }
 
 // OrgMembershipClient is the port this layer needs from the sibling Org &
-// Membership service (§6).
+// Membership service (§6) and iam-tender-acl (ADR-0007 Wave 3 Phase 4).
+// It covers only the three calls the §3.1 Check() precedence chain makes:
+// I-8 (membership rebuild), TAC-4 (tender-ACL overlay), and I-14 (MFA
+// freshness). The batch TAC-5 call lives on BatchTenderACLClient below.
 type OrgMembershipClient interface {
 	GetMemberships(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error)
 	GetTenderACL(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error)
 	GetMFAFreshness(ctx context.Context, tenant string) (time.Duration, error)
+}
+
+// BatchTenderACLClient is the narrower port for the TAC-5 batch check
+// (iam-tender-acl §8.4 / TAC-D14): a single POST replacing N individual
+// TAC-4 calls for dashboard-read paths (AE-30) that need many (tender, user)
+// pairs in one tenant. Callers must chunk requests > 50 items — iam-tender-acl
+// enforces that cap and returns 422 on violation (mapped to ErrUnavailable).
+//
+// Kept separate from OrgMembershipClient so every existing test fake for the
+// §3.1 Check() chain does not need to implement a method it never exercises.
+// Wire this interface at the call site that actually invokes GetBatchTenderACL,
+// not at NewChecker.
+type BatchTenderACLClient interface {
+	GetBatchTenderACL(ctx context.Context, tenant string, items []domain.BatchTenderACLItem) ([]domain.BatchTenderACLResult, error)
 }
 
 // Recorder is the metrics port (§10). A no-op implementation is used in
@@ -60,6 +77,14 @@ type Recorder interface {
 	ObserveI12Latency(d time.Duration)
 	ObserveI14Latency(d time.Duration)
 	ObserveDecisionLatency(d time.Duration)
+	// ObserveTACDependencyError increments the TAC-4 error counter when
+	// resolveTenderACL returns an error — distinguishing a real iam-tender-acl
+	// outage from legitimate insufficient-access denials in Prometheus.
+	ObserveTACDependencyError()
+	// ObserveEvictionError increments the best-effort eviction-failure counter
+	// for the named event (e.g. "membership_revoked", "user_deleted") when
+	// EvictTenderACLForUser errors, making systematic SCAN failures alertable.
+	ObserveEvictionError(event string)
 }
 
 // NoopRecorder implements Recorder with no side effects.
@@ -74,6 +99,8 @@ func (NoopRecorder) ObserveI8Latency(time.Duration)          {}
 func (NoopRecorder) ObserveI12Latency(time.Duration)         {}
 func (NoopRecorder) ObserveI14Latency(time.Duration)         {}
 func (NoopRecorder) ObserveDecisionLatency(time.Duration)    {}
+func (NoopRecorder) ObserveTACDependencyError()              {}
+func (NoopRecorder) ObserveEvictionError(string)             {}
 
 // Logger mirrors platform-gincommon's port.Logger method set structurally —
 // that type lives in an internal package we cannot import directly, so every

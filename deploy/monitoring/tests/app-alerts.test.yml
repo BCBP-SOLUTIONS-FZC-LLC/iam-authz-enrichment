@@ -24,9 +24,9 @@ tests:
               service: iam-authz-enrichment
               environment: prod
             exp_annotations:
-              description: "A sustained rate of DENY_SERVICE_UNAVAILABLE in prod means §7's failure-handling matrix is fail-closing on a dependency outage outside the stale-if-error grace window, or the tender-ACL overlay's independent fail-closed rule is firing on TAC-4 failures. Check Org & Membership, iam-tender-acl and Valkey health. Rate: 166.7m/s."
+              description: "A sustained rate of DENY_SERVICE_UNAVAILABLE in prod means §7's failure-handling matrix is fail-closing on an Org & Membership or Valkey outage outside the stale-if-error grace window. Check Org & Membership and Valkey health. iam-tender-acl (TAC-4) outages fail closed to DENY_TENDER_ACL_INSUFFICIENT instead and fire AuthzEnrichmentTAC4ErrorSpike, not this alert. Rate: 166.7m/s."
               runbook: "docs/observability/runbooks.md#authzenrichmentserviceunavailablespike"
-              summary: "iam-authz-enrichment is denying requests due to a dependency failure"
+              summary: "iam-authz-enrichment is denying requests due to an Org & Membership or Valkey failure"
 
   # Policy denies alone never trip the dependency alert.
   - interval: 1m
@@ -37,6 +37,28 @@ tests:
       - eval_time: 15m
         alertname: AuthzEnrichmentServiceUnavailableSpike
         exp_alerts: []
+
+  # TAC-4 errors page per environment; legitimate tender-ACL denials alone don't.
+  - interval: 1m
+    input_series:
+      - series: 'iam_authz_enrichment_tac4_errors_total{domain="iam",service="iam-authz-enrichment",environment="prod"}'
+        values: '0+6x10'
+      - series: 'iam_authz_enrichment_deny_reason_total{domain="iam",service="iam-authz-enrichment",environment="staging",reason="deny_tender_acl_insufficient"}'
+        values: '0+100x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AuthzEnrichmentTAC4ErrorSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: platform
+              domain: iam
+              service: iam-authz-enrichment
+              environment: prod
+            exp_annotations:
+              description: "iam_authz_enrichment_tac4_errors_total is increasing in prod: GetTenderACL is returning errors and the tender-ACL overlay is failing closed with DENY_TENDER_ACL_INSUFFICIENT for every restricted-tender request. Legitimate access-control denials do not increment this counter. Check iam-tender-acl health and iam_authz_enrichment_i12_call_latency_seconds. Rate: 100m/s."
+              runbook: "docs/observability/runbooks.md#authzenrichmenttac4errorspike"
+              summary: "iam-authz-enrichment TAC-4 (iam-tender-acl) errors — tender-ACL overlay failing closed"
 
   # A forward to a DLQ fires immediately, carrying the reason.
   - interval: 1m

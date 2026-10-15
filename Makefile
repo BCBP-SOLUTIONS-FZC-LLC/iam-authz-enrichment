@@ -15,6 +15,18 @@ export GONOSUMDB  ?= github.com/BCBP-SOLUTIONS-FZC-LLC/*
 
 export APP_NAME APP_ENV BUILD_VERSION
 
+# The integration and e2e tiers read VALKEY_URL / AWS_ENDPOINT_URL from the
+# environment and otherwise default to CI's LocalStack/Valkey ports (4566 /
+# 6379). Locally those ports usually belong to another repo's stack, so pass
+# this repo's .env values through when it sets them (CI has no .env and keeps
+# its own environment).
+ifneq ($(strip $(VALKEY_URL)),)
+test-integration test-e2e: export VALKEY_URL := $(VALKEY_URL)
+endif
+ifneq ($(strip $(AWS_ENDPOINT_URL)),)
+test-integration test-e2e: export AWS_ENDPOINT_URL := $(AWS_ENDPOINT_URL)
+endif
+
 TEST_UNIT_PKGS := ./internal/... ./cmd/...
 TEST_INT_PKGS  := ./test/integration/...
 TEST_E2E_PKGS  := ./test/e2e/...
@@ -50,6 +62,10 @@ help:
 	@echo "  make vet             - go vet (default build + every test build tag)"
 	@echo "  make lint            - run golangci-lint (default build + every test build tag)"
 	@echo "  make arch-lint       - enforce .go-arch-lint.yml component boundaries"
+	@echo "  make observability-lint - enforce all logs/metrics/traces route through platform-gincommon"
+	@echo "  make database-lint      - enforce all DB connections/config/ops route through platform-pgcommon"
+	@echo "  make events-lint        - enforce all events/outbox/dedup route through platform-events"
+	@echo "  make image-pin-lint     - enforce Dockerfile golang tag matches go.mod"
 	@echo "  make test            - unit tests (no Docker required)"
 	@echo "  make test-ci         - unit tests with race detector + coverage (used in CI)"
 	@echo "  make test-integration - Valkey + LocalStack SQS integration tests (requires Docker)"
@@ -60,7 +76,7 @@ help:
 	@echo "  make cover           - coverage profile + open HTML report"
 	@echo "  make cover-func      - coverage summary by function"
 	@echo "  make cover-all       - whole-module coverage incl. cmd/server (unit + e2e on an instrumented binary; needs make docker-up)"
-	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + metrics-check + test-ci + build"
+	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + observability/database/events/image-pin lints + metrics-check + test-ci + build"
 	@echo "  make metrics-check   - observability standard: naming, governance, metricslint, inventory, PrometheusRule drift, alert tests"
 	@echo "  make metrics-inventory - regenerate docs/observability/metric-registry.md"
 	@echo "  make prometheusrule  - regenerate the Helm PrometheusRule from deploy/monitoring/app-alerts.yml"
@@ -115,6 +131,44 @@ lint:
 arch-lint:
 	@command -v go-arch-lint >/dev/null || $(GO) install github.com/fe3dback/go-arch-lint@v1.15.0
 	go-arch-lint check --project-path .
+
+# database-lint enforces the platform-pgcommon-only routing invariant:
+#   Connections → postgres.OpenPool (→ pgcommon.NewPool)
+#   Config      → pgcommon.ConfigFromEnv() / postgres.DSNFromEnv()
+#   Operations  → pgcommon helpers (IsConnectionException / IsPgError / ...)
+# Also enforces the HLD §5.4 invariant: this service has no schema, so
+# cmd/server must never call OpenPool / migrate / outbox runner.
+.PHONY: database-lint
+database-lint:
+	@bash .github/scripts/check-database-routing.sh
+
+# observability-lint enforces the platform-gincommon-only routing invariant:
+#   Logs    → logger.NewLogger (Zap, structured, redacted)
+#   Metrics → gincommon.MetricsRegisterer() via promauto.With()
+#   Traces  → gincommon.InitTracingFromEnv() global TracerProvider
+# Any violation of this constraint means observability data bypasses the shared
+# sink — breaking redaction, label consistency, and distributed trace continuity.
+.PHONY: observability-lint
+observability-lint:
+	@bash .github/scripts/check-observability-routing.sh
+
+# events-lint enforces the platform-events-only routing invariant:
+#   Consumers  → events.NewSQSConsumerWithClient via buildConsumer
+#   Config     → config.LoadSQS / SQSConfigFromEnv / SQSConsumerOptions
+#   Glue       → events.GlueDecodeCodec{} via events.WithConsumerCodec
+#   Dedup      → Envelope.ID via MarkProcessed SET NX + EvictProcessed on error/panic
+#   Outbox     → skipped (consume-only, HLD §5.4 / EVT-2)
+#   Metrics    → events.InitMetrics → gincommon.MetricsRegisterer()
+.PHONY: events-lint
+events-lint:
+	@bash .github/scripts/check-events-routing.sh
+
+# image-pin-lint enforces Dockerfile's golang:<ver>-alpine tag (and
+# .docker-digests) match go.mod's go directive. The official image sets
+# GOTOOLCHAIN=local, so a lagging pin fails at `go mod download`.
+.PHONY: image-pin-lint
+image-pin-lint:
+	@bash .github/scripts/check-golang-image-pin.sh
 
 # -----------------------------
 # OBSERVABILITY (docs/observability/README.md § CI enforcement)
@@ -243,7 +297,7 @@ pin-base-images:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy fmt-check vet lint arch-lint metrics-check test-ci build
+ci: tidy fmt-check vet lint arch-lint observability-lint database-lint events-lint image-pin-lint metrics-check test-ci build
 
 # -----------------------------
 # COVERAGE

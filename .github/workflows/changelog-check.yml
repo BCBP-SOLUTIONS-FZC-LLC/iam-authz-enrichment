@@ -1,5 +1,8 @@
 # Pre-merge CHANGELOG check.
-# Fails if a PR modifies internal/, cmd/, or deploy/ without also updating CHANGELOG.md.
+# Fails if a PR modifies internal/, cmd/, deploy/, or api/ without also
+# updating CHANGELOG.md. api/ includes api/asyncapi.yaml — the event-contract
+# spec — whose changes are part of the runtime contract (§ VERSIONING.md) and
+# must be recorded in the changelog for downstream consumers to notice.
 name: Changelog check
 
 "on":
@@ -9,6 +12,7 @@ name: Changelog check
       - 'internal/**'
       - 'cmd/**'
       - 'deploy/**'
+      - 'api/**'
 
 permissions:
   contents: read

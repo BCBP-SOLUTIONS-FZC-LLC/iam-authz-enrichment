@@ -35,13 +35,14 @@ func TestTenderACL_Satisfies(t *testing.T) {
 		required string
 		want     bool
 	}{
-		{"no access never satisfies", domain.TenderACL{HasAccess: false, AccessLevel: domain.AccessLevelApprove}, domain.AccessLevelView, false},
-		{"view satisfies view", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelView}, domain.AccessLevelView, true},
-		{"view does not satisfy edit", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelView}, domain.AccessLevelEdit, false},
-		{"approve satisfies view", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, domain.AccessLevelView, true},
-		{"approve satisfies edit", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, domain.AccessLevelEdit, true},
-		{"unrecognized granted level never satisfies", domain.TenderACL{HasAccess: true, AccessLevel: "bogus"}, domain.AccessLevelView, false},
-		{"unrecognized required level never satisfies", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, "bogus", false},
+		{"no access never satisfies", domain.TenderACL{HasAccess: false, AccessLevel: strPtr(domain.AccessLevelApprove)}, domain.AccessLevelView, false},
+		{"view satisfies view", domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelView)}, domain.AccessLevelView, true},
+		{"view does not satisfy edit", domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelView)}, domain.AccessLevelEdit, false},
+		{"approve satisfies view", domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}, domain.AccessLevelView, true},
+		{"approve satisfies edit", domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}, domain.AccessLevelEdit, true},
+		{"unrecognized granted level never satisfies", domain.TenderACL{HasAccess: true, AccessLevel: strPtr("bogus")}, domain.AccessLevelView, false},
+		{"unrecognized required level never satisfies", domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}, "bogus", false},
+		{"nil access level never satisfies (absent on wire — TAC-GAP-001)", domain.TenderACL{HasAccess: true, AccessLevel: nil}, domain.AccessLevelView, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -49,6 +50,23 @@ func TestTenderACL_Satisfies(t *testing.T) {
 			assert.Equal(t, c.want, c.acl.Satisfies(c.required))
 		})
 	}
+}
+
+func strPtr(s string) *string { return &s }
+
+func TestTenderACL_UnmarshalJSON_InvalidJSON_ReturnsError(t *testing.T) {
+	t.Parallel()
+	var acl domain.TenderACL
+	err := acl.UnmarshalJSON([]byte("not-json"))
+	assert.Error(t, err, "completely invalid JSON must propagate a parse error")
+}
+
+func TestTenderACL_UnmarshalJSON_InvalidExpiresAt_ReturnsError(t *testing.T) {
+	t.Parallel()
+	var acl domain.TenderACL
+	err := acl.UnmarshalJSON([]byte(`{"has_access":true,"expires_at":"not-a-timestamp"}`))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "expires_at")
 }
 
 func TestDenyReason_HTTPStatus_UnknownReasonDefaultsTo403(t *testing.T) {

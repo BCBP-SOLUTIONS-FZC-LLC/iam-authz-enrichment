@@ -104,16 +104,6 @@ func run() error {
 		"service": cfg.AppName, "version": buildVersion, "env": cfg.AppEnv,
 	})
 
-	// SHARED_REALM_ISSUER is legitimately optional — ResolveTenant falls
-	// back to RealmTenantMapSeed for dedicated-realm-only platforms (see
-	// tenant_resolve.go) — so this is a warning, not the hard startup
-	// failure config.Load() applies to ORG_MEMBERSHIP_BASE_URL. But BOTH
-	// empty outside dev means there is no tenant-resolution path at all:
-	// every request will resolve to DENY_MALFORMED_IDENTITY.
-	if cfg.AppEnv != "dev" && cfg.SharedRealmIssuer == "" && len(cfg.RealmTenantMapSeed) == 0 {
-		appLog.Warn("no tenant-resolution path configured — every request will get DENY_MALFORMED_IDENTITY until SHARED_REALM_ISSUER is set or a TenantConverted/TenantRealmReady event seeds the realm map", nil)
-	}
-
 	// Align the env vars the platform libraries read directly (APP_NAME,
 	// OTEL_SERVICE_NAME — platform-events' consumer spans — and BUILD_VERSION)
 	// with this process's identity, so a deployment that sets only APP_NAME
@@ -181,6 +171,18 @@ func run() error {
 	// iam-org-membership / iam-user-profile. NewRouter applies the same
 	// middleware slice; gincommon's metrics init is first-call-wins.
 	_ = gincommon.ObservabilityMiddlewares(ginCfg)
+
+	// DOCS_AUTH_TOKEN guard: if /asyncapi is enabled in production without a
+	// bearer token, the event-contract viewer is public — it doesn't expose
+	// credentials but does expose the consumer topology and schema detail.
+	// Warn at startup (not a fatal error — DOCS_ENABLED=false is the safe
+	// default in production) so an operator who sets DOCS_ENABLED=true
+	// without DOCS_AUTH_TOKEN gets an immediate, visible signal rather than
+	// discovering the exposure post-deployment. Mirrors iam-user-profile's
+	// identical startup warning.
+	if cfg.AppEnv == "prod" && cfg.DocsEnabled && cfg.DocsAuthToken == "" {
+		appLog.Warn("DOCS_ENABLED=true in prod without DOCS_AUTH_TOKEN — /asyncapi and /asyncapi.yaml are served unauthenticated; set DOCS_AUTH_TOKEN to require a bearer token", nil)
+	}
 
 	// 3. Metrics — business collectors + platform-events / platform-pgcommon
 	// Tier 1 collectors, all on gincommon's registerer (the same /metrics
@@ -254,7 +256,7 @@ func run() error {
 	checker := usecase.NewChecker(cache, orgClient, realmMap, restricted, appLog, recorder, usecase.CheckerConfig{
 		SharedRealmIssuer: cfg.SharedRealmIssuer,
 	})
-	invalidator := usecase.NewInvalidator(eventCache, realmMap, restricted, appLog)
+	invalidator := usecase.NewInvalidator(eventCache, realmMap, restricted, appLog, recorder)
 
 	// 7. gRPC server (primary inbound adapter): panic-recovery -> request-id
 	// -> tracing -> metrics -> logging, from platform-gincommon. Not

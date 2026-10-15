@@ -9,7 +9,9 @@ linters:
   enable:
     - bodyclose
     - exhaustive
+    - gocritic      # catches subtle bugs: range-over-copy, unnecessary conversions, suspicious code patterns
     - nilerr
+    - nolintlint    # ensures //nolint directives are well-formed and not silently ignored
     - noctx
     - revive
     - unconvert
@@ -27,6 +29,8 @@ issues:
   exclude-rules:
     - path: '_test\.go'
       linters:
+        - gocritic
+        - nolintlint
         - revive
         - unparam
         - noctx

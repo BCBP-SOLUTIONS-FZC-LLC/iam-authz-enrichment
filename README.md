@@ -202,8 +202,9 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 | Library | Version | Purpose |
 |---------|---------|---------|
 | `platform-gincommon` | v1.6.0 | zap logger, gRPC observability interceptors (panic-recovery/request-id/tracing/metrics/logging) + `RegisterKnownMethods`, Gin observability middlewares (`/healthz`/`/readyz`), health handler, `InitTracingWithConfig`, `MetricsHandler` (`/metrics`), Tier 3 metric constructors (`NewCounterVec`/`NewCounter`/`NewHistogramVec`, registry-validated), `NewTracer`/`NewSpanTracer`/`InjectTraceContext` — the only OTel/Prometheus entry points, same as iam-org-membership |
-| `platform-events/v2` | v2.0.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]`), Glue decoding (`GlueDecodeCodec`), `InitMetrics`, SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table) |
-| `platform-pgcommon/v2` | v2.0.0 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, query tracer (`gincommon.NewSpanTracer`), `pgmetrics.InitWithIdentity` — same wiring as iam-user-profile / iam-org-membership. **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox |
+| `platform-events/v2` | v2.1.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]`), Glue decoding (`GlueDecodeCodec`), `InitMetrics`, SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table) |
+| `platform-pgcommon/v2` | v2.0.1 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, query tracer (`gincommon.NewSpanTracer`), `pgmetrics.InitWithIdentity` — same wiring as iam-user-profile / iam-org-membership. **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox |
+| `go-redis/v9` | v9.23.0 | Valkey/Redis client — the only non-platform library with a significant version; import path `github.com/redis/go-redis/v9` |
 
 ---
 
@@ -244,7 +245,7 @@ The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) �
 | `TenantSubscriptionCancelled` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
 | `TenantReactivated` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
 
-**`tenant-authz-q`** (Realm Provisioner, 2 event types) — keep the in-process realm→tenant map fresh for JWT-issuer-based tenant resolution (LLD §8.3); both must be wired, since a direct-paid-signup tenant fires only the second one:
+**`tenant-authz-q`** (Realm Provisioner, 2 event types) — keep the in-process realm→tenant map fresh for JWT-issuer-based tenant resolution (LLD §8.3); both must be wired. The Realm Provisioner always co-emits both events (RP-2 direct-paid signup and RP-3 trial→dedicated conversion each emit `TenantRealmReady` followed by `TenantConverted` in the same outbox transaction). The SNS subscription filter for this queue **must include both** `EventType` values — omitting `TenantRealmReady` leaves `HandleTenantRealmReady` as dead code and breaks any future provisioning path that may emit it without a co-emitted `TenantConverted`:
 
 | Event type | Consumed field(s) | Effect |
 |---|---|---|
@@ -256,6 +257,55 @@ The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) �
 | Event type | Consumed field(s) | Effect |
 |---|---|---|
 | `TenderRestricted` | `tender_id` | Mark `(tenant, tender_id)` restricted in the in-process `RestrictedTenderSet` — the §3.1 step-4 tender-ACL overlay only calls out to TAC-4 for a tender this set marks restricted |
+
+---
+
+## Cross-service dependencies
+
+### 1. Synchronous outbound calls (this service → other services)
+
+Every `Authorization.Check` traverses the §3.1 precedence chain. Not every call reaches every dependency — the table below shows when each is hit:
+
+| Dependency | When called | Adapter package | Posture | On failure |
+|---|---|---|---|---|
+| **Valkey** | Every `Check()` — cache read (`ae:ctx`, `ae:tenant`) | `outbound/valkey/` | soft — bypass | Call Org & Membership directly for this request; a Valkey miss is not an error |
+| **Org & Membership** (`ORG_MEMBERSHIP_BASE_URL`) | Cache miss or Valkey unavailable — I-8 membership rebuild | `outbound/orgmembership/` | stale-if-error, capped 5 min | Stale `ae:ctx`/`ae:tenant` entry present → serve it (§7 row 2). No stale entry → `DENY_SERVICE_UNAVAILABLE` (§7 row 3) |
+| **Org & Membership** (`ORG_MEMBERSHIP_BASE_URL`) | Approver-gated requests only — I-14 MFA-freshness | `outbound/orgmembership/` | fail-closed | `DENY_MFA_STALE` — **never cached**; a sibling outage on this check is treated as "can't confirm freshness", not "service unavailable" |
+| **iam-tender-acl** (`TENDER_ACL_BASE_URL`) | Restricted tender-scoped requests only — TAC-4 tender-ACL | `outbound/orgmembership/` | fail-closed, overlay only | `DENY_TENDER_ACL_INSUFFICIENT` — never escalates to `DENY_SERVICE_UNAVAILABLE`; does not affect non-tender aspects of the same request |
+
+The common path at 95%+ cache-hit rate hits **Valkey only** — no synchronous sibling call at all.
+
+`mfa_freshness_seconds` is a **hard security invariant**: it is never written into `ae:ctx` or any other Valkey key. A code path that folds it into a cached envelope is a security regression, not a performance optimization — there is a dedicated regression test for this.
+
+### 2. Inbound callers (other services → this service)
+
+| Caller | Interface | Purpose |
+|---|---|---|
+| **Envoy** | gRPC `envoy.service.auth.v3.Authorization/Check` | The sole inbound interface — called on every authenticated request the gateway proxies. Envoy's `jwt_authn` validates the JWT first; this service reads only the already-validated metadata (`MetadataContext`), never raw headers |
+
+No other service calls this service directly. There is no REST or HTTP business API.
+
+### 3. Async event dependencies
+
+**Events this service consumes** (cache-invalidation only — no domain state of its own is mutated, nothing is published):
+
+| Queue | Producer | Event types | Action |
+|---|---|---|---|
+| `membership-authz-q` | Org & Membership | `DepartmentMembershipGranted`, `DepartmentMembershipRevoked`, `DepartmentMembershipLevelChanged`, `TenantRoleGranted`, `TenantRoleRevoked`, `MembershipRevoked` | Evict `ae:ctx`/`ae:neg` for the user; `MembershipRevoked` additionally performs a best-effort eviction of all `ae:tender_acl:{tenant}:*:{user}` entries — the whole-membership-removal cascade signal (LLD §16 AE-20) |
+| `user-authz-q` | User Profile (`iam-user-profile`) | `UserUpdated`, `UserAvailabilityChanged`, `UserDeleted` | Evict `ae:ctx`/`ae:neg`; `UserUpdated` only evicts if `"email"` appears in `changed_fields`; `UserDeleted` also evicts all `ae:tender_acl` entries for the user |
+| `billing-authz-q` | Billing Service | `TenantPlanChanged`, `TenantSubscriptionCancelled`, `TenantReactivated` | Evict `ae:tenant:{tenant}` — no payload decode beyond the envelope's `tenant_id` |
+| `tenant-authz-q` | Realm Provisioner | `TenantConverted`, `TenantRealmReady` | Update in-process realm→tenant map; `TenantConverted` also evicts `ae:tenant:{tenant}` (realm strategy changed) |
+| `tender-authz-q` | Tender Service | `TenderRestricted` | Mark `(tenant, tender_id)` restricted in in-process `RestrictedTenderSet` — gates whether TAC-4 is called on subsequent tender-scoped `Check()` calls |
+
+**Events this service produces:** **None.** This service is a pure consumer. `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner` are never called (HLD §5.4 / EVT-2). The full machine-readable consumer contract is [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `GET /asyncapi`.
+
+### 4. Infrastructure dependencies
+
+| System | Role |
+|---|---|
+| **Valkey** (Redis-compatible) | The only persistent-ish state this service touches — `ae:ctx`, `ae:tenant`, `ae:tender_acl`, `ae:neg`, `ae:processed` cache keys; no database, no ORM, no migrations |
+| **AWS SQS** (5 queues + 5 DLQs) | `membership-authz-q`, `user-authz-q`, `billing-authz-q`, `tenant-authz-q`, `tender-authz-q`; DLQ via SQS-native `maxReceiveCount=5` redrive — no application-layer DLQ code; a DLQ'd message degrades to a stale cache entry until its TTL expires, not a correctness failure |
+| **Envoy** (inbound only) | The API gateway / service mesh proxy — the sole caller of `Authorization.Check`. `jwt_authn` validates JWTs upstream; this service reads only Envoy-injected `MetadataContext`, never raw headers |
 
 ---
 
@@ -293,7 +343,10 @@ make vuln-check         # govulncheck over ./... — exceptions only via .github
 make metrics-check      # observability standard: naming, governance, metricslint, inventory + PrometheusRule drift, alert tests
 make metrics-inventory  # regenerate docs/observability/metric-registry.md (never edit it by hand)
 make prometheusrule     # regenerate the Helm PrometheusRule from deploy/monitoring/app-alerts.yml
-make ci                 # the full local gate: tidy + fmt-check + vet + lint + arch-lint + metrics-check + test-ci + build
+make ci                 # the full local gate: tidy + fmt-check + vet + lint + arch-lint + observability/database/events/image-pin lints + metrics-check + test-ci + build
+make observability-lint # enforce all logs/metrics/traces pass through platform-gincommon only
+make database-lint      # enforce all DB connections/config/ops pass through platform-pgcommon only
+make events-lint        # enforce all SQS events/outbox/dedup pass through platform-events only
 ```
 
 ### Exercising the gRPC API locally
@@ -571,19 +624,20 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `APP_ENV` | `dev` | One of `local`, `dev`, `test`, `staging`, `prod` (Enterprise Platform Observability Standard; `production`/`development` fail startup). It is the `environment` label on every metric. When unset, `ENVIRONMENT` is used (trimmed, lowercased — the precedence the platform libraries apply on their own), then `dev` |
 | `OBSERVABILITY_DOMAIN` | `iam` | Registry domain for the `{domain, service, environment}` metric labels; `cmd/server` also sets `iam` explicitly |
 | `APP_PORT` / `METRICS_PORT` / `GRPC_PORT` | `8080` / `9090` / `9091` | HTTP (health only), metrics (`/metrics`, separate listener), and gRPC (`ext_authz`) listen ports |
-| `VALKEY_URL` | `localhost:6379` | `.env-example` recommends `localhost:6384` for local dev (matches `docker-compose.yml`'s host-mapped port so it doesn't collide with a system-wide Redis/Valkey on the default port); `rediss://` for TLS in-transit in prod/staging. A value containing `://` must parse as a `redis://`/`rediss://` URL or startup fails — an unparseable one would otherwise fall back to a plain address with TLS off |
+| `VALKEY_URL` | `localhost:6379` | `.env-example` recommends `localhost:6384` for local dev (matches `docker-compose.yml`'s host-mapped port so it doesn't collide with a system-wide Redis/Valkey on the default port); **must use the `rediss://` scheme (TLS) outside `APP_ENV=dev`** — startup fails fast on a plaintext URL in non-dev, since the cache holds authorization context. A value containing `://` must parse as a `redis://`/`rediss://` URL or startup fails — an unparseable one would otherwise fall back to a plain address with TLS off |
 | `VALKEY_DIAL_TIMEOUT` / `VALKEY_READ_TIMEOUT` / `VALKEY_WRITE_TIMEOUT` | `20ms` / `10ms` / `10ms` | Request-path Valkey client — sized for the 15ms p99 decision budget (§11.1) |
 | `VALKEY_EVENT_TIMEOUT` | `500ms` | Dial/read/write timeout of the separate Valkey client SQS event processing uses (evictions, `ae:restricted`/`ae:realm` writes, the `ae:processed` ledger). The request path keeps `VALKEY_*_TIMEOUT` (10ms); an eviction has no latency budget, and failing one delays it a whole visibility timeout. Must be positive |
-| `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=prod`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled |
+| `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=prod`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled; startup warns when `DOCS_ENABLED=true` in prod without `DOCS_AUTH_TOKEN` |
 | `AE_CTX_TTL` / `AE_CTX_JITTER` | `60s` / `6s` | §4.1 — desyncs expiry across replicas |
 | `AE_TENDER_ACL_TTL` / `AE_NEG_TTL` | `15s` / `5s` | Half the sibling's own TTL / negative-cache storm collapse |
 | `AE_RESTRICTED_NEG_TTL` / `AE_REALM_NEG_TTL` | `5s` each | L1 negative-cache TTLs for `RestrictedTenderSet`/`RealmMap` — separate from `AE_NEG_TTL` since each bounds a distinct security-propagation delay (how fast a replica notices another replica's write), not a shared performance knob |
+| `AE_PROCESSED_EVENT_TTL` | `192h` (8 days) | PE-1: must be strictly > 7-day SQS message lifetime to guarantee redelivered messages are still recognized as processed |
 | `AE_STALE_IF_ERROR_MAX_AGE` | `5m` | Hard-capped at 5m regardless of configured value (§7) |
 | `ORG_MEMBERSHIP_BASE_URL` / `_TIMEOUT` | `http://localhost:8081` / `40ms` | I-8/I-14. Covers Org & Membership's own I-8 p99 targets (15ms cache hit, 30ms miss) plus the mesh hop — a shorter timeout fails healthy calls (LLD §16 AE-37) |
 | `GRPC_REQUEST_TIMEOUT` | `250ms` | Server-side cap on each `Check` (`grpccommon.TimeoutUnaryInterceptor`); Envoy's own shorter `grpc-timeout` wins. Must be positive |
 | `GOMEMLIMIT` | _(unset)_ (Helm: `230MiB`) | Go runtime soft heap limit, ~90% of the container memory limit |
 | `TENDER_ACL_BASE_URL` / `TENDER_ACL_TIMEOUT` | `http://localhost:8086` / `30ms` | TAC-4 (formerly I-12) against iam-tender-acl, ADR-0007 Wave 3 Phase 4 — sized against that service's own 5ms-hit/20ms-miss SLO, not reused from `ORG_MEMBERSHIP_TIMEOUT` |
-| `SHARED_REALM_ISSUER` | _(empty)_ | Keycloak issuer for the shared trial realm |
+| `SHARED_REALM_ISSUER` | _(empty)_ | Keycloak issuer for the shared trial realm. **At least one of `SHARED_REALM_ISSUER` or `REALM_TENANT_MAP_SEED` must be set outside `APP_ENV=dev`** — both empty causes a startup failure (every request would silently return `DENY_MALFORMED_IDENTITY`) |
 | `REALM_TENANT_MAP_SEED` | `{}` | Startup-only JSON seed for dedicated realms; kept fresh at runtime by events, never re-read |
 | `JWT_METADATA_NAMESPACE` / `JWT_PAYLOAD_KEY` | `envoy.filters.http.jwt_authn` / `trial` | Must match the Envoy `jwt_authn` filter config |
 | `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups (`APP_ENV=dev` only — required, and must be pairwise distinct, outside dev; `config.Load()` fails fast otherwise) |
@@ -601,7 +655,14 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `OTEL_TRACES_SAMPLER_RATIO` / `OTEL_PROPAGATOR_BAGGAGE` / `OTEL_TRACES_IGNORE_REMOTE_PARENT_SAMPLED` | `0.1` / `false` / `false` | platform-gincommon sampling and propagation (same values as iam-org-membership) |
 | `LOG_LEVEL` / `LOG_SAMPLING` | `debug` in `local`/`dev`, else `info` / `false` | platform-gincommon logger |
 
-Startup fails fast (not silently) if `ORG_MEMBERSHIP_BASE_URL` or `TENDER_ACL_BASE_URL` is left at its local-dev default (`http://localhost:8081` / `http://localhost:8086`) outside `APP_ENV=dev` — see `docs/runbook.md`.
+Startup fails fast (not silently) on all of the following outside `APP_ENV=dev`:
+- `ORG_MEMBERSHIP_BASE_URL` or `TENDER_ACL_BASE_URL` left at its local-dev default
+- `VALKEY_URL` without `rediss://` scheme (authorization context must be encrypted in transit)
+- Both `SHARED_REALM_ISSUER` and `REALM_TENANT_MAP_SEED` empty (no tenant-resolution path)
+- Any of the five `*_AUTHZ_QUEUE_URL` vars blank
+- Any two queue URLs set to the same value
+
+See `docs/runbook.md` for startup-failure troubleshooting.
 
 **In Kubernetes** the Helm chart sets both to the siblings' real Services — `http://iam-org-membership.iam.svc.cluster.local:8080` and `http://iam-tender-acl.iam.svc.cluster.local:8080` (IAM convention: namespace `iam`, Service named after the repo, port 8080) — and `networkPolicy.upstreamEgress` allows egress only to those two services' pods on 8080 (`app.kubernetes.io/name: iam-org-membership` / `tender-acl`; iam-tender-acl's pods carry its chart name, not its Service name). Override both per environment if a cluster differs. iam-tender-acl only admits TAC-4 callers it lists: its `networkPolicy.internalCallerPodSelectors` must include `app.kubernetes.io/name: iam-authz-enrichment` (iam-tender-acl README "Onboarding a TAC-4 caller").
 

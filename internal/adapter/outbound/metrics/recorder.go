@@ -43,6 +43,8 @@ type Recorder struct {
 	i8Latency        *gincommon.HistogramVec
 	i12Latency       *gincommon.HistogramVec
 	i14Latency       *gincommon.HistogramVec
+	tac4ErrorsTotal  gincommon.Counter
+	evictionErrors   *gincommon.CounterVec
 }
 
 // latencyBuckets is 0.5ms .. ~16s (16 exponential buckets, factor 2) —
@@ -100,6 +102,10 @@ func New(reg gincommon.Registerer) (*Recorder, error) {
 			"iam-tender-acl TAC-4 (formerly Org & Membership's I-12) tender-ACL call latency; name kept for continuity (LLD §16 AE-19)."),
 		i14Latency: b.histogram("iam_authz_enrichment_i14_call_latency_seconds",
 			"Org & Membership MFA-freshness (I-14) call latency."),
+		tac4ErrorsTotal: b.counter("iam_authz_enrichment_tac4_errors_total",
+			"GetTenderACL (TAC-4) errors — iam-tender-acl dependency failures that made the tender-ACL overlay fail closed. Distinct from legitimate DENY_TENDER_ACL_INSUFFICIENT policy denials."),
+		evictionErrors: b.counterVec("iam_authz_enrichment_eviction_errors_total",
+			"Best-effort EvictTenderACLForUser failures, by event. A nonzero rate means ae:tender_acl entries for revoked/deleted users may persist until their 15s TTL.", "event"),
 	}
 	if err := errors.Join(b.errs...); err != nil {
 		return nil, fmt.Errorf("register iam_authz_enrichment metrics: %w", err)
@@ -169,6 +175,11 @@ func (r *Recorder) ObserveNegativeCacheHit(hit bool) {
 
 func (r *Recorder) ObserveStaleIfErrorServed()    { r.staleServedTotal.Inc() }
 func (r *Recorder) ObserveSingleflightCoalesced() { r.sfCoalescedTotal.Inc() }
+func (r *Recorder) ObserveTACDependencyError()    { r.tac4ErrorsTotal.Inc() }
+
+func (r *Recorder) ObserveEvictionError(event string) {
+	r.evictionErrors.WithLabelValues(event).Inc()
+}
 
 func (r *Recorder) ObserveI8Latency(d time.Duration) {
 	r.i8Latency.WithLabelValues().Observe(d.Seconds())

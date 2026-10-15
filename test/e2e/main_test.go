@@ -135,12 +135,25 @@ func runMain(m *testing.M) int {
 		// hides it for the 30s visibility timeout — longer than any
 		// eventually() window here, so the tender-ACL test failed
 		// intermittently. A 1s wait lets abandoned polls expire before the
-		// next run starts, and a 5s visibility timeout recovers any message
-		// that is still lost well inside the 10s windows. (In production this
-		// is ordinary at-least-once behaviour during a rolling restart: such
-		// a message is redelivered after one visibility timeout.)
+		// next run starts, and a 3s visibility timeout recovers any message
+		// that is still lost — or whose handler failed on first delivery
+		// (e.g. a transient Valkey write timeout) — well inside the 15s
+		// windows. (In production this is ordinary at-least-once behaviour
+		// during a rolling restart: such a message is redelivered after one
+		// visibility timeout.)
 		"SQS_WAIT_SECONDS=1",
-		"SQS_VISIBILITY_TIMEOUT=5s",
+		"SQS_VISIBILITY_TIMEOUT=3s",
+		// Concurrency=1 per queue (5 total goroutines vs the production
+		// default of 4 per queue = 20). Reduces LocalStack saturation in CI.
+		"MEMBERSHIP_AUTHZ_QUEUE_CONCURRENCY=1",
+		"USER_AUTHZ_QUEUE_CONCURRENCY=1",
+		"BILLING_AUTHZ_QUEUE_CONCURRENCY=1",
+		"TENANT_AUTHZ_QUEUE_CONCURRENCY=1",
+		"TENDER_AUTHZ_QUEUE_CONCURRENCY=1",
+		// Valkey timeouts: the default 10ms is too tight when Valkey is under
+		// load after the integration test suite runs in the same job.
+		"VALKEY_WRITE_TIMEOUT=500ms",
+		"VALKEY_READ_TIMEOUT=500ms",
 	)
 	cmd.Stdout = &logs
 	cmd.Stderr = &logs
@@ -155,6 +168,15 @@ func runMain(m *testing.M) int {
 		fmt.Fprintf(os.Stderr, "e2e: server never became healthy: %v\nserver output:\n%s\n", err, logs.String())
 		return 1
 	}
+
+	// Allow 3 seconds for the SQS consumers to start their first long-poll
+	// sessions and register with LocalStack. Without this, a test that sends
+	// an SQS event immediately after healthz passes may send the message
+	// before LocalStack has registered the polling connection — meaning
+	// LocalStack cannot wake up the poll, and the message is only delivered
+	// after the 20s poll window expires (past the test's eventually() timeout).
+	// 3s is well within LocalStack's connection registration time in CI.
+	time.Sleep(3 * time.Second)
 
 	conn, err := grpc.NewClient("127.0.0.1:"+e2eGRPCPort, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {

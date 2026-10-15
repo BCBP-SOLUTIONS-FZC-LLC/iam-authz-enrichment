@@ -132,15 +132,42 @@ spec:
             severity: warning
             team: platform
           annotations:
-            summary: iam-authz-enrichment is denying requests due to a dependency failure
+            summary: iam-authz-enrichment is denying requests due to an Org & Membership or Valkey failure
             description: >-
               A sustained rate of DENY_SERVICE_UNAVAILABLE in {{ "{{ $labels.environment }}" }}
-              means §7's failure-handling matrix is fail-closing on a dependency outage
-              outside the stale-if-error grace window, or the tender-ACL overlay's
-              independent fail-closed rule is firing on TAC-4 failures. Check
-              Org & Membership, iam-tender-acl and Valkey health.
+              means §7's failure-handling matrix is fail-closing on an Org & Membership
+              or Valkey outage outside the stale-if-error grace window. Check
+              Org & Membership and Valkey health. iam-tender-acl (TAC-4) outages
+              fail closed to DENY_TENDER_ACL_INSUFFICIENT instead and fire
+              AuthzEnrichmentTAC4ErrorSpike, not this alert.
               Rate: {{ "{{ $value | humanize }}" }}/s.
             runbook: "docs/observability/runbooks.md#authzenrichmentserviceunavailablespike"
+
+        # ── TAC-4 dependency errors (iam-tender-acl outage) ──────────────────────
+        # TAC-4 failures fail closed to DENY_TENDER_ACL_INSUFFICIENT (§7 row 4),
+        # never DENY_SERVICE_UNAVAILABLE, and never activate stale-if-error, so
+        # neither alert above sees them. iam_authz_enrichment_tac4_errors_total
+        # counts only resolveTenderACL's error path, not legitimate denials.
+        - alert: AuthzEnrichmentTAC4ErrorSpike
+          expr: |
+            sum by (domain, service, environment) (
+              rate(iam_authz_enrichment_tac4_errors_total{domain="iam", service="iam-authz-enrichment"}[5m])
+            ) > 0
+          for: 1m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-authz-enrichment TAC-4 (iam-tender-acl) errors — tender-ACL overlay failing closed
+            description: >-
+              iam_authz_enrichment_tac4_errors_total is increasing in
+              {{ "{{ $labels.environment }}" }}: GetTenderACL is returning errors and the
+              tender-ACL overlay is failing closed with DENY_TENDER_ACL_INSUFFICIENT
+              for every restricted-tender request. Legitimate access-control denials
+              do not increment this counter. Check iam-tender-acl health and
+              iam_authz_enrichment_i12_call_latency_seconds.
+              Rate: {{ "{{ $value | humanize }}" }}/s.
+            runbook: "docs/observability/runbooks.md#authzenrichmenttac4errorspike"
 
     - name: iam_authz_enrichment_cache
       rules:

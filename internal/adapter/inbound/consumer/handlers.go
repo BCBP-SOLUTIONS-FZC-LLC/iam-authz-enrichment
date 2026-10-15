@@ -44,9 +44,9 @@ func NewMembershipConsumer(queueURL string, deps Deps, opts ...events.ConsumerOp
 	return buildConsumer(queueURL, deps, membershipHandler(deps), opts...)
 }
 
-// userHandler implements user-authz-q (§5): UserUpdated (email changes
-// only — filtered via UserEventPayload.IsEmailChange, not an SNS attribute
-// filter), UserAvailabilityChanged, UserDeleted.
+// userHandler implements user-authz-q (§5): UserUpdated (email or status
+// changes — filtered via UserEventPayload.RequiresEviction, not an SNS
+// attribute filter), UserAvailabilityChanged, UserDeleted.
 func userHandler(deps Deps) events.Handler {
 	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 		switch env.Type {
@@ -94,25 +94,36 @@ func NewBillingConsumer(queueURL string, deps Deps, opts ...events.ConsumerOptio
 	return buildConsumer(queueURL, deps, billingHandler(deps), opts...)
 }
 
-// tenantHandler implements tenant-authz-q (§5): TenantConverted (evicts +
-// refreshes the realm map) and TenantRealmReady (refreshes the realm map
-// only — no ae:ctx eviction). Both must be wired: a direct-paid-signup
-// tenant fires only TenantRealmReady.
+// tenantHandler implements tenant-authz-q (§5). It handles two families:
+//
+//   - TenantConverted / TenantRealmReady (Realm Provisioner provisioning
+//     paths RP-2/RP-3) — decode the `realm` field, update the in-process
+//     realm→tenant map; TenantConverted additionally evicts ae:tenant.
+//
+//   - TenantSuspended / TenantReactivated (operator, RP-10/RP-14) /
+//     TenantOffboarded / TrialExpired / TrialReactivated — no payload
+//     decode needed; evict ae:tenant so the next Check fetches fresh tenant
+//     context (plan, feature_flags, subscription_status, read_only). Note:
+//     the billing-sourced TenantReactivated is handled separately on
+//     billing-authz-q; this handler covers only the operator-sourced one
+//     from iam-tenant-events.
 func tenantHandler(deps Deps) events.Handler {
 	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
-		var p usecase.TenantRealmEventPayload
 		switch env.Type {
 		case "TenantConverted", "TenantRealmReady":
+			var p usecase.TenantRealmEventPayload
 			if err := json.Unmarshal(env.Payload, &p); err != nil {
 				return fmt.Errorf("decode %s payload: %w", env.Type, err)
 			}
+			if env.Type == "TenantConverted" {
+				return deps.Invalidator.HandleTenantConverted(ctx, env.TenantID, p)
+			}
+			return deps.Invalidator.HandleTenantRealmReady(ctx, env.TenantID, p)
+		case "TenantSuspended", "TenantReactivated", "TenantOffboarded", "TrialExpired", "TrialReactivated":
+			return deps.Invalidator.HandleTenantLifecycleEvent(ctx, env.TenantID)
 		default:
 			return ackUnknown(deps.Log, env)
 		}
-		if env.Type == "TenantConverted" {
-			return deps.Invalidator.HandleTenantConverted(ctx, env.TenantID, p)
-		}
-		return deps.Invalidator.HandleTenantRealmReady(ctx, env.TenantID, p)
 	}
 }
 

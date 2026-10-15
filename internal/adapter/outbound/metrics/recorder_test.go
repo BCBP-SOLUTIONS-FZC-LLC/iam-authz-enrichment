@@ -88,6 +88,8 @@ func TestNew_AppliesGincommonConstLabels(t *testing.T) {
 	r.ObserveI8Latency(time.Millisecond)
 	r.ObserveI12Latency(time.Millisecond)
 	r.ObserveI14Latency(time.Millisecond)
+	r.ObserveTACDependencyError()
+	r.ObserveEvictionError("membership_revoked")
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
@@ -194,4 +196,26 @@ func TestObserveLatencies(t *testing.T) {
 	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i12Latency))
 	assert.Equal(t, uint64(1), histogramSampleCount(t, r.i14Latency))
 	assert.Equal(t, uint64(1), histogramSampleCount(t, r.decisionLatency))
+}
+
+func TestObserveTACDependencyError(t *testing.T) {
+	t.Parallel()
+	r := newTestRecorder(t)
+
+	r.ObserveTACDependencyError()
+	r.ObserveTACDependencyError()
+
+	assert.Equal(t, float64(2), testutil.ToFloat64(r.tac4ErrorsTotal))
+}
+
+func TestObserveEvictionError_ByEvent(t *testing.T) {
+	t.Parallel()
+	r := newTestRecorder(t)
+
+	r.ObserveEvictionError("membership_revoked")
+	r.ObserveEvictionError("membership_revoked")
+	r.ObserveEvictionError("user_deleted")
+
+	assert.Equal(t, float64(2), testutil.ToFloat64(r.evictionErrors.WithLabelValues("membership_revoked")))
+	assert.Equal(t, float64(1), testutil.ToFloat64(r.evictionErrors.WithLabelValues("user_deleted")))
 }
