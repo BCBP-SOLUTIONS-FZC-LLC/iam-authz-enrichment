@@ -101,18 +101,24 @@ func TestInvalidator_MembershipRevoked_EvictsCtxNegativeAndTenderACL(t *testing.
 	}, cache.SortedCalls())
 }
 
-func TestInvalidator_UserUpdated_OnlyEvictsOnEmailChange(t *testing.T) {
+func TestInvalidator_UserUpdated_OtherChange_IsNoOp(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
 	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 
 	err := inv.HandleUserUpdated(context.Background(), "tenant-1", usecase.UserEventPayload{
-		UserID: "alice", ChangedFields: []string{"display_name"},
+		UserID: "alice", ChangedFields: []string{"display_name", "job_title", "timezone"},
 	})
 	require.NoError(t, err)
-	assert.Empty(t, cache.SortedCalls(), "a non-email change must be a no-op (§5)")
+	assert.Empty(t, cache.SortedCalls(), "a change to a non-eviction field must be a no-op (§5)")
+}
 
-	err = inv.HandleUserUpdated(context.Background(), "tenant-1", usecase.UserEventPayload{
+func TestInvalidator_UserUpdated_EmailChange_Evicts(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+
+	err := inv.HandleUserUpdated(context.Background(), "tenant-1", usecase.UserEventPayload{
 		UserID: "alice", ChangedFields: []string{"display_name", "email"},
 	})
 	require.NoError(t, err)
@@ -120,6 +126,41 @@ func TestInvalidator_UserUpdated_OnlyEvictsOnEmailChange(t *testing.T) {
 		"EvictMembershipContext:tenant-1:alice",
 		"EvictNegative:tenant-1:alice",
 	}, cache.SortedCalls())
+}
+
+// TestInvalidator_UserUpdated_StatusChange_Evicts is the regression test for
+// UP-AE-GAP-001: when a user is disabled, iam-user-profile fires UserUpdated
+// with changed_fields=["status"] (alongside UserStatusChanged, which
+// user-authz-q does not subscribe to). Without evicting on "status", the
+// ae:ctx entry would serve stale Allow decisions for up to AE_CTX_TTL.
+func TestInvalidator_UserUpdated_StatusChange_Evicts(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+
+	err := inv.HandleUserUpdated(context.Background(), "tenant-1", usecase.UserEventPayload{
+		UserID: "alice", ChangedFields: []string{"status"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"EvictMembershipContext:tenant-1:alice",
+		"EvictNegative:tenant-1:alice",
+	}, cache.SortedCalls(), "a status change (user disabled/re-enabled) must evict ae:ctx")
+}
+
+func TestInvalidator_UserUpdated_StatusAndEmailChange_Evicts(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+
+	err := inv.HandleUserUpdated(context.Background(), "tenant-1", usecase.UserEventPayload{
+		UserID: "alice", ChangedFields: []string{"status", "email"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"EvictMembershipContext:tenant-1:alice",
+		"EvictNegative:tenant-1:alice",
+	}, cache.SortedCalls(), "eviction fires once regardless of how many trigger fields are present")
 }
 
 func TestInvalidator_UserAvailabilityChanged_Evicts(t *testing.T) {
@@ -273,6 +314,53 @@ func TestInvalidator_TenantRealmReady_StoreError(t *testing.T) {
 	inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 
 	err := inv.HandleTenantRealmReady(context.Background(), "tenant-1", usecase.TenantRealmEventPayload{Realm: "realm-1"})
+	require.Error(t, err)
+}
+
+// CD-37 / §16 AE-38: TenantSettingChanged evicts ae:tenant so residency_mode
+// and other tenant settings propagate without waiting for the TTL.
+func TestInvalidator_TenantSettingChanged_EvictsTenantSliceOnly(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+
+	err := inv.HandleTenantSettingChanged(context.Background(), "tenant-1")
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls(),
+		"a TenantSettingChanged event must evict only the tenant-scoped cache slice, never per-user ae:ctx")
+}
+
+// §5 / AE-RP-GAP-002..006: lifecycle events from Realm Provisioner (TenantSuspended,
+// TenantReactivated operator-sourced, TenantOffboarded, TrialExpired, TrialReactivated)
+// must all evict ae:tenant and nothing else — no realm map update, no per-user eviction.
+func TestInvalidator_TenantLifecycleEvent_EvictsTenantSliceOnly(t *testing.T) {
+	t.Parallel()
+	for _, eventType := range []string{
+		"TenantSuspended", "TenantReactivated", "TenantOffboarded", "TrialExpired", "TrialReactivated",
+	} {
+		t.Run(eventType, func(t *testing.T) {
+			t.Parallel()
+			cache := fixtures.NewFakeCache()
+			inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+
+			err := inv.HandleTenantLifecycleEvent(context.Background(), "tenant-1")
+
+			require.NoError(t, err)
+			assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls(),
+				"%s must be a single ae:tenant eviction — never touching per-user ae:ctx or ae:neg", eventType)
+		})
+	}
+}
+
+func TestInvalidator_TenantLifecycleEvent_EvictError_Propagates(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.EvictTenantErr = errors.New("valkey down")
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+
+	err := inv.HandleTenantLifecycleEvent(context.Background(), "tenant-1")
+
 	require.Error(t, err)
 }
 

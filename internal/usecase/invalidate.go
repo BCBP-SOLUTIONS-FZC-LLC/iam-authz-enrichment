@@ -82,22 +82,36 @@ type UserEventPayload struct {
 	ChangedFields []string `json:"changed_fields,omitempty"`
 }
 
-// IsEmailChange reports whether a UserUpdated event's changed_fields
-// includes "email" — the §5-mandated consumer-side filter (deliberately not
-// an SNS attribute filter).
-func (p UserEventPayload) IsEmailChange() bool {
+// RequiresEviction reports whether a UserUpdated event's changed_fields
+// contains a value that invalidates the AE decision cache. Two values trigger
+// eviction:
+//
+//   - "email" — the subject's identity key in Org & Membership's I-8 response
+//     changes, so the cached ae:ctx entry is stale.
+//   - "status" — the user has been enabled or disabled; a disabled user can no
+//     longer authenticate and Org & Membership's I-8 will return 404 on the
+//     next live call. Without evicting on "status", the ae:ctx entry would
+//     serve stale Allow decisions for up to AE_CTX_TTL after the user is
+//     disabled. UserUpdated with changed_fields=["status"] fires in the same
+//     UP transaction as UserStatusChanged, but user-authz-q only subscribes to
+//     UserUpdated — this consumer-side check is the only eviction path for a
+//     status change (UP-AE-GAP-001).
+//
+// All other changed_fields values (display_name, job_title, timezone, …) are
+// no-ops — they do not affect any fact the AE decision cache holds.
+func (p UserEventPayload) RequiresEviction() bool {
 	for _, f := range p.ChangedFields {
-		if f == "email" {
+		if f == "email" || f == "status" {
 			return true
 		}
 	}
 	return false
 }
 
-// HandleUserUpdated evicts only on an email change (§5) — any other
+// HandleUserUpdated evicts on an email or status change (§5); any other
 // changed_fields value is a no-op.
 func (inv *Invalidator) HandleUserUpdated(ctx context.Context, tenant string, p UserEventPayload) error {
-	if !p.IsEmailChange() {
+	if !p.RequiresEviction() {
 		return nil
 	}
 	return inv.evictUserContext(ctx, tenant, p.UserID)
@@ -136,6 +150,27 @@ func (inv *Invalidator) evictUserContext(ctx context.Context, tenant, user strin
 // TenantSubscriptionCancelled, TenantReactivated): evict the tenant-scoped
 // slice — one key, regardless of which of the three event types fired.
 func (inv *Invalidator) HandleBillingEvent(ctx context.Context, tenant string) error {
+	return inv.cache.EvictTenantContext(ctx, tenant)
+}
+
+// HandleTenantSettingChanged implements tenant-authz-q TenantSettingChanged
+// (CD-37, LLD §16 AE-38): a tenant-owner changed a setting such as
+// residency_mode, so the ae:tenant entry is stale. Evict it; the next
+// request will rebuild from I-8 and pick up the new value. No payload
+// decoding needed — the tenant_id on the envelope is the only fact required.
+func (inv *Invalidator) HandleTenantSettingChanged(ctx context.Context, tenant string) error {
+	return inv.cache.EvictTenantContext(ctx, tenant)
+}
+
+// HandleTenantLifecycleEvent evicts ae:tenant:{tenant} for any Realm
+// Provisioner lifecycle event that changes tenant status (§5): TenantSuspended,
+// TenantReactivated (operator-sourced, distinct from the billing-sourced
+// TenantReactivated handled on billing-authz-q), TenantOffboarded,
+// TrialExpired, TrialReactivated. All arrive on tenant-authz-q via the
+// iam-tenant-events SNS topic. No payload decode needed — the eviction is
+// driven entirely by the envelope's tenant_id; the ae:tenant entry rebuilds
+// fresh from I-8 on the next Check.
+func (inv *Invalidator) HandleTenantLifecycleEvent(ctx context.Context, tenant string) error {
 	return inv.cache.EvictTenantContext(ctx, tenant)
 }
 

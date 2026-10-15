@@ -31,18 +31,19 @@ import (
 // constructor API has only NewHistogramVec; Observe goes through
 // WithLabelValues() with no values.
 type Recorder struct {
-	decisionsTotal   *gincommon.CounterVec
-	denyReasonTotal  *gincommon.CounterVec
-	decisionLatency  *gincommon.HistogramVec
-	cacheLookups     gincommon.Counter
-	cacheHits        gincommon.Counter
-	negCacheLookups  gincommon.Counter
-	negCacheHits     gincommon.Counter
-	staleServedTotal gincommon.Counter
-	sfCoalescedTotal gincommon.Counter
-	i8Latency        *gincommon.HistogramVec
-	i12Latency       *gincommon.HistogramVec
-	i14Latency       *gincommon.HistogramVec
+	decisionsTotal        *gincommon.CounterVec
+	denyReasonTotal       *gincommon.CounterVec
+	decisionLatency       *gincommon.HistogramVec
+	cacheLookups          gincommon.Counter
+	cacheHits             gincommon.Counter
+	negCacheLookups       gincommon.Counter
+	negCacheHits          gincommon.Counter
+	staleServedTotal      gincommon.Counter
+	sfCoalescedTotal      gincommon.Counter
+	i8Latency             *gincommon.HistogramVec
+	i12Latency            *gincommon.HistogramVec
+	i14Latency            *gincommon.HistogramVec
+	residencyUnknownTotal gincommon.Counter
 }
 
 // latencyBuckets is 0.5ms .. ~16s (16 exponential buckets, factor 2) —
@@ -100,6 +101,8 @@ func New(reg gincommon.Registerer) (*Recorder, error) {
 			"iam-tender-acl TAC-4 (formerly Org & Membership's I-12) tender-ACL call latency; name kept for continuity (LLD §16 AE-19)."),
 		i14Latency: b.histogram("iam_authz_enrichment_i14_call_latency_seconds",
 			"Org & Membership MFA-freshness (I-14) call latency."),
+		residencyUnknownTotal: b.counter("iam_authz_enrichment_authz_residency_unknown_total",
+			"Allow decisions where Core returned an unrecognised residency_mode; the fail-safe 'strict' default was applied (LLD §16 AE-38, CD-37). A persistent nonzero rate means Core has not yet deployed the CD-37 field or is sending an unexpected value."),
 	}
 	if err := errors.Join(b.errs...); err != nil {
 		return nil, fmt.Errorf("register iam_authz_enrichment metrics: %w", err)
@@ -183,3 +186,5 @@ func (r *Recorder) ObserveI14Latency(d time.Duration) {
 func (r *Recorder) ObserveDecisionLatency(d time.Duration) {
 	r.decisionLatency.WithLabelValues().Observe(d.Seconds())
 }
+
+func (r *Recorder) ObserveResidencyUnknown() { r.residencyUnknownTotal.Inc() }

@@ -3,9 +3,3 @@
 #   <OSV id> <expires YYYY-MM-DD> <reason>
 # An entry stops applying on its expiry date, so CI fails again and the
 # exception has to be re-justified or the dependency upgraded. Keep this short.
-
-# google.golang.org/grpc server panic on a request missing :authority/Host.
-# Fixed only in grpc pre-release builds (v1.85.0-dev); no released version
-# yet. Mitigated: the NetworkPolicy admits only Envoy to the gRPC port, and
-# Envoy always sends :authority. Upgrade to grpc v1.85.0 when it ships.
-GO-2026-6443 2026-11-15 grpc server panic, no released fix; ingress limited to Envoy

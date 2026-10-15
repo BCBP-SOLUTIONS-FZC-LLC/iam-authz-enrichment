@@ -65,6 +65,7 @@ Built in `internal/adapter/outbound/metrics/recorder.go`. All latency histograms
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
+| `iam_authz_enrichment_authz_residency_unknown_total` | counter | - | Allow decisions where Core returned an unrecognised residency_mode; the fail-safe 'strict' default was applied (LLD §16 AE-38, CD-37). A persistent nonzero rate means Core has not yet deployed the CD-37 field or is sending an unexpected value. |
 | `iam_authz_enrichment_cache_hits_total` | counter | - | ae:ctx/ae:tenant lookups that were a fresh hit. |
 | `iam_authz_enrichment_cache_lookups_total` | counter | - | Total ae:ctx/ae:tenant lookups. Divide iam_authz_enrichment_cache_hits_total by this for the hit ratio. |
 | `iam_authz_enrichment_decision_latency_seconds` | histogram | - | End-to-end Check() decision latency. Design budget: 15ms p99 (LLD §11.1). |

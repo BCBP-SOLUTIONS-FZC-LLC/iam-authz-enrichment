@@ -298,9 +298,11 @@ flowchart TD
         i2["UserUpdated(email) / UserAvailabilityChanged → DEL ae:ctx + DEL ae:neg"]
         i3["UserDeleted → DEL ae:ctx + DEL ae:neg + best-effort SCAN-DEL ae:tender_acl:*:{user}"]
         i4["TenantPlanChanged / *SubscriptionCancelled / *Reactivated → DEL ae:tenant ONLY"]
-        i5["TenantConverted → DEL ae:tenant + refresh realm map"]
-        i6["TenantRealmReady → refresh realm map ONLY, no eviction"]
-        i7["TenderRestricted → flips an in-memory fact, NOT a cache eviction"]
+        i5["TenantSettingChanged → DEL ae:tenant ONLY (CD-37)"]
+        i6["TenantConverted → DEL ae:tenant + refresh realm map"]
+        i7["TenantRealmReady → refresh realm map ONLY, no eviction"]
+        i8["TenantSuspended / *Reactivated(op) / *Offboarded / TrialExpired / TrialReactivated → DEL ae:tenant ONLY"]
+        i9["TenderRestricted → flips an in-memory fact, NOT a cache eviction"]
     end
 ```
 
@@ -376,9 +378,9 @@ sequenceDiagram
 | `user-authz-q` | `UserUpdated` (email changes only), `UserAvailabilityChanged`, `UserDeleted` | Evict `ae:ctx` + `ae:neg`; `UserDeleted` also best-effort-evicts `ae:tender_acl:*:{user}` |
 | `billing-authz-q` | `TenantPlanChanged`, `TenantSubscriptionCancelled`, `TenantReactivated` | Evict `ae:tenant:{tenant}` (single key) |
 | `tenant-authz-q` | `TenantConverted`, `TenantRealmReady` | Refresh the in-process realm map; `TenantConverted` also evicts `ae:tenant` |
+| `tenant-authz-q` | `TenantSettingChanged` (CD-37, §16 AE-38) | Evict `ae:tenant:{tenant}` — no payload decode; next Check rebuilds from I-8 with fresh `residency_mode` |
+| `tenant-authz-q` | `TenantSuspended`, `TenantReactivated` (operator-sourced), `TenantOffboarded`, `TrialExpired`, `TrialReactivated` (§16 AE-43) | Evict `ae:tenant:{tenant}` only — all route through `HandleTenantLifecycleEvent`, no payload decode |
 | `tender-authz-q` | `TenderRestricted` | Flip the in-memory restricted-tender fact — not a cache eviction |
-
-`TenantSuspended` is deliberately not consumed anywhere — a suspended tenant's realm is disabled, so no new token is issued and the request never reaches this service.
 
 **Why both `TenantConverted` and `TenantRealmReady` matter:** a tenant converting from shared-trial to dedicated fires `TenantConverted`. A tenant that signs up directly for a paid plan and gets a dedicated realm from day one fires *only* `TenantRealmReady`. Subscribing to just one leaves a real gap in the realm→tenant map.
 

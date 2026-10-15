@@ -696,3 +696,218 @@ func TestCheck_Singleflight_FirstCallerCancelled_OthersUnaffected(t *testing.T) 
 	assert.NotEqual(t, domain.DenyServiceUnavailable, decB.Reason, "a healthy request must not fail because another caller was cancelled")
 	assert.Equal(t, int64(1), atomic.LoadInt64(&org.MembershipCalls), "still one coalesced I-8 call")
 }
+
+// ─── read_only in x-feature-flags (§4.6 gap-closure contract) ───────────────
+
+// A cancelled-grace-period tenant: reads are allowed and x-feature-flags must
+// carry "read_only" so downstream services (LLM, Workflow, Tender) can adapt
+// their UI without a separate API call (IAM-to-Commercial §4.6).
+func TestCheck_Allow_ReadOnly_AppendsToFeatureFlags(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.TenantContext{
+		Plan:          "pro",
+		FeatureFlags:  []string{"sso_enabled"},
+		ReadOnly:      true,
+		ResidencyMode: "standard",
+	}, domain.CacheFresh)
+	checker := newTestChecker(cache, &fixtures.FakeOrgMembershipClient{}, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  baseClaims(),
+		Request: policy.RequestFacts{Method: "GET"},
+	})
+
+	require.True(t, decision.Allow)
+	assert.Equal(t, "sso_enabled,read_only", decision.Headers[domain.HeaderFeatureFlags],
+		"read_only sentinel must be appended to feature_flags on an allowed read for a cancelled-grace tenant")
+}
+
+// A non-cancelled tenant must never see "read_only" in x-feature-flags.
+func TestCheck_Allow_NotReadOnly_NoSentinelInFeatureFlags(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.TenantContext{
+		Plan:          "pro",
+		FeatureFlags:  []string{"sso_enabled"},
+		ReadOnly:      false,
+		ResidencyMode: "standard",
+	}, domain.CacheFresh)
+	checker := newTestChecker(cache, &fixtures.FakeOrgMembershipClient{}, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  baseClaims(),
+		Request: policy.RequestFacts{Method: "GET"},
+	})
+
+	require.True(t, decision.Allow)
+	assert.NotContains(t, decision.Headers[domain.HeaderFeatureFlags], "read_only",
+		"non-cancelled tenant must never have read_only in x-feature-flags")
+}
+
+// ─── CD-37: x-residency-mode header (LLD §16 AE-38) ─────────────────────────
+
+// residencyCountingRecorder counts ObserveResidencyUnknown calls; all other
+// methods are no-ops via the embedded NoopRecorder.
+type residencyCountingRecorder struct {
+	usecase.NoopRecorder
+	mu    sync.Mutex
+	count int
+}
+
+func (r *residencyCountingRecorder) ObserveResidencyUnknown() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.count++
+}
+
+func (r *residencyCountingRecorder) residencyUnknownCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.count
+}
+
+func allowedCheckWithResidency(residencyMode string) domain.Decision {
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.TenantContext{
+		Plan:          "enterprise",
+		FeatureFlags:  []string{},
+		ResidencyMode: residencyMode,
+	}, domain.CacheFresh)
+	checker := newTestChecker(cache, &fixtures.FakeOrgMembershipClient{}, nil)
+	return checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  baseClaims(),
+		Request: policy.RequestFacts{Method: "GET"},
+	})
+}
+
+func TestCheck_Allow_StandardResidency_HeaderInjected(t *testing.T) {
+	t.Parallel()
+	decision := allowedCheckWithResidency("standard")
+	require.True(t, decision.Allow)
+	assert.Equal(t, "standard", decision.Headers[domain.HeaderResidencyMode],
+		"x-residency-mode must carry the tenant's value when it is 'standard'")
+}
+
+func TestCheck_Allow_StrictResidency_HeaderInjected(t *testing.T) {
+	t.Parallel()
+	decision := allowedCheckWithResidency("strict")
+	require.True(t, decision.Allow)
+	assert.Equal(t, "strict", decision.Headers[domain.HeaderResidencyMode],
+		"x-residency-mode must carry the tenant's value when it is 'strict'")
+}
+
+func TestCheck_Allow_UnknownResidency_DefaultsToStrict_MetricIncremented(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	// Empty ResidencyMode simulates a pre-CD-37 Core or a stale cache entry.
+	cache.SeedTenantContext(tenant, domain.TenantContext{FeatureFlags: []string{}}, domain.CacheFresh)
+
+	rec := &residencyCountingRecorder{}
+	realmMap := usecase.NewRealmMap(map[string]string{dedicatedIssuer: tenant}, 5*time.Second)
+	checker := usecase.NewChecker(cache, &fixtures.FakeOrgMembershipClient{}, realmMap,
+		usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{}, rec,
+		usecase.CheckerConfig{SharedRealmIssuer: sharedRealmIssuer})
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  baseClaims(),
+		Request: policy.RequestFacts{Method: "GET"},
+	})
+
+	require.True(t, decision.Allow)
+	assert.Equal(t, "strict", decision.Headers[domain.HeaderResidencyMode],
+		"unknown residency_mode must fail-safe to strict")
+	assert.Equal(t, 1, rec.residencyUnknownCount(),
+		"authz_residency_unknown_total must be incremented exactly once")
+}
+
+func TestCheck_Allow_UnknownResidency_ExplicitlyBadValue_DefaultsToStrict(t *testing.T) {
+	t.Parallel()
+	// A future Core revision sends an unrecognised value — still must be
+	// treated as unknown and default to strict.
+	decision := allowedCheckWithResidency("lax")
+	require.True(t, decision.Allow)
+	assert.Equal(t, "strict", decision.Headers[domain.HeaderResidencyMode])
+}
+
+func TestCheck_Deny_NoResidencyHeader(t *testing.T) {
+	t.Parallel()
+	// On a Deny path, buildHeaders is never called — no x-residency-mode must
+	// appear in the decision's header map.
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.TenantContext{ReadOnly: true, FeatureFlags: []string{}, ResidencyMode: "strict"}, domain.CacheFresh)
+	checker := newTestChecker(cache, &fixtures.FakeOrgMembershipClient{}, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  baseClaims(),
+		Request: policy.RequestFacts{Method: "POST"},
+	})
+
+	assert.False(t, decision.Allow)
+	assert.Equal(t, domain.DenyTenantReadOnly, decision.Reason)
+	assert.Empty(t, decision.Headers, "deny decisions must carry no injected headers")
+}
+
+// ─── CD-28: dedicated_workflow_queue in x-feature-flags (LLD §16 AE-39) ─────
+
+// No new infrastructure is needed: flags arrive from Core's feature_flags[]
+// slice and flow through the existing x-feature-flags header unchanged.
+// This test pins that a tenant with the flag gets it in the header.
+func TestCheck_Allow_DedicatedWorkflowQueue_InFeatureFlags(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.TenantContext{
+		Plan:          "enterprise",
+		FeatureFlags:  []string{"sso_enabled", "dedicated_workflow_queue"},
+		ResidencyMode: "standard",
+	}, domain.CacheFresh)
+	checker := newTestChecker(cache, &fixtures.FakeOrgMembershipClient{}, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  baseClaims(),
+		Request: policy.RequestFacts{Method: "GET"},
+	})
+
+	require.True(t, decision.Allow)
+	flags := decision.Headers[domain.HeaderFeatureFlags]
+	assert.Contains(t, flags, "dedicated_workflow_queue",
+		"an enterprise tenant with dedicated_workflow_queue grant must see it in x-feature-flags")
+	assert.Contains(t, flags, "sso_enabled", "other flags must also be present")
+}
+
+// ─── CD-31: deny-code stability (LLD §16 AE-40) ──────────────────────────────
+
+// Pin the exact wire strings for every DenyReason. A future RFC 9457 migration
+// (CD-31) must not change these values — they are part of this service's
+// versioned runtime contract (VERSIONING.md).
+func TestDenyCodes_Pinned(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		reason domain.DenyReason
+		want   string
+		status int
+	}{
+		{domain.DenyUnresolvableSubject, "DENY_UNRESOLVABLE_SUBJECT", 403},
+		{domain.DenyTenantReadOnly, "DENY_TENANT_READ_ONLY", 403},
+		{domain.DenyMFAStale, "DENY_MFA_STALE", 403},
+		{domain.DenyTenderACLInsufficient, "DENY_TENDER_ACL_INSUFFICIENT", 403},
+		{domain.DenyRoleInsufficient, "DENY_ROLE_INSUFFICIENT", 403},
+		{domain.DenyServiceUnavailable, "DENY_SERVICE_UNAVAILABLE", 503},
+		{domain.DenyMalformedIdentity, "DENY_MALFORMED_IDENTITY", 401},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.reason), func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, string(tc.reason),
+				"DenyReason wire value is part of the versioned contract and must not change")
+			assert.Equal(t, tc.status, tc.reason.HTTPStatus(),
+				"HTTP status mapping for %s must not change", tc.reason)
+		})
+	}
+}

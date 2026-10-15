@@ -60,6 +60,10 @@ type Recorder interface {
 	ObserveI12Latency(d time.Duration)
 	ObserveI14Latency(d time.Duration)
 	ObserveDecisionLatency(d time.Duration)
+	// ObserveResidencyUnknown increments the counter for Allow decisions where
+	// Core returned an unrecognised residency_mode (empty or unknown value),
+	// triggering the fail-safe "strict" default (LLD §16 AE-38, CD-37).
+	ObserveResidencyUnknown()
 }
 
 // NoopRecorder implements Recorder with no side effects.
@@ -74,6 +78,7 @@ func (NoopRecorder) ObserveI8Latency(time.Duration)          {}
 func (NoopRecorder) ObserveI12Latency(time.Duration)         {}
 func (NoopRecorder) ObserveI14Latency(time.Duration)         {}
 func (NoopRecorder) ObserveDecisionLatency(time.Duration)    {}
+func (NoopRecorder) ObserveResidencyUnknown()                {}
 
 // Logger mirrors platform-gincommon's port.Logger method set structurally —
 // that type lives in an internal package we cannot import directly, so every

@@ -1,6 +1,7 @@
-# Reusable workflow — quality gate. fmt + vet + lint + arch-lint +
-# mod-verify + vuln-check. Called by ci.yml and release.yml — see
-# validate-test.yml's header comment for why this is split out.
+# Reusable workflow — quality gate. fmt + tidy + vet + lint + observability
+# standard checks + vuln-check + Dockerfile digest pin verification.
+# Called by ci.yml and release.yml — see validate-test.yml's header comment
+# for why this is split out.
 name: Validate / Quality
 
 "on":
@@ -22,28 +23,110 @@ jobs:
   quality:
     name: quality
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: actions/setup-go@v6.5.0
+
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
             go.sum
             go.mod
+
       - name: Configure private module access
-        run: git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
-      - run: make fmt-check
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+
+      - name: Download modules
+        env:
+          GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+          GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+        run: go mod download
+
+      - name: Verify modules
+        run: go mod verify
+
+      # Step 2: Reject HTML-escaped operators in workflow/script files
+      - name: Reject HTML-escaped operators
+        run: |
+          if grep -REn '&(gt|lt|amp);' .github/workflows/ .github/scripts/ 2>/dev/null; then
+            echo "::error::HTML-escaped operators (&gt; &lt; &amp;) found in workflow or script files — use plain shell operators instead"
+            exit 1
+          fi
+          echo "No HTML-escaped operators found."
+
+      # Step 3: Format check (gofmt -l → fail if non-empty)
+      - name: Format check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted" | while IFS= read -r f; do
+              echo "::error file=${f}::${f} is not gofmt-formatted — run 'gofmt -w ${f}' or 'make fmt'"
+            done
+            exit 1
+          fi
+          echo "All files are gofmt-formatted."
+
+      # Step 4: Tidy check (go.mod + go.sum must not diverge after tidy)
+      - name: Tidy check
+        run: |
+          make tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error file=go.mod::go.mod or go.sum is out of date — run 'go mod tidy' and commit the result"
+            exit 1
+          fi
+
+      # Step 5: Vet
       - run: make vet
+
+      # Step 6: Lint (golangci-lint via go tool)
       - run: make lint
-      - run: make arch-lint
-      # Enterprise Platform Observability Standard (docs/observability/README.md):
-      # collector naming, proposed-metric governance, platform-gincommon's
-      # metricslint on a real scrape + refs + inventory drift, Helm
-      # PrometheusRule drift against app-alerts.yml, promtool alert tests.
-      - name: Observability standard checks
-        run: make metrics-check
-      - run: make mod-verify
-      - run: make vuln-check
+
+      # Step 7: Metric construction and naming check
+      - name: Metric naming check
+        run: bash .github/scripts/check-metric-naming.sh
+
+      # Step 8: Metrics registry ratification check
+      - name: Metrics registry ratification
+        run: bash .github/scripts/metrics-registry-lint.sh
+
+      # Step 9: Observability standard lint (metricslint)
+      - name: Observability standard lint
+        run: bash .github/scripts/metricslint.sh
+
+      # Step 10: Vulnerability check
+      - name: Vulnerability check
+        run: |
+          if ! make vuln-check; then
+            echo "::error::govulncheck found reachable vulnerabilities — see above. Add an entry to .github/govulncheck-allow.txt if a risk acceptance is required."
+            exit 1
+          fi
+
+      # Step 11: Dockerfile base image digest pin check
+      - name: Dockerfile digest pin check
+        run: |
+          if ! grep -qP 'FROM .+@sha256:[0-9a-f]{64}' Dockerfile; then
+            echo "::error file=Dockerfile::All FROM lines must use @sha256:… digest pins (no floating tags). Run 'make pin-base-images' to update."
+            exit 1
+          fi
+          # Verify .docker-digests records the same digests as the Dockerfile
+          if [ ! -f .docker-digests ]; then
+            echo "::error file=.docker-digests::.docker-digests is missing. Run 'make pin-base-images' to generate it."
+            exit 1
+          fi
+          while IFS= read -r line; do
+            # Skip blank lines and comments
+            [[ -z "$line" || "$line" == '#'* ]] && continue
+            image=$(echo "$line" | awk '{print $1}')
+            digest=$(echo "$line" | awk '{print $2}')
+            if ! grep -qF "@sha256:${digest}" Dockerfile; then
+              echo "::error file=.docker-digests::Digest mismatch for ${image}: .docker-digests records sha256:${digest} but Dockerfile does not contain that exact digest. Run 'make pin-base-images' to sync."
+              exit 1
+            fi
+          done < .docker-digests
+          echo "Dockerfile digest pins verified."

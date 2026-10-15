@@ -34,7 +34,7 @@ func (r DenyReason) HTTPStatus() int {
 	}
 }
 
-// InjectedHeaders are the six trust-boundary headers this service injects on
+// InjectedHeaders are the seven trust-boundary headers this service injects on
 // Allow. Every downstream service trusts these implicitly (mTLS-enforced
 // mesh) — no other header on the inbound CheckRequest may influence them.
 const (
@@ -44,6 +44,11 @@ const (
 	HeaderTenantRoles  = "x-tenant-roles"
 	HeaderPlan         = "x-plan"
 	HeaderFeatureFlags = "x-feature-flags"
+	// HeaderResidencyMode is the tenant's data-residency mode (LLD §5.3, §16 AE-38,
+	// CD-37). Values: "standard" | "strict". Always server-computed — never
+	// read from the inbound request (ingress strips it; AuthZ overwrites). Consumed
+	// by LLM services and forwarded to the Model Gateway. On Allow path only.
+	HeaderResidencyMode = "x-residency-mode"
 )
 
 // CacheResult reports what state a jittered-TTL cache lookup found. It lives

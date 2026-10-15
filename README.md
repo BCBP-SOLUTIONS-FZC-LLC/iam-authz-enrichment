@@ -132,7 +132,7 @@ Clean Architecture — dependencies point inward; outer layers never import inne
 ```
 iam-authz-enrichment/
 ├── api/
-│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels, 15 event types, 0 published
+│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels, 21 event types, 0 published
 │   └── embed.go                       # //go:embed asyncapi.yaml — served at GET /asyncapi · GET /asyncapi.yaml
 ├── cmd/server/                        # Composition root: config, logger, tracing/metrics identity, gRPC+HTTP+metrics servers, 5 SQS consumers
 │   ├── main.go                        # wiring + graceful shutdown; a fatal background failure exits non-zero (SIGTERM exits 0)
@@ -202,8 +202,8 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 | Library | Version | Purpose |
 |---------|---------|---------|
 | `platform-gincommon` | v1.6.0 | zap logger, gRPC observability interceptors (panic-recovery/request-id/tracing/metrics/logging) + `RegisterKnownMethods`, Gin observability middlewares (`/healthz`/`/readyz`), health handler, `InitTracingWithConfig`, `MetricsHandler` (`/metrics`), Tier 3 metric constructors (`NewCounterVec`/`NewCounter`/`NewHistogramVec`, registry-validated), `NewTracer`/`NewSpanTracer`/`InjectTraceContext` — the only OTel/Prometheus entry points, same as iam-org-membership |
-| `platform-events/v2` | v2.0.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]`), Glue decoding (`GlueDecodeCodec`), `InitMetrics`, SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table) |
-| `platform-pgcommon/v2` | v2.0.0 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, query tracer (`gincommon.NewSpanTracer`), `pgmetrics.InitWithIdentity` — same wiring as iam-user-profile / iam-org-membership. **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox |
+| `platform-events/v2` | v2.1.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]`), Glue decoding (`GlueDecodeCodec`), `InitMetrics`, SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table) |
+| `platform-pgcommon/v2` | v2.0.1 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, query tracer (`gincommon.NewSpanTracer`), `pgmetrics.InitWithIdentity` — same wiring as iam-user-profile / iam-org-membership. **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox |
 
 ---
 
@@ -211,7 +211,7 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 
 This service is a **pure event consumer** — it subscribes to five SQS queues and publishes **zero** events. `cmd/server` still loads platform-events SNS and outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) so operators see the same `SNS_*` / `OUTBOX_*` warnings as iam-user-profile / iam-org-membership, then skips `NewSNSPublisher`, `outbox.ApplySchema`, and `NewRunner` (HLD §5.4 / EVT-2). Every event received is a cache-invalidation trigger against this service's own Valkey cache, never a domain state mutation of its own.
 
-The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 15 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile, Realm Provisioner) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
+The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 21 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile, Realm Provisioner) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
 
 **Envelope shape:** `{id, type, tenant_id, time, data}` — `tenant_id` is a top-level envelope field, never duplicated inside `data`; the `billing-authz-q` events below read only that field, no `data` decode at all.
 
@@ -244,12 +244,18 @@ The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) �
 | `TenantSubscriptionCancelled` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
 | `TenantReactivated` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
 
-**`tenant-authz-q`** (Realm Provisioner, 2 event types) — keep the in-process realm→tenant map fresh for JWT-issuer-based tenant resolution (LLD §8.3); both must be wired, since a direct-paid-signup tenant fires only the second one:
+**`tenant-authz-q`** (Realm Provisioner + Tenant Owner, 8 event types) — two sub-families: provisioning events keep the in-process realm→tenant map fresh; lifecycle/settings events evict `ae:tenant:{tenant}` so the next Check picks up fresh tenant context (plan, feature_flags, subscription_status, read_only, residency_mode) from I-8:
 
 | Event type | Consumed field(s) | Effect |
 |---|---|---|
 | `TenantConverted` | `realm` | Update the realm→tenant map, **plus** evict `ae:tenant:{tenant}` (the realm strategy changed) |
 | `TenantRealmReady` | `realm` | Update the realm→tenant map only — **no** cache eviction |
+| `TenantSettingChanged` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — CD-37/LLD §16 AE-38: a tenant owner changed a setting (e.g. `residency_mode`) |
+| `TenantSuspended` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — operator suspension (RP-14); no billing event covers this path (AE-RP-GAP-002) |
+| `TenantReactivated` (operator-sourced) | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — operator reactivation (RP-10, source=operator); distinct from billing-authz-q's `TenantReactivated` (AE-RP-GAP-003) |
+| `TenantOffboarded` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — after eviction the next Check fetches I-8, receives ErrNotFound, and correctly denies (AE-RP-GAP-004) |
+| `TrialExpired` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — trial expiry changes `subscription_status` and `read_only`; without eviction pre-expiry values persist for up to `AE_TENANT_TTL` (AE-RP-GAP-005) |
+| `TrialReactivated` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — trial extension (new `trial_ends_at`), so the next Check picks up the refreshed date (AE-RP-GAP-006) |
 
 **`tender-authz-q`** (Tender Service, 1 event type) — flips an in-process fact, not a Valkey write:
 
@@ -709,7 +715,7 @@ Every `Check()` touches at most two synchronous dependencies (Valkey, Org & Memb
 - [`.claude/CLAUDE.md`](.claude/CLAUDE.md) — top-level guidance for Claude Code working in this repo.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layer model, request-flow/cache/event/failure-handling diagrams, key invariants, threat model.
 - [`docs/lld/iam-lld-authz-enrichment.md`](docs/lld/iam-lld-authz-enrichment.md) — the Low-Level Design: precedence chain, cache-key table, §7 event-invalidation narrative, §9 `DenyReason`/status table, §16 `AE-#` decision register.
-- [`api/asyncapi.yaml`](api/asyncapi.yaml) — the 5-queue/15-event-type consumer contract (see [§ Event architecture](#event-architecture)); also served live at `GET /asyncapi`/`GET /asyncapi.yaml`.
+- [`api/asyncapi.yaml`](api/asyncapi.yaml) — the 5-queue/21-event-type consumer contract (see [§ Event architecture](#event-architecture)); also served live at `GET /asyncapi`/`GET /asyncapi.yaml`.
 - [`VERSIONING.md`](VERSIONING.md) — SemVer rules for the runtime contract, image tag scheme, maintainer release checklist.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch naming, PR checklist, commit style, how to extend each layer.
 - [`docs/architecture/`](docs/architecture/) — standalone Mermaid diagram sources.
