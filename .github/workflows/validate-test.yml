@@ -1,8 +1,10 @@
 # Reusable workflow — test gate. Race detector (unit + integration) +
-# coverage, e2e (real compiled binary over real gRPC), arch-lint.
-# Called by ci.yml and release.yml so both share exactly one definition of
-# "tests pass" — this split only started earning its keep once release.yml
-# existed as a second caller.
+# coverage + arch-lint, plus a separate e2e job that drives the real compiled
+# binary over a real gRPC connection. Called by ci.yml and release.yml so both
+# share exactly one definition of "tests pass". e2e runs as its own job (not
+# a step in `test`) so it gets a completely fresh Valkey + LocalStack — the
+# integration tests leave state that makes the SQS-consumer timing in
+# TestRoleInsufficient_ThenEventDrivenGrant_Allows unreliable in a shared env.
 name: Validate / Test
 
 "on":
@@ -26,6 +28,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # ── unit + integration tests, coverage gate, arch-lint ───────────────────
   test:
     name: test
     runs-on: ubuntu-latest
@@ -87,7 +90,6 @@ jobs:
         env:
           AWS_ENDPOINT_URL: http://localhost:4566
 
-      # Step 2: unit + integration tests (race + coverage)
       - name: Unit tests (race + coverage)
         env:
           TESTCONTAINERS_RYUK_DISABLED: "true"
@@ -103,8 +105,93 @@ jobs:
           AWS_REGION: ap-south-1
         run: make test-integration
 
-      # Step 3: e2e — real compiled binary over real gRPC
-      - name: Build binary (e2e)
+      - name: Coverage gate (95%)
+        id: coverage
+        run: bash .github/scripts/coverage-gate.sh
+        env:
+          COVERAGE_THRESHOLD: "95"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage.out
+          retention-days: 30
+
+      - name: Cache go-arch-lint
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/go/bin/go-arch-lint
+          key: go-arch-lint-${{ runner.os }}-v1.15.0
+
+      - name: Architecture lint
+        run: bash .github/scripts/arch-lint.sh
+
+  # ── e2e — real binary over real gRPC against fresh Valkey + LocalStack ───
+  # Runs as a separate job so it gets its own service containers with no state
+  # left by the integration tests above. Shares the same reusable workflow so
+  # ci.yml's `needs: [validate-test]` waits for both jobs to complete.
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      localstack:
+        image: localstack/localstack:4.4.0
+        ports: ["4566:4566"]
+        env:
+          SERVICES: sqs
+          AWS_DEFAULT_REGION: ap-south-1
+        options: >-
+          --health-cmd "awslocal sqs list-queues"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            go.mod
+
+      - name: Configure private module access
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+
+      - name: Download modules
+        env:
+          GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+          GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+        run: go mod download
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Init LocalStack queues
+        run: |
+          chmod +x scripts/init-localstack.sh
+          AWS_ACCESS_KEY_ID=localstack AWS_SECRET_ACCESS_KEY=localstack AWS_DEFAULT_REGION=ap-south-1 \
+            ./scripts/init-localstack.sh
+        env:
+          AWS_ENDPOINT_URL: http://localhost:4566
+
+      - name: Build binary
         run: make build
 
       - name: E2E tests
@@ -117,30 +204,3 @@ jobs:
           AWS_SECRET_ACCESS_KEY: localstack
           AWS_REGION: ap-south-1
         run: make test-e2e
-
-      # Step 4: coverage threshold gate (≥ 95%)
-      - name: Coverage gate (95%)
-        id: coverage
-        run: bash .github/scripts/coverage-gate.sh
-        env:
-          COVERAGE_THRESHOLD: "95"
-
-      # Step 5: upload coverage report
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v7.0.1
-        if: always()
-        with:
-          name: coverage-${{ github.sha }}
-          path: coverage.out
-          retention-days: 30
-
-      # Step 6: cache go-arch-lint binary
-      - name: Cache go-arch-lint
-        uses: actions/cache@v6.1.0
-        with:
-          path: ~/go/bin/go-arch-lint
-          key: go-arch-lint-${{ runner.os }}-v1.15.0
-
-      # Step 7: architecture lint
-      - name: Architecture lint
-        run: bash .github/scripts/arch-lint.sh

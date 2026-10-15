@@ -9,15 +9,15 @@ function icon(r) {
   return '❌';
 }
 
-const coveragePct = needs['test']?.outputs?.pct;
+const coveragePct = needs['validate-test']?.outputs?.pct;
 
 const rows = [
-  ['Tests & race detector',         'test'],
-  ['Coverage ≥ 95%',                'test'],
+  ['Tests & race detector',         'validate-test'],
+  ['Coverage ≥ 95%',                'validate-test'],
   ['Image build + Dockerfile lint', 'build-image'],
   ['Trivy CVE scan',                'trivy'],
   ['Smoke tests',                   'smoke'],
-  ['Code quality',                  'quality'],
+  ['Code quality',                  'validate-quality'],
 ];
 
 const table = rows
@@ -25,7 +25,7 @@ const table = rows
     const label = row[0];
     const key   = row[1];
     const r     = needs[key]?.result || 'skipped';
-    const value = (label === 'Coverage ≥ 95%' && coveragePct)
+    const value = (label === 'Coverage ≥ 95%' && coveragePct != null)
       ? parseFloat(coveragePct).toFixed(1) + '%'
       : '`' + r + '`';
     return '| ' + icon(r) + ' | ' + label + ' | ' + value + ' |';
