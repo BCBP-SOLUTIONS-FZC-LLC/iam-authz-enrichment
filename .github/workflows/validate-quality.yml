@@ -55,7 +55,7 @@ jobs:
       - name: Reject HTML-escaped operators
         run: |
           if grep -REn '&(gt|lt|amp);' .github/workflows/ .github/scripts/ 2>/dev/null; then
-            echo "::error::HTML-escaped operators (&gt; &lt; &amp;) found in workflow or script files — use plain shell operators instead"
+            echo "::error::HTML-escaped operators found in workflow or script files — use plain shell operators instead"
             exit 1
           fi
           echo "No HTML-escaped operators found."
