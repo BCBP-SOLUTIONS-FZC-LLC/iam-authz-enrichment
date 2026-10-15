@@ -32,6 +32,10 @@ Does NOT read a metric back from the Gatherer — platform-events' former per-qu
 
 **Singleflight-coalesced I-8 call runs on `context.WithoutCancel(ctx)`** (LLD rev 1.32): under the first caller's context, Envoy cancelling one request failed every request waiting on the same key (`TestCheck_Singleflight_FirstCallerCancelled_OthersUnaffected`). Don't pass the request `ctx` into `sf.Do`.
 
+**Security invariant — future `auth_time` (LLD §16 AE-38):** `checkMFAFreshness()` guards `authTime.After(c.now())` before the duration comparison — a future auth_time produces a negative duration that would silently pass the MFA gate without this guard.
+
+**Security invariant — empty TenderID (AE-39):** if `reqFacts.RequiredAccessLevel != ""` but `reqFacts.TenderID == ""` (e.g. trailing-slash `/tenders/` or route misconfiguration), `check()` returns `DenyMalformedIdentity` immediately rather than silently skipping the tender-ACL overlay. TAC-4 call failures fail closed to `DenyTenderACLInsufficient` (§7 row 4) and call `ObserveTACDependencyError()`.
+
 **Sibling timeouts** must never be set below the siblings' own p99 targets (AE-37: I-8 40ms, TAC-4 30ms). `GRPC_REQUEST_TIMEOUT` caps each `Check` server-side.
 
 **Two Valkey clients:** request-path `cache` (10ms `VALKEY_*_TIMEOUT`) and `eventCache` (`cache.WithTimeouts(VALKEY_EVENT_TIMEOUT)`, 500ms) for everything SQS consumers write — the invalidator, `ae:processed` ledger, and `SetRealm`/`SetRestricted` via `cmd/server/factstore.go`. Don't bind consumer writes to the 10ms client: one slow round trip costs a 30s visibility-timeout retry.
@@ -44,7 +48,9 @@ The e2e harness pins `SQS_WAIT_SECONDS=1` / `SQS_VISIBILITY_TIMEOUT=5s` for isol
 
 ## internal/usecase/invalidate.go
 
-`HandleUserDeleted` and `HandleMembershipRevoked` share the same best-effort-tender-ACL-eviction shape: `EvictTenderACLForUser` failure logs a warning but never fails the event — a partial scan degrades to "stale until its 15s TTL expires", not a correctness failure requiring retry.
+`NewInvalidator(cache, realmMap, restricted, log, recorder ...Recorder)` takes an optional variadic `Recorder` (defaults to `NoopRecorder{}`; `cmd/server` passes the real one).
+
+`HandleUserDeleted` and `HandleMembershipRevoked` share the same best-effort-tender-ACL-eviction shape: `EvictTenderACLForUser` failure calls `recorder.ObserveEvictionError(eventType)` and logs a warning but never fails the event — a partial scan degrades to "stale until its 15s TTL expires", not a correctness failure requiring retry.
 
 `HandleMembershipRevoked` (LLD §16 AE-20) exists because a whole-membership removal soft-deletes the `tenant_memberships` row and leaves per-grant rows inert rather than firing individual `*Revoked` events — it's the only `membership-authz-q` event type needing the wider eviction.
 
@@ -68,6 +74,8 @@ Every `envInt`-backed field that can silently misbehave on zero/negative goes th
 
 `GRPC_REQUEST_TIMEOUT` and `VALKEY_EVENT_TIMEOUT` must be positive. A `VALKEY_URL` containing `://` must pass `redis.ParseURL` (LLD rev 1.32) — the cache adapter otherwise falls back to treating it as `host:port`, so a typo'd `rediss://` URL starts with TLS silently off and, since `/readyz` ignores Valkey, fails every request closed.
 
+All five non-dev fail-fasts live here, not in `main.go`, so `config_test.go` can unit-test them: dev-default sibling URLs, `VALKEY_URL` must be `rediss://`, both `SHARED_REALM_ISSUER` and `REALM_TENANT_MAP_SEED` empty, blank queue URLs, duplicate queue URLs. `AE_PROCESSED_EVENT_TTL` defaults to 192h (PE-1 — strictly > the 7-day SQS lifetime); `AE_STALE_IF_ERROR_MAX_AGE` is hard-capped at 5m (§7).
+
 `ResolveAppEnv()` (`APP_ENV` → `ENVIRONMENT` → `dev`, trimmed/lowercased) is the single environment source — never read `APP_ENV` directly.
 
 ## internal/adapter/inbound/grpc/claims.go
@@ -89,6 +97,8 @@ AsyncAPI HTML viewer (`GET /asyncapi`) and raw-spec endpoint (`GET /asyncapi.yam
 `New(reg)` builds every `iam_authz_enrichment_*` metric through gincommon's Tier 3 constructors, which validate names/labels against the Platform Observability Registry and **require gincommon's metrics identity to exist first** (`cmd/server` calls `ObservabilityMiddlewares` before `metrics.New`; the test file's `TestMain` does the same). Returns an error naming every failing metric instead of panicking.
 
 `deny_reason_total{reason}` emits the `DenyReason` **lowercased** (`deny_service_unavailable`) — the registry's `reason` vocabulary is snake_case. `TestNew_AppliesGincommonConstLabels` emits every series and runs `obsregistry.Validate`. Keep it emitting every metric, or a new label violation goes unnoticed.
+
+Two error counters sit beside the latency/decision series: `iam_authz_enrichment_tac4_errors_total` (`ObserveTACDependencyError()`, `check.go`'s TAC-4 error path — tells an iam-tender-acl outage from real `DENY_TENDER_ACL_INSUFFICIENT` denials; alerted by `AuthzEnrichmentTAC4ErrorSpike`) and `iam_authz_enrichment_eviction_errors_total{event}` (`ObserveEvictionError(event)`, `invalidate.go`'s best-effort SCAN failure path). `BatchTenderACLClient` is a separate port from `OrgMembershipClient` — it holds only `GetBatchTenderACL`, so §3.1 Check() fakes don't implement a method no Check() path calls. `domain.TenderACL.AccessLevel` is `*string` — an absent JSON field decodes as nil, not "" (TAC-GAP-001).
 
 ## test/fixtures/cache.go
 

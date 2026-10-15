@@ -17,11 +17,18 @@ type Invalidator struct {
 	realmMap   *RealmMap
 	restricted *RestrictedTenderSet
 	log        Logger
+	recorder   Recorder
 }
 
-// NewInvalidator builds an Invalidator.
-func NewInvalidator(cache Cache, realmMap *RealmMap, restricted *RestrictedTenderSet, log Logger) *Invalidator {
-	return &Invalidator{cache: cache, realmMap: realmMap, restricted: restricted, log: log}
+// NewInvalidator builds an Invalidator. recorder is optional (variadic so all
+// existing call sites compile unchanged); if omitted, a NoopRecorder is used.
+// cmd/server passes the real metrics.Recorder so eviction failures are counted.
+func NewInvalidator(cache Cache, realmMap *RealmMap, restricted *RestrictedTenderSet, log Logger, recorder ...Recorder) *Invalidator {
+	var rec Recorder = NoopRecorder{}
+	if len(recorder) > 0 && recorder[0] != nil {
+		rec = recorder[0]
+	}
+	return &Invalidator{cache: cache, realmMap: realmMap, restricted: restricted, log: log, recorder: rec}
 }
 
 // MembershipEventPayload is membership-authz-q's decoded payload —
@@ -72,6 +79,7 @@ func (inv *Invalidator) HandleMembershipRevoked(ctx context.Context, tenant stri
 	}
 	if err := inv.cache.EvictTenderACLForUser(ctx, tenant, p.UserID); err != nil {
 		inv.log.Warn("best-effort tender-acl eviction failed on MembershipRevoked", map[string]interface{}{"error": err.Error()})
+		inv.recorder.ObserveEvictionError("membership_revoked")
 	}
 	return nil
 }
@@ -132,6 +140,7 @@ func (inv *Invalidator) HandleUserDeleted(ctx context.Context, tenant string, p 
 	}
 	if err := inv.cache.EvictTenderACLForUser(ctx, tenant, p.UserID); err != nil {
 		inv.log.Warn("best-effort tender-acl eviction failed on UserDeleted", map[string]interface{}{"error": err.Error()})
+		inv.recorder.ObserveEvictionError("user_deleted")
 	}
 	return nil
 }
@@ -154,7 +163,7 @@ func (inv *Invalidator) HandleBillingEvent(ctx context.Context, tenant string) e
 }
 
 // HandleTenantSettingChanged implements tenant-authz-q TenantSettingChanged
-// (CD-37, LLD §16 AE-38): a tenant-owner changed a setting such as
+// (CD-37, LLD §16 AE-40): a tenant-owner changed a setting such as
 // residency_mode, so the ae:tenant entry is stale. Evict it; the next
 // request will rebuild from I-8 and pick up the new value. No payload
 // decoding needed — the tenant_id on the envelope is the only fact required.
@@ -189,8 +198,11 @@ func (inv *Invalidator) HandleTenantConverted(ctx context.Context, tenant string
 }
 
 // HandleTenantRealmReady: NO ae:ctx eviction — refresh the realm map only.
-// Wiring this (not just TenantConverted) matters: a newly-dedicated realm
-// created via direct-paid signup fires only TenantRealmReady (§5).
+// Both RP-2 (direct-paid signup) and RP-3 (trial→dedicated conversion) always
+// co-emit TenantRealmReady alongside TenantConverted. This handler must still
+// be wired because TenantRealmReady MUST be in the tenant-authz-q SNS filter —
+// omitting it leaves this handler dead and breaks any future RP path that may
+// emit TenantRealmReady independently of TenantConverted.
 func (inv *Invalidator) HandleTenantRealmReady(ctx context.Context, tenant string, p TenantRealmEventPayload) error {
 	if err := inv.realmMap.Set(ctx, p.Realm, tenant); err != nil {
 		return fmt.Errorf("persist realm map: %w", err)

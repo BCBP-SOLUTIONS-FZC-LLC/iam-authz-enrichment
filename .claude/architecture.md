@@ -23,7 +23,7 @@ iam-authz-enrichment/
 │   │       ├── types.go               # Action consts, DepartmentLevel consts, RequestFacts + .IsMutation()/.RequiresApproverGate()/.RequiresTenderACL()
 │   │       └── policy.go              # Input, EvaluateBase(), ViolatesReadOnly(), MeetsDepartmentLevel() — §3 base policy as pure predicates
 │   ├── usecase/                       # orchestration — the layer inbound adapters call into
-│   │   ├── ports.go                   # Cache, OrgMembershipClient, Recorder(+NoopRecorder), Logger interfaces
+│   │   ├── ports.go                   # Cache, OrgMembershipClient, BatchTenderACLClient (TAC-5 only), Recorder(+NoopRecorder), Logger interfaces
 │   │   ├── check.go                   # Checker.check() — the full §3.1 precedence chain, OTel spans, resolveContext/resolveTenderACL/checkMFAFreshness
 │   │   ├── failure.go                 # DependencyOutcome/DependencyState/DecideDependencyOutcome() — §7 failure matrix as a pure function
 │   │   ├── invalidate.go              # Invalidator — one Handle* method per §5 event type
@@ -52,7 +52,7 @@ iam-authz-enrichment/
 │           │   ├── keys.go            # ae:ctx / ae:tenant / ae:tender_acl / ae:neg / ae:processed key builders
 │           │   └── cache.go           # entry[T]{Value,FetchedAt,SoftTTL} — single-envelope trick for fresh-read AND §7 stale-if-error
 │           ├── orgmembership/
-│           │   └── client.go          # I-8/I-14 HTTP client (Org & Membership) + TAC-4/I-12 HTTP client (iam-tender-acl); getJSON() classifies 404 → domain.ErrNotFound
+│           │   └── client.go          # I-8/I-14 HTTP client (Org & Membership) + TAC-4/I-12 HTTP client (iam-tender-acl); getJSON() classifies 404 → domain.ErrNotFound; GetTenderACL also classifies 400 → ErrNotFound (TAC-GAP-005), 5xx → ErrUnavailable; GetBatchTenderACL is TAC-5
 │           ├── postgres/              # platform-pgcommon DSN/pool config — cmd/server loads PoolConfig then skips NewPool (no schema)
 │           │   ├── dsn.go             # DSNFromEnv / MigrationDSNFromEnv / SystemDSNFromEnv
 │           │   ├── logger_adapter.go  # Zap → pgcommon domain.Logger
@@ -88,16 +88,16 @@ iam-authz-enrichment/
 ```go
 require (
     github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon v1.6.0
-    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2    v2.0.0
-    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2  v2.0.0
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2    v2.1.0
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2  v2.0.1
 )
 ```
 
 - **`platform-gincommon`** — `pkg/logger` (zap + redaction), `pkg/grpccommon` (`ObservabilityUnaryInterceptors`: panic-recovery → request-id → tracing → metrics → logging). Uses `ObservabilityUnaryInterceptors`, **not** `ProtectedUnaryInterceptors` — Envoy calls over mTLS, no JWT bearer auth to require. `grpccommon.RegisterKnownMethods` bounds the `grpc_method` label. `pkg/gincommon` is the **only** OTel/Prometheus entry point: `InitTracingWithConfig`, `MetricsHandler`, `NewCounterVec`/`NewCounter`/`NewHistogramVec`, `NewTracer`, `NewSpanTracer`, `InjectTraceContext`. Don't reintroduce local copies (hand-rolled tracer, `promauto`, `promhttp`, local Glue decoder). One direct OTel import remains: `otelhttp` on the outbound transport.
 
-- **`platform-events`** — `pkg/events` SQS consumer loop (`NewSQSConsumer`, `WithMaxReceiveCount`, `WithConcurrency`, `WithDrainTimeout`, `WithConsumerCodec`), `pkg/config` (`LoadSQS`/`LoadSNS`/`LoadOutbox`/`SNSConfigFromEnv`/`RunnerConfigFromEnv`/`SQSConsumerOptions`). **No publisher or runner** — consume-only (HLD §5.4). Dedup via `skipDuplicate`/`ackUnknown`; store is Valkey SET NX (AE-6).
+- **`platform-events/v2`** — import path `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/...`. `pkg/events` SQS consumer loop (`NewSQSConsumer`, `WithMaxReceiveCount`, `WithConcurrency`, `WithDrainTimeout`, `WithConsumerCodec`), `pkg/config` (`LoadSQS`/`LoadSNS`/`LoadOutbox`/`SNSConfigFromEnv`/`RunnerConfigFromEnv`/`SQSConsumerOptions`). **No publisher or runner** — consume-only (HLD §5.4). Dedup via `skipDuplicate`/`ackUnknown`; store is Valkey SET NX (AE-6).
 
-- **`platform-pgcommon`** — DSN assembly, Zap logger adapter, query tracer via `gincommon.NewSpanTracer`, `pgmetrics.InitWithIdentity`, `NewPool` wrapper. **No live pool** — no schema (HLD §5.4). A future schema must use `postgres.OpenPool`.
+- **`platform-pgcommon/v2`** — import path `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/...`. DSN assembly, Zap logger adapter, query tracer via `gincommon.NewSpanTracer`, `pgmetrics.InitWithIdentity`, `NewPool` wrapper. **No live pool** — no schema (HLD §5.4). A future schema must use `postgres.OpenPool`.
 
 - **Not a dependency:** `platform-schemagov` — this service publishes no events.
 

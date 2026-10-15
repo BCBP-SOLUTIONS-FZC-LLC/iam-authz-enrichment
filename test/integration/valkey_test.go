@@ -97,10 +97,10 @@ func TestValkey_EvictTenderACLForUser_ScansAcrossTenders(t *testing.T) {
 	tenant, user := "it-tenant-3", "it-user-3"
 
 	for _, tender := range []string{"tender-a", "tender-b"} {
-		require.NoError(t, cache.SetTenderACL(ctx, tenant, tender, user, domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelView}))
+		require.NoError(t, cache.SetTenderACL(ctx, tenant, tender, user, domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelView)}))
 	}
 	// A different user's grant on the same tenant/tender must survive.
-	require.NoError(t, cache.SetTenderACL(ctx, tenant, "tender-a", "other-user", domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelView}))
+	require.NoError(t, cache.SetTenderACL(ctx, tenant, "tender-a", "other-user", domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelView)}))
 
 	require.NoError(t, cache.EvictTenderACLForUser(ctx, tenant, user))
 
@@ -129,3 +129,5 @@ func TestValkey_MarkProcessed_IsIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, second, "SET NX must reject the second mark for the same event ID")
 }
+
+func strPtr(s string) *string { return &s }

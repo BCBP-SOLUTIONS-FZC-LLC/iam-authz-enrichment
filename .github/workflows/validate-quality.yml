@@ -1,5 +1,5 @@
-# Reusable workflow — quality gate. fmt + tidy + vet + lint + observability
-# standard checks + vuln-check + Dockerfile digest pin verification.
+# Reusable workflow — quality gate. fmt + tidy + vet + lint + routing/image-pin
+# lints + observability standard checks + vuln-check + Dockerfile digest pin verification.
 # Called by ci.yml and release.yml — see validate-test.yml's header comment
 # for why this is split out.
 name: Validate / Quality
@@ -86,6 +86,17 @@ jobs:
 
       # Step 6: Lint (golangci-lint via go tool)
       - run: make lint
+
+      # Step 6b: Shared-library routing lints + Go image pin (logs/metrics/traces
+      # via platform-gincommon, DB via platform-pgcommon, SQS via platform-events)
+      - name: Observability routing lint
+        run: make observability-lint
+      - name: Database routing lint
+        run: make database-lint
+      - name: Events routing lint
+        run: make events-lint
+      - name: Go image pin lint
+        run: make image-pin-lint
 
       # Step 7: Metric construction and naming check
       - name: Metric naming check

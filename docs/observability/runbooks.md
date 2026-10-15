@@ -63,14 +63,23 @@ Common starting points:
 
 ### AuthzEnrichmentServiceUnavailableSpike
 
-**Meaning.** `iam_authz_enrichment_deny_reason_total{reason="deny_service_unavailable"}` has been sustained for 5 minutes. §7 has failed closed with no stale entry to serve, or the tender-ACL overlay's independent fail-closed rule is firing on TAC-4 failures.
+**Meaning.** `iam_authz_enrichment_deny_reason_total{reason="deny_service_unavailable"}` has been sustained for 5 minutes. §7 has failed closed on an Org & Membership or Valkey failure with no stale entry to serve. TAC-4 (iam-tender-acl) failures never produce this reason — they fail closed to `DENY_TENDER_ACL_INSUFFICIENT` and fire `AuthzEnrichmentTAC4ErrorSpike`.
 
 **Triage.**
-1. Is it tender-scoped only? Then check **iam-tender-acl** (TAC-4) and the `i12` latency, not Org & Membership.
-2. Otherwise, run the same checks as `AuthzEnrichmentStaleIfErrorServing`. New tenants or users with no cache entry fail closed immediately.
-3. Siblings healthy but still failing: check the NetworkPolicy path in both directions (`networkPolicy.upstreamEgress`, and iam-tender-acl's `internalCallerPodSelectors`). A dropped connection looks like a timeout. Then search the logs for `membership rebuild failed, no stale entry available`.
+1. Run the same checks as `AuthzEnrichmentStaleIfErrorServing`. New tenants or users with no cache entry fail closed immediately.
+2. Siblings healthy but still failing: check the NetworkPolicy path (`networkPolicy.upstreamEgress`). A dropped connection looks like a timeout. Then search the logs for `membership rebuild failed, no stale entry available`.
 
 **Mitigate.** Restore the dependency or the network path.
+
+### AuthzEnrichmentTAC4ErrorSpike
+
+**Meaning.** `iam_authz_enrichment_tac4_errors_total` is increasing: `GetTenderACL` (TAC-4) calls to iam-tender-acl are failing, and the tender-ACL overlay is failing closed with `DENY_TENDER_ACL_INSUFFICIENT` on every restricted-tender request (§7 row 4). Legitimate access-control denials don't increment this counter, so a nonzero rate is a dependency problem, not a policy one.
+
+**Triage.**
+1. Check iam-tender-acl's health and alerts, and this pod's `iam_authz_enrichment_i12_call_latency_seconds` — a p99 pinned at `TENDER_ACL_TIMEOUT` means timeouts, not errors.
+2. iam-tender-acl healthy: check the NetworkPolicy path in both directions (`networkPolicy.upstreamEgress`, and iam-tender-acl's `internalCallerPodSelectors`), and that `TENDER_ACL_BASE_URL` points at the right service.
+
+**Mitigate.** Restore iam-tender-acl or the network path. Don't raise `TENDER_ACL_TIMEOUT` below iam-tender-acl's own p99 target (AE-37) to mask it.
 
 ## Cache
 

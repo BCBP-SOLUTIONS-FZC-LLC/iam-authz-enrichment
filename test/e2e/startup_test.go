@@ -81,6 +81,15 @@ func requireFailFast(t *testing.T, timeout time.Duration, env []string, wantInOu
 	assert.Contains(t, out, wantInOutput)
 }
 
+// nonDevBase passes the non-dev checks that run before the sibling-URL and
+// queue checks (rediss:// Valkey, a tenant-resolution path), so each staging
+// case fails on the one check it names. Load fails before any Valkey dial.
+var nonDevBase = []string{
+	"APP_ENV=staging",
+	"VALKEY_URL=rediss://valkey.example:6379",
+	"SHARED_REALM_ISSUER=https://kc.example/realms/shared",
+}
+
 func TestStartup_FailsFast(t *testing.T) {
 	dir := t.TempDir()
 	cases := map[string]struct {
@@ -88,15 +97,22 @@ func TestStartup_FailsFast(t *testing.T) {
 		want string
 	}{
 		"sibling URL left at its dev default outside dev": {
-			env:  []string{"APP_ENV=staging", "ORG_MEMBERSHIP_BASE_URL="},
+			env:  append(nonDevBase, "ORG_MEMBERSHIP_BASE_URL="),
 			want: "ORG_MEMBERSHIP_BASE_URL is left at its local-dev default",
 		},
 		"blank queue URL outside dev": {
-			env: []string{
-				"APP_ENV=staging",
+			env: append(nonDevBase,
 				"ORG_MEMBERSHIP_BASE_URL=http://om.example", "TENDER_ACL_BASE_URL=http://tacl.example",
-			},
+			),
 			want: "is required when APP_ENV=",
+		},
+		"plaintext VALKEY_URL outside dev": {
+			env:  []string{"APP_ENV=staging", "VALKEY_URL=localhost:6379"},
+			want: "VALKEY_URL must use the rediss:// scheme",
+		},
+		"no tenant-resolution path outside dev": {
+			env:  []string{"APP_ENV=staging", "VALKEY_URL=rediss://valkey.example:6379", "SHARED_REALM_ISSUER=", "REALM_TENANT_MAP_SEED="},
+			want: "tenant-resolution",
 		},
 		"malformed rediss:// VALKEY_URL": {
 			env:  []string{"VALKEY_URL=rediss://cache.example:notaport"},

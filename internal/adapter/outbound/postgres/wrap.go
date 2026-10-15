@@ -4,8 +4,6 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/jackc/puddle/v2"
-
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
@@ -24,7 +22,7 @@ func wrapConnErr(err error) error {
 	if errors.Is(err, domain.ErrUnavailable) || errors.Is(err, domain.ErrNotFound) {
 		return err
 	}
-	if pgcommon.IsConnectionException(err) || pgcommon.IsInsufficientResources(err) || isOperatorOrSystemErrorSQLState(err) || errors.Is(err, puddle.ErrClosedPool) {
+	if pgcommon.IsConnectionException(err) || pgcommon.IsInsufficientResources(err) || isOperatorOrSystemErrorSQLState(err) || isClosedPool(err) {
 		return domain.ErrUnavailable
 	}
 	return err
@@ -32,11 +30,25 @@ func wrapConnErr(err error) error {
 
 // isOperatorOrSystemErrorSQLState reports SQLSTATE class 57/58.
 // pgcommon v1.3.0 covers 08/53 but not these two; classify via the
-// pgconn Error() text so callers never import pgconn.
+// pgconn Error() text so callers never import pgconn directly.
 func isOperatorOrSystemErrorSQLState(err error) bool {
 	if !pgcommon.IsPgError(err) {
 		return false
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "SQLSTATE 57") || strings.Contains(msg, "SQLSTATE 58")
+}
+
+// isClosedPool reports whether err is a puddle "closed pool" error —
+// returned when a query is attempted on a pgxpool that has already been
+// closed (typically during graceful shutdown). Checked by error-message
+// text rather than importing "github.com/jackc/puddle/v2" directly, which
+// would bypass the platform-pgcommon-only database-routing invariant.
+// puddle.ErrClosedPool = errors.New("closed pool") — the message is a
+// stable sentinel inside the pgx/puddle library, not a user-facing string.
+func isClosedPool(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "closed pool")
 }

@@ -236,7 +236,7 @@ func TestCheck_TenderACL_CacheHit_SkipsSiblingCall(t *testing.T) {
 	cache := fixtures.NewFakeCache()
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
 	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
-	require.NoError(t, cache.SetTenderACL(context.Background(), tenant, "tender-1", user, domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}))
+	require.NoError(t, cache.SetTenderACL(context.Background(), tenant, "tender-1", user, domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}))
 	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
 	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{}
@@ -261,7 +261,7 @@ func TestCheck_TenderACL_SetCacheFails_StillAllowsOnGrant(t *testing.T) {
 	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{
 		GetTenderACLFunc: func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
-			return domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, nil
+			return domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}, nil
 		},
 	}
 	checker := newTestChecker(cache, org, restricted)
@@ -284,7 +284,7 @@ func TestCheck_TenderACL_GetCacheErrors_FallsThroughToSibling(t *testing.T) {
 	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{
 		GetTenderACLFunc: func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
-			return domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, nil
+			return domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}, nil
 		},
 	}
 	checker := newTestChecker(cache, org, restricted)
@@ -307,7 +307,7 @@ func TestCheck_TenderACL_Allow_WhenSufficientGrant(t *testing.T) {
 	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{
 		GetTenderACLFunc: func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
-			return domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}, nil
+			return domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}, nil
 		},
 	}
 	checker := newTestChecker(cache, org, restricted)
@@ -396,6 +396,61 @@ func TestCheck_MFA_FreshAllowsStaleDenies(t *testing.T) {
 	})
 	assert.False(t, decision.Allow)
 	assert.Equal(t, domain.DenyMFAStale, decision.Reason)
+}
+
+func TestCheck_MFA_FutureAuthTime_FailsClosed(t *testing.T) {
+	t.Parallel()
+	// A JWT with auth_time in the future produces a negative duration from
+	// now.Sub(future). Without the authTime.After(now) guard, a negative
+	// duration is never > window (positive) so the gate would silently allow.
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	futureAuthTime := now.Add(24 * time.Hour) // auth_time one day in the future
+
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMFAFreshnessFunc: func(ctx context.Context, _ string) (time.Duration, error) {
+			return 5 * time.Minute, nil
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+	checker.SetClock(func() time.Time { return now })
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  usecase.Claims{Subject: user, Issuer: dedicatedIssuer, AuthTime: futureAuthTime.Unix()},
+		Request: policy.RequestFacts{Method: "POST", RequiredDepartmentLevel: policy.LevelApprover},
+	})
+
+	assert.False(t, decision.Allow, "a future auth_time must fail closed — it is not a fresh authentication")
+	assert.Equal(t, domain.DenyMFAStale, decision.Reason)
+}
+
+func TestCheck_TenderACL_MissingTenderID_WithAccessLevel_DeniesMalformedIdentity(t *testing.T) {
+	t.Parallel()
+	// A route that carries required_access_level but yields no TenderID
+	// (e.g. path /tenders/ with trailing slash, or route misconfiguration)
+	// must deny rather than silently skip the overlay. Without this guard
+	// the tender-ACL step would be bypassed entirely.
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
+	org := &fixtures.FakeOrgMembershipClient{}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{
+		Claims: baseClaims(),
+		Request: policy.RequestFacts{
+			Method:              "GET",
+			TenderID:            "",                     // path parsing failed or path is /tenders/
+			RequiredAccessLevel: domain.AccessLevelView, // route is meant to be tender-scoped
+		},
+	})
+
+	assert.False(t, decision.Allow)
+	assert.Equal(t, domain.DenyMalformedIdentity, decision.Reason,
+		"a tender-scoped route (required_access_level set) with no extractable TenderID must deny, not skip the overlay")
+	assert.Zero(t, org.TenderACLCalls, "TAC-4 must never be called when TenderID is empty")
 }
 
 func TestCheck_MFA_NotRequired_SkipsFreshnessCallEntirely(t *testing.T) {
@@ -624,6 +679,8 @@ func TestCheck_Singleflight_CoalescesConcurrentMisses(t *testing.T) {
 	assert.Less(t, callCount, int64(n), "singleflight must coalesce concurrent rebuild calls for the same (tenant,user)")
 }
 
+func strPtr(s string) *string { return &s }
+
 // countingRecorder records only what TestCheck_MissingSubject_IsRecorded asserts.
 type countingRecorder struct {
 	usecase.NoopRecorder
@@ -747,7 +804,7 @@ func TestCheck_Allow_NotReadOnly_NoSentinelInFeatureFlags(t *testing.T) {
 		"non-cancelled tenant must never have read_only in x-feature-flags")
 }
 
-// ─── CD-37: x-residency-mode header (LLD §16 AE-38) ─────────────────────────
+// ─── CD-37: x-residency-mode header (LLD §16 AE-40) ─────────────────────────
 
 // residencyCountingRecorder counts ObserveResidencyUnknown calls; all other
 // methods are no-ops via the embedded NoopRecorder.
@@ -853,7 +910,7 @@ func TestCheck_Deny_NoResidencyHeader(t *testing.T) {
 	assert.Empty(t, decision.Headers, "deny decisions must carry no injected headers")
 }
 
-// ─── CD-28: dedicated_workflow_queue in x-feature-flags (LLD §16 AE-39) ─────
+// ─── CD-28: dedicated_workflow_queue in x-feature-flags (LLD §16 AE-41) ─────
 
 // No new infrastructure is needed: flags arrive from Core's feature_flags[]
 // slice and flow through the existing x-feature-flags header unchanged.
@@ -881,7 +938,7 @@ func TestCheck_Allow_DedicatedWorkflowQueue_InFeatureFlags(t *testing.T) {
 	assert.Contains(t, flags, "sso_enabled", "other flags must also be present")
 }
 
-// ─── CD-31: deny-code stability (LLD §16 AE-40) ──────────────────────────────
+// ─── CD-31: deny-code stability (LLD §16 AE-42) ──────────────────────────────
 
 // Pin the exact wire strings for every DenyReason. A future RFC 9457 migration
 // (CD-31) must not change these values — they are part of this service's

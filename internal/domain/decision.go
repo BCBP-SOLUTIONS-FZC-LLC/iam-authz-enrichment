@@ -44,7 +44,7 @@ const (
 	HeaderTenantRoles  = "x-tenant-roles"
 	HeaderPlan         = "x-plan"
 	HeaderFeatureFlags = "x-feature-flags"
-	// HeaderResidencyMode is the tenant's data-residency mode (LLD §5.3, §16 AE-38,
+	// HeaderResidencyMode is the tenant's data-residency mode (LLD §5.3, §16 AE-40,
 	// CD-37). Values: "standard" | "strict". Always server-computed — never
 	// read from the inbound request (ingress strips it; AuthZ overwrites). Consumed
 	// by LLM services and forwarded to the Model Gateway. On Allow path only.

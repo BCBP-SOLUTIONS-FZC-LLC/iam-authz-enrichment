@@ -61,6 +61,17 @@ func sendEnvelope(t *testing.T, client *sqs.Client, qURL string, env map[string]
 	require.NoError(t, err)
 }
 
+// shortPollDeps returns consumer Deps with a 1s long poll. The default 20s
+// poll outlives the test: LocalStack keeps a stopped consumer's in-flight
+// ReceiveMessage open, and in CI the e2e suite runs next against the same
+// queues, so that dead poll takes e2e's freshly sent event and hides it for
+// the visibility timeout — past e2e's eventually() window.
+func shortPollDeps(client *sqs.Client, cache consumer.IdempotencyStore, inv *usecase.Invalidator) consumer.Deps {
+	deps := consumer.Deps{Client: client, Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv}
+	deps.SQS.WaitSeconds = 1
+	return deps
+}
+
 func drainQueue(client *sqs.Client, qURL string) {
 	_, _ = client.PurgeQueue(context.Background(), &sqs.PurgeQueueInput{QueueUrl: awssdk.String(qURL)})
 }
@@ -78,9 +89,7 @@ func TestSQS_MembershipConsumer_EndToEnd(t *testing.T) {
 	require.NoError(t, cache.SetMembershipContext(context.Background(), tenant, user, domain.MembershipContext{Roles: []string{"x"}}))
 
 	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
-	c, err := consumer.NewMembershipConsumer(qURL, consumer.Deps{
-		Client: client, Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv,
-	})
+	c, err := consumer.NewMembershipConsumer(qURL, shortPollDeps(client, cache, inv), events.WithVisibilityTimeout(time.Second))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -137,9 +146,7 @@ func TestSQS_DLQ_MessageMovesAfterMaxReceiveCount(t *testing.T) {
 
 	cache := newTestCache(t)
 	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
-	c, err := consumer.NewTenderConsumer(qURL, consumer.Deps{
-		Client: client, Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv,
-	}, events.WithVisibilityTimeout(1*time.Second))
+	c, err := consumer.NewTenderConsumer(qURL, shortPollDeps(client, cache, inv), events.WithVisibilityTimeout(1*time.Second))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -85,7 +85,7 @@ env:
   AE_NEG_TTL: "5s"
   AE_RESTRICTED_NEG_TTL: "5s"
   AE_REALM_NEG_TTL: "5s"
-  AE_PROCESSED_EVENT_TTL: "168h"
+  AE_PROCESSED_EVENT_TTL: "192h"  # PE-1: strictly > 7-day SQS message lifetime (192h = 8 days)
   AE_STALE_IF_ERROR_MAX_AGE: "5m"
 
   # Org & Membership sibling service (§6) — I-8/I-14. IAM convention: every
@@ -104,10 +104,14 @@ env:
   # TAC-4 targets 5ms hit / 20ms miss (iam-tender-acl LLD §14.1) + headroom.
   TENDER_ACL_TIMEOUT: "30ms"
 
-  # Tenant resolution (§2 point 3). SHARED_REALM_ISSUER is required — the
-  # Keycloak issuer for the shared trial realm. REALM_TENANT_MAP_SEED is a
-  # startup-only JSON seed for dedicated realms, kept fresh at runtime by the
-  # tenant-authz-q consumer — leave "{}" unless bootstrapping a fresh cluster.
+  # Tenant resolution (§2 point 3).
+  # REQUIRED: at least one of SHARED_REALM_ISSUER or REALM_TENANT_MAP_SEED must
+  # be set outside APP_ENV=dev. Both empty causes a startup failure: every request
+  # would return DENY_MALFORMED_IDENTITY with no visible error to callers.
+  #   SHARED_REALM_ISSUER  — Keycloak issuer URL for the shared trial realm.
+  #   REALM_TENANT_MAP_SEED — startup-only JSON {"realm": "tenant_id"} seed for
+  #                           dedicated realms; kept fresh at runtime by the
+  #                           tenant-authz-q consumer. Leave "{}" unless bootstrapping.
   SHARED_REALM_ISSUER: ""
   REALM_TENANT_MAP_SEED: "{}"
 
@@ -130,9 +134,22 @@ env:
   GRPC_MAX_RECV_MSG_SIZE_BYTES: "262144"
   GRPC_MAX_SEND_MSG_SIZE_BYTES: "262144"
 
-  # AWS — five inbound SQS queues, zero outbound (§5). Required outside
-  # APP_ENV=dev: a blank URL fails startup (idle consumers look healthy
-  # while cache never evicts). Override every URL for production.
+  # AWS — five inbound SQS queues, zero outbound (§5). ALL five queue URLs
+  # are required outside APP_ENV=dev: a blank URL starts that consumer idle
+  # (looks healthy on /readyz) while its cache-eviction path silently never
+  # fires. Leaving any queue blank in production means stale cache entries
+  # persist until their TTL — the specific impact per queue:
+  #   MEMBERSHIP_AUTHZ_QUEUE_URL blank → role/dept/membership changes never evict ae:ctx
+  #   USER_AUTHZ_QUEUE_URL        blank → user email changes and deletes never evict ae:ctx
+  #   BILLING_AUTHZ_QUEUE_URL     blank → plan/subscription changes never evict ae:tenant
+  #   TENANT_AUTHZ_QUEUE_URL      blank → realm→tenant map never updated (DENY_UNRESOLVABLE_SUBJECT
+  #                                        for all dedicated-realm tenants after conversion)
+  #   TENDER_AUTHZ_QUEUE_URL      blank → RestrictedTenderSet never populated (tender-ACL
+  #                                        overlay silently skipped for all restricted tenders)
+  # Override every URL for production. The filter policies on these queues are
+  # owned by the producing services (iam-org-membership, iam-user-profile,
+  # Billing, iam-realm-provisioner, Tender Service) — ensure those services
+  # include the correct EventType filters when provisioning the subscriptions.
   AWS_REGION: "ap-south-1"
   AWS_ENDPOINT_URL: ""   # blank → real AWS SQS; only set for LocalStack-backed environments
   MEMBERSHIP_AUTHZ_QUEUE_URL: ""
@@ -192,6 +209,9 @@ env:
   # bearer-gated by DOCS_AUTH_TOKEN (add it to envFromSecret to use it).
   DOCS_ENABLED: "false"
 
+# VALKEY_URL must use rediss:// scheme (TLS in transit) when APP_ENV is not 'dev'.
+# A plaintext redis:// or bare host:port URL causes a startup failure outside dev.
+# Example: rediss://valkey.iam.svc.cluster.local:6379
 envFromSecret:
   - VALKEY_URL
   - AWS_ACCESS_KEY_ID

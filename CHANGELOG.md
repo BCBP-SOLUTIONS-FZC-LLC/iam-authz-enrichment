@@ -8,9 +8,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Security (compatibility-check pass — 2026-10-14)
+
+- **MFA approver-gate future `auth_time` bypass fixed** (`internal/usecase/check.go`): `checkMFAFreshness()` now guards `authTime.After(c.now())` before the duration comparison. A future-dated `auth_time` claim produced a negative `time.Duration` that was never `>` the positive MFA window, silently passing all approver-gated actions. Now fails closed to `DENY_MFA_STALE` for any future-dated `auth_time` (LLD §16 AE-36).
+- **Tender-ACL overlay bypass via trailing-slash path fixed** (`internal/usecase/check.go`): `check()` now returns `DENY_MALFORMED_IDENTITY` when `RequiredAccessLevel != ""` and `TenderID == ""`. A path like `/api/v1/tenders/` produced `TenderID=""` which caused `RequiresTenderACL()` to return `false`, silently skipping the overlay for any tender-scoped route (LLD §16 AE-37).
+
+### Fixed (compatibility-check pass — 2026-10-14)
+
+- **Dockerfile builder image lagged `go.mod`** (`golang:1.26.6-alpine` vs `go 1.26.9`): `go mod download` failed in CI with `go: go.mod requires go >= 1.26.9 (running go 1.26.6; GOTOOLCHAIN=local)`. Re-pinned to `golang:1.26.9-alpine` (digest from `make pin-base-images`). Added `make image-pin-lint` so this drift fails quality CI before the image build.
+- **`platform-events/v2 v2.1.0` migration** (AE-OM-GAP-001, UP-AE-GAP-002, AE-RP-GAP-001): all import paths migrated from `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/...` to `platform-events/v2/pkg/...`. The local `consumer.GlueDecoder` (AE-35) retired in favour of the built-in `events.GlueDecodeCodec{}`.
+- **`platform-pgcommon/v2 v2.0.1` migration** (UP-AE-GAP-004): all import paths migrated to `platform-pgcommon/v2/pkg/...`.
+- **`go-redis/v9 v9.23.0`** (AE-OM-GAP-003): bumped from v9.22.0.
+- **`TenderACL.AccessLevel *string`** (TAC-GAP-001): field changed from `string` to `*string` so an absent `access_level` field (iam-tender-acl omits it via `omitempty` when `HasAccess=false`) decodes as `nil` rather than `""`. `Satisfies()` short-circuits on nil.
+- **TAC-4 HTTP 400 → `ErrNotFound`** (TAC-GAP-005): `GetTenderACL` now maps HTTP 400 (invalid UUID / caller-side error) to `ErrNotFound` instead of `ErrUnavailable`, preventing the §7 stale-if-error path from activating for a protocol error. Same fix applied to `GetBatchTenderACL`.
+- **`authTimeField` Kind-check**: `authTimeField()` in `claims.go` now uses `v.Kind.(*structpb.Value_NumberValue)` type assertion before reading the value, correctly distinguishing `auth_time=0` (the number zero) from a missing/non-numeric claim.
+- **`ExpiresAt` parse layout**: `TenderACL.UnmarshalJSON` now uses `time.RFC3339Nano` instead of `time.RFC3339`, so sub-second timestamps in `expires_at` (e.g. from a test fixture using `time.Now()`) don't break the Valkey round-trip.
+- **Valkey TLS check dead guard removed** (`internal/config/config.go`): the `url != ""` condition was dead code since `envOr("VALKEY_URL", "localhost:6379")` always returns a non-empty default.
+
+### Added (compatibility-check pass — 2026-10-14)
+
+- **`make events-lint`** (`check-events-routing.sh`): CI enforcement that all SQS consumption, outbox config, and dedup processed-message handling pass through `platform-events` only. Wired into `make ci` and `validate-quality.yml`.
+- **`iam_authz_enrichment_tac4_errors_total`** counter: incremented exclusively in `resolveTenderACL`'s error path, making a real iam-tender-acl outage distinguishable from legitimate `DENY_TENDER_ACL_INSUFFICIENT` policy denials in Prometheus.
+- **`iam_authz_enrichment_eviction_errors_total{event}`** counter: incremented when `EvictTenderACLForUser` fails during `HandleMembershipRevoked` (`event=membership_revoked`) or `HandleUserDeleted` (`event=user_deleted`), making systematic SCAN failures alertable without a log review.
+- **`AuthzEnrichmentTAC4ErrorSpike`** Prometheus alert in `deploy/monitoring/app-alerts.yml`: fires when `iam_authz_enrichment_tac4_errors_total` is increasing — the gap where a TAC-4 outage was invisible to automated alerting (neither `StaleIfErrorServing` nor `ServiceUnavailableSpike` would fire for it).
+- **`BatchTenderACLClient`** interface split from `OrgMembershipClient` (`usecase/ports.go`): `GetBatchTenderACL` (TAC-5) moved to its own narrower interface so test fakes for the §3.1 Check() chain don't need to implement a method no Check() path calls.
+- **`NewInvalidator`** now accepts an optional variadic `Recorder` parameter — `cmd/server` passes the real recorder; all existing test call sites compile unchanged (variadic, defaults to `NoopRecorder{}`). `HandleMembershipRevoked` and `HandleUserDeleted` now call `recorder.ObserveEvictionError(event)` on best-effort SCAN failure.
+- **TAC-4 outage section** in `docs/runbook.md`: explains how to distinguish a live iam-tender-acl outage from legitimate access-control denials using `iam_authz_enrichment_tac4_errors_total` and `iam_authz_enrichment_i12_call_latency_seconds`.
+- **LLD v1.30** (`docs/lld/iam-lld-authz-enrichment.md`): documents AE-36 (MFA future `auth_time` fix), AE-37 (empty TenderID guard), corrects §11.2 metric names to `iam_authz_enrichment_*` namespace, adds §11.8 Prometheus alerts table, updates AE-35 to note `consumer.GlueDecoder` retired in favour of platform-events/v2 built-in.
+- **100% test coverage restored**: 9 targeted tests added to cover branches introduced by the compatibility-check fixes (`isClosedPool(nil)`, `TenderACL.UnmarshalJSON` error paths, `GetTenderACL` malformed-body path, `GetBatchTenderACL` 400/malformed/invalid-timestamp paths, `NewInvalidator` recorder branch).
+
+### Security
+
+- **Valkey TLS enforcement**: `VALKEY_URL` must now use the `rediss://` scheme (TLS in transit) when `APP_ENV` is not `dev`. A plaintext URL fails startup with a clear error — authorization context cached in Valkey must be encrypted in transit in staging/production.
+- **`SHARED_REALM_ISSUER` + `REALM_TENANT_MAP_SEED` both empty outside dev** now fails startup with an error (previously only logged a warning). Both empty means no tenant-resolution path — every request would silently return `DENY_MALFORMED_IDENTITY` with no observable difference from a real authz denial.
+- **`DOCS_AUTH_TOKEN` warning**: a startup warning is now logged when `DOCS_ENABLED=true` in production without `DOCS_AUTH_TOKEN`, making the unauthenticated `/asyncapi` exposure visible immediately at deploy time.
+
+### Fixed
+
+- **`AE_PROCESSED_EVENT_TTL` default corrected** from 168h (7 days, at-boundary with SQS lifetime) to 192h (8 days, strictly greater per PE-1), matching iam-user-profile / iam-org-membership. A message delivered on day 6 and redelivered on day 7 was at risk of being re-processed after the old TTL expired.
+- **`internal/adapter/outbound/postgres/wrap.go`**: removed direct `"github.com/jackc/puddle/v2"` import; replaced `errors.Is(err, puddle.ErrClosedPool)` with a string-sentinel helper `isClosedPool()` — all pgx-ecosystem imports now stay inside platform-pgcommon.
+- **`api/asyncapi.yaml` spec correction**: three locations incorrectly claimed that Realm Provisioner's RP-2 direct-paid signup emits "only TenantRealmReady, never TenantConverted". RP-2 always co-emits both; the spec, channel description, and message summary are corrected. `internal/usecase/invalidate.go` and `README.md` carry the same correction.
+- **`deploy/helm/values.yaml` improvements**: `TENDER_ACL_BASE_URL` comment adds explicit REQUIRED warning and consequence; queue URLs block comment corrected from "blank fails startup" (wrong — consumers start idle) to a per-queue impact table.
+
 ### Added
 
-- **tenant-authz-q expanded from 2 → 8 event types** (AE-RP-GAP-002..006, CD-37, LLD §16 AE-38): `TenantSettingChanged` (CD-37 — tenant owner changed a setting, e.g. `residency_mode`; triggers `ae:tenant` eviction), `TenantSuspended` (RP-14 operator/billing-lapse suspension), `TenantReactivated` (operator-sourced, RP-10 — distinct from the billing-sourced `TenantReactivated` on `billing-authz-q`), `TenantOffboarded` (full realm deletion), `TrialExpired` (RP-C1 CronJob, clears `read_only` gate), and `TrialReactivated` (trial extension). All six new types evict `ae:tenant:{tenant}` with no payload decode; the handler routes them through `HandleTenantLifecycleEvent` (for the lifecycle family) and `HandleTenantSettingChanged` (for CD-37). `api/asyncapi.yaml` updated (21 total event types, was 15), `README.md` event table updated, `TestTenantHandler_LifecycleEvents_EvictTenantSliceOnly` and `TestInvalidator_TenantLifecycleEvent_EvictsTenantSliceOnly` added.
+- **`make observability-lint`** (`check-observability-routing.sh`): CI enforcement that all logs, metrics, and traces pass through `platform-gincommon` only. Wired into `make ci` and `validate-quality.yml`.
+- **`make database-lint`** (`check-database-routing.sh`): CI enforcement that all DB connections, configuration, and operations pass through `platform-pgcommon` only — including the HLD §5.4 invariant that `cmd/server` never calls `OpenPool`/migrate/outbox. Wired into `make ci` and `validate-quality.yml`.
+- **`validate-quality.yml` tidy drift check**: `go mod tidy` is now run in CI and the workflow fails if it would change `go.mod`/`go.sum`.
+
+### Added
+
+- **tenant-authz-q expanded from 2 → 8 event types** (AE-RP-GAP-002..006, CD-37, LLD §16 AE-40): `TenantSettingChanged` (CD-37 — tenant owner changed a setting, e.g. `residency_mode`; triggers `ae:tenant` eviction), `TenantSuspended` (RP-14 operator/billing-lapse suspension), `TenantReactivated` (operator-sourced, RP-10 — distinct from the billing-sourced `TenantReactivated` on `billing-authz-q`), `TenantOffboarded` (full realm deletion), `TrialExpired` (RP-C1 CronJob, clears `read_only` gate), and `TrialReactivated` (trial extension). All six new types evict `ae:tenant:{tenant}` with no payload decode; the handler routes them through `HandleTenantLifecycleEvent` (for the lifecycle family) and `HandleTenantSettingChanged` (for CD-37). `api/asyncapi.yaml` updated (21 total event types, was 15), `README.md` event table updated, `TestTenantHandler_LifecycleEvents_EvictTenantSliceOnly` and `TestInvalidator_TenantLifecycleEvent_EvictsTenantSliceOnly` added.
 - `test/fixtures.FakeCache.EvictTenantErr` — write-side error injection for `EvictTenantContext`, completing the full error-coverage parity with the other `Evict*Err` fields.
 
 - Tests: `cmd/server` unit tests for `loadServerTLS` (TLS, mTLS and every failure), `initLibraryMetrics` (fails before gincommon's identity, succeeds after) and `startConsumers` (idle in dev; a queue without a RedrivePolicy reaches the fatal channel); e2e startup tests on the real binary — fail-fast exits for a dev-default sibling URL, a blank queue URL outside dev, a malformed `rediss://` URL, a non-positive `GRPC_REQUEST_TIMEOUT`, missing TLS files, an occupied gRPC port and a queue without a RedrivePolicy, plus SIGTERM exiting 0. `make cover-all` merges unit coverage with an e2e run of a coverage-instrumented binary: whole module 96.9%, `cmd/server` 82.3% (was 16% from unit tests alone).

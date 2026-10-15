@@ -172,7 +172,7 @@ func TestTenderACL_RoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, hit)
 
-	want := domain.TenderACL{HasAccess: true, AccessLevel: domain.AccessLevelApprove}
+	want := domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}
 	require.NoError(t, c.SetTenderACL(ctx, "t1", "tender-1", "u1", want))
 
 	got, hit, err := c.GetTenderACL(ctx, "t1", "tender-1", "u1")
@@ -396,6 +396,8 @@ func TestRedisNilIsTheMissSignal(t *testing.T) {
 	err := client.Get(context.Background(), "nope").Err()
 	assert.ErrorIs(t, err, redis.Nil)
 }
+
+func strPtr(s string) *string { return &s }
 
 // WithTimeouts shares the Valkey and TTL settings but has its own pool and
 // socket timeouts, and leaves the original Cache untouched.

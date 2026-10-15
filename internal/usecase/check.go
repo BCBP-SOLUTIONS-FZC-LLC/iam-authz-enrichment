@@ -125,11 +125,21 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 	}
 
 	// §3.1 step 4: tender-ACL overlay. Only evaluated because step 3 passed.
+	//
+	// Guard: a route that carries required_access_level but yields no
+	// extractable TenderID (e.g. a trailing-slash path /tenders/ or a
+	// misconfigured Envoy route) cannot be correctly evaluated. Deny
+	// rather than silently skip the overlay — the service cannot tell
+	// "no tender applies" apart from "path parsing failed" otherwise.
+	if reqFacts.RequiredAccessLevel != "" && reqFacts.TenderID == "" {
+		return domain.Denied(domain.DenyMalformedIdentity)
+	}
 	if reqFacts.RequiresTenderACL() {
 		acl, err := c.resolveTenderACL(policyCtx, tenant, reqFacts.TenderID, subject)
 		if err != nil {
 			// §7 row 4: fails closed for this overlay only — never escalates
 			// to DENY_SERVICE_UNAVAILABLE or denies non-tender-scoped aspects.
+			c.metrics.ObserveTACDependencyError()
 			return domain.Denied(domain.DenyTenderACLInsufficient)
 		}
 		if !acl.Satisfies(reqFacts.RequiredAccessLevel) {
@@ -145,7 +155,7 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 		}
 	}
 
-	// CD-37 / §16 AE-38: normalise residency_mode before injecting it as a
+	// CD-37 / §16 AE-40: normalise residency_mode before injecting it as a
 	// header. "standard" and "strict" are the two valid values; anything else
 	// (including the empty string a pre-CD-37 Core or a cached entry written
 	// before the field existed will return) fails safe to "strict" — we must
@@ -185,7 +195,7 @@ func buildHeaders(tenant, subject string, m domain.MembershipContext, t domain.T
 		domain.HeaderPlan:         t.Plan,
 		domain.HeaderFeatureFlags: strings.Join(flags, ","),
 		// x-residency-mode is always server-computed — never read from the
-		// inbound request (§16 AE-38). The check() caller has already
+		// inbound request (§16 AE-40). The check() caller has already
 		// normalised ResidencyMode to "standard" or "strict".
 		domain.HeaderResidencyMode: t.ResidencyMode,
 	}
@@ -358,5 +368,13 @@ func (c *Checker) checkMFAFreshness(ctx context.Context, tenant string, claims C
 		return true
 	}
 	authTime := time.Unix(claims.AuthTime, 0)
+	// A future auth_time is either a replayed/forged token or a clock-skew
+	// beyond any reasonable tolerance — neither should pass an approver-gate.
+	// Without this guard, now.Sub(future) is a large negative duration, which
+	// is never > window (positive), so the check would silently allow instead
+	// of deny.
+	if authTime.After(c.now()) {
+		return true
+	}
 	return c.now().Sub(authTime) > window
 }

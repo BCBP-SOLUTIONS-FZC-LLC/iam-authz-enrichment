@@ -9,7 +9,7 @@
 #   https://github.com/kubernetes-sigs/prometheus-adapter/blob/master/docs/config.md
 #
 # After applying, verify the metric is visible:
-#   kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1 | jq '.resources[].name' | grep authz
+#   kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1 | jq '.resources[].name' | grep iam_authz_enrichment
 apiVersion: v1
 kind: ConfigMap
 metadata:

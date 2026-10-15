@@ -102,6 +102,9 @@ func exerciseEveryCollector(r *Recorder) {
 	r.ObserveI12Latency(time.Millisecond)
 	r.ObserveI14Latency(time.Millisecond)
 	r.ObserveResidencyUnknown()
+	r.ObserveTACDependencyError()
+	r.ObserveEvictionError("membership_revoked")
+	r.ObserveEvictionError("user_deleted")
 }
 
 // exerciseGRPCInterceptors runs one Check call through the production gRPC

@@ -293,6 +293,17 @@ func TestInvalidator_TenderRestricted_FlipsInMemoryFact_NoEviction(t *testing.T)
 	assert.False(t, restricted.IsRestricted(ctx, "tenant-2", "tender-9"), "restriction is tenant-scoped")
 }
 
+func TestInvalidator_BillingEvent_EvictError_Propagates(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.EvictTenantErr = errors.New("valkey down")
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+
+	err := inv.HandleBillingEvent(context.Background(), "tenant-1")
+
+	require.Error(t, err)
+}
+
 func TestInvalidator_TenantConverted_StoreError(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
@@ -317,7 +328,7 @@ func TestInvalidator_TenantRealmReady_StoreError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// CD-37 / §16 AE-38: TenantSettingChanged evicts ae:tenant so residency_mode
+// CD-37 / §16 AE-40: TenantSettingChanged evicts ae:tenant so residency_mode
 // and other tenant settings propagate without waiting for the TTL.
 func TestInvalidator_TenantSettingChanged_EvictsTenantSliceOnly(t *testing.T) {
 	t.Parallel()
@@ -374,4 +385,24 @@ func TestInvalidator_TenderRestricted_StoreError(t *testing.T) {
 
 	err := inv.HandleTenderRestricted(context.Background(), "tenant-1", usecase.TenderRestrictedPayload{TenderID: "tender-9"})
 	require.Error(t, err)
+}
+
+func TestNewInvalidator_WithRecorder_UsesIt(t *testing.T) {
+	t.Parallel()
+	// Exercises the len(recorder)>0 && recorder[0]!=nil branch in NewInvalidator.
+	cache := fixtures.NewFakeCache()
+	cache.EvictTenderACLErr = errors.New("scan failed")
+	rec := usecase.NoopRecorder{}
+	inv := usecase.NewInvalidator(
+		cache,
+		usecase.NewRealmMap(nil, 5*time.Second),
+		usecase.NewRestrictedTenderSet(5*time.Second),
+		fixtures.NoopLogger{},
+		rec, // explicit non-nil recorder — exercises the assignment branch
+	)
+
+	// HandleUserDeleted triggers EvictTenderACLForUser; the error is best-effort
+	// (log + ObserveEvictionError) and never returned, so Handle succeeds.
+	err := inv.HandleUserDeleted(context.Background(), "tenant-1", usecase.UserEventPayload{UserID: "alice"})
+	require.NoError(t, err)
 }

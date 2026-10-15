@@ -129,20 +129,36 @@ requires Valkey up + sibling down + a stale entry available).
    grace window (hard-capped regardless of config — see
    `internal/config/config.go`).
 
+## TAC-4 outage (`iam-tender-acl` dependency down)
+
+A `iam-tender-acl` outage is **not** surfaced as `DENY_SERVICE_UNAVAILABLE` —
+it fails closed with `DENY_TENDER_ACL_INSUFFICIENT` instead (§7 row 4: the
+tender-ACL overlay fails closed for that overlay only, never escalates to a
+full-service deny). On-call cannot distinguish a TAC-4 service outage from a
+legitimate access denial by looking at `iam_authz_enrichment_deny_reason_total`
+alone. Use the following signals to identify a TAC-4 outage specifically:
+
+0. `iam_authz_enrichment_tac4_errors_total` — counts only TAC-4 call failures, never policy denials; a nonzero rate fires `AuthzEnrichmentTAC4ErrorSpike` (see `docs/observability/runbooks.md`).
+1. `iam_authz_enrichment_i12_call_latency_seconds` — a sudden spike in latency or a gap (no data) indicates TAC-4 is slow or unreachable.
+2. `iam_authz_enrichment_deny_reason_total{reason="deny_tender_acl_insufficient"}` — an elevated rate that is **not** explained by expected access-control denials. Cross-check with TAC-4 call latency above to distinguish "real denials" from "overlay failed closed due to outage".
+3. `iam-tender-acl`'s own health/alerts — this is almost certainly their incident manifesting in this service.
+4. Logs from this service: look for `"tender acl rebuild"` errors with non-404 causes.
+
+**Note on HTTP 400 vs 503:** a TAC-4 400 (invalid UUID sent by this service) maps to `ErrNotFound` and does NOT activate the §7 stale-if-error path — if you see 400s, the issue is a malformed `tender_id` being sent (check `requestfacts.go`'s `tenderIDFromPath()` for the URL path this service is parsing), not a TAC-4 outage.
+
+**During a TAC-4 outage:** only tender-scoped requests (those whose URL path matches `/tenders/:id`) are affected. Non-tender requests continue to be decided normally. The blast radius is bounded to the overlay step.
+
 ## Alert: `AuthzEnrichmentServiceUnavailableSpike` (warning)
 
-Sustained `DENY_SERVICE_UNAVAILABLE` — §7 has fail-closed (no stale entry
-was available to serve instead), or the tender-ACL overlay's independent
-fail-closed rule is firing on TAC-4 failures (formerly I-12 — as of
-ADR-0007 Wave 3 Phase 4, this call goes to **iam-tender-acl**, not Org &
-Membership; check that service's health first if this alert is isolated to
-tender-scoped requests).
+Sustained `DENY_SERVICE_UNAVAILABLE` — §7 has fail-closed on an Org &
+Membership or Valkey failure (no stale entry was available to serve
+instead). TAC-4 (iam-tender-acl) failures never produce this reason — see
+the TAC-4 outage section above and `AuthzEnrichmentTAC4ErrorSpike`.
 
 1. Same dependency checks as `AuthzEnrichmentStaleIfErrorServing` — this is
    usually the same underlying outage, just past the grace window or with
    no cache warm enough to bridge it (e.g. brand-new tenants/users with no
-   existing cache entry at all). For a TAC-4-only spike, check
-   **iam-tender-acl** specifically, not Org & Membership.
+   existing cache entry at all).
 2. If this is firing with Org & Membership *healthy*, check this service's
    own logs for `"membership rebuild failed, no stale entry available"` —
    the error string in that log line is the actual dial/timeout error, not

@@ -39,11 +39,15 @@ make race            # unit tests with -race flag
 make run             # run server locally (:8080 HTTP, :9091 gRPC, :9090 metrics)
 make build           # compile to bin/iam-authz-enrichment
 make cover / cover-func
-make metrics-check   # observability standard checks (naming, governance, lint, drift, alert tests)
-make metrics-inventory # regenerate docs/observability/metric-registry.md (never edit by hand)
-make prometheusrule  # regenerate deploy/helm/templates/prometheusrule.yaml (never edit by hand)
-make ci              # tidy + fmt-check + vet + lint + arch-lint + metrics-check + test-ci + build
-make docker-up / docker-down  # Valkey + floci (SQS) + floci-ui only
+make metrics-check   # observability standard: collector naming, proposed-metric governance, metricslint on a real scrape + refs + inventory drift, Helm PrometheusRule drift, promtool alert tests
+make metrics-inventory # regenerate docs/observability/metric-registry.md (never edit it by hand)
+make prometheusrule  # regenerate deploy/helm/templates/prometheusrule.yaml from deploy/monitoring/app-alerts.yml (never edit the Helm rule by hand)
+make observability-lint # enforce all logs/metrics/traces pass through platform-gincommon only (.github/scripts/check-observability-routing.sh)
+make database-lint   # enforce all DB connections/config/ops pass through platform-pgcommon only (.github/scripts/check-database-routing.sh)
+make events-lint     # enforce all SQS events/outbox/dedup pass through platform-events only (.github/scripts/check-events-routing.sh)
+make image-pin-lint  # Dockerfile golang:<ver>-alpine tag (and .docker-digests) must match go.mod's go directive
+make ci              # tidy + fmt-check + vet + lint + arch-lint + observability/database/events/image-pin lints + metrics-check + test-ci + build (mirrors CI)
+make docker-up / docker-down   # Valkey + floci (SQS) + floci-ui only — app itself usually runs via `make run`
 make install-hooks   # re-sync .githooks/pre-commit → .git/hooks
 make load-test       # manual 500 RPS harness (not in CI)
 make pin-base-images / make clean
@@ -60,7 +64,7 @@ go test -tags=e2e ./test/e2e/... -run TestGoldenPath_Allow -v
 
 **Tool note:** `golangci-lint` is a `go.mod` tool directive, invoked via `go tool golangci-lint`. `go-arch-lint` is installed on demand by `make arch-lint`.
 
-**Env vars:** every field defaults (`envOr`). Three exceptions — fatal outside `APP_ENV=dev`: (1) `ORG_MEMBERSHIP_BASE_URL`, (2) `TENDER_ACL_BASE_URL`, (3) any `*_AUTHZ_QUEUE_URL` left blank (consumer starts idle, looks healthy, never evicts). Also rejects (any env) two of the five queue URLs set to the same value — corrupts watchdog streak tracking. Use `config.ResolveAppEnv()` — never read `APP_ENV` directly.
+**Env vars:** every field defaults (`envOr`). Five exceptions — all in `config.Load()`, fatal outside `APP_ENV=dev`: (1) `ORG_MEMBERSHIP_BASE_URL` / (2) `TENDER_ACL_BASE_URL` left at the dev default, (3) `VALKEY_URL` without `rediss://` (Valkey must be TLS in non-dev), (4) both `SHARED_REALM_ISSUER` and `REALM_TENANT_MAP_SEED` empty (no tenant-resolution path — every request silently `DENY_MALFORMED_IDENTITY`), (5) any `*_AUTHZ_QUEUE_URL` left blank (consumer starts idle, looks healthy, never evicts). Also rejects (any env) two of the five queue URLs set to the same value — corrupts watchdog streak tracking. Use `config.ResolveAppEnv()` — never read `APP_ENV` directly.
 
 ## Architecture
 

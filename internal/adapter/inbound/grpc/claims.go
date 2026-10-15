@@ -70,12 +70,16 @@ func stringField(fields map[string]*structpb.Value, key string) string {
 
 // authTimeField reads the "auth_time" claim, which may arrive as a JSON
 // number or, from some IdP/metadata pipelines, a numeric string.
+// The Kind check distinguishes auth_time=0 (the number zero, a legitimate
+// but unlikely value) from an absent or non-numeric claim — structpb's
+// GetNumberValue() returns 0.0 for both, so inspecting the value alone
+// cannot distinguish them.
 func authTimeField(fields map[string]*structpb.Value) int64 {
 	v, ok := fields["auth_time"]
 	if !ok {
 		return 0
 	}
-	if v.GetNumberValue() != 0 {
+	if _, isNum := v.Kind.(*structpb.Value_NumberValue); isNum {
 		return int64(v.GetNumberValue())
 	}
 	if s := v.GetStringValue(); s != "" {

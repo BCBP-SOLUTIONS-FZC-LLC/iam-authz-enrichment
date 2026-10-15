@@ -100,7 +100,7 @@ func NewBillingConsumer(queueURL string, deps Deps, opts ...events.ConsumerOptio
 //     paths RP-2/RP-3) — decode the `realm` field, update the in-process
 //     realm→tenant map; TenantConverted additionally evicts ae:tenant.
 //
-//   - TenantSettingChanged (CD-37, LLD §16 AE-38) / TenantSuspended /
+//   - TenantSettingChanged (CD-37, LLD §16 AE-40) / TenantSuspended /
 //     TenantReactivated (operator-sourced, RP-10) / TenantOffboarded /
 //     TrialExpired / TrialReactivated — no payload decode needed; evict
 //     ae:tenant so the next Check fetches fresh tenant context. Note: the

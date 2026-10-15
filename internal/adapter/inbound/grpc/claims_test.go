@@ -103,3 +103,24 @@ func TestAuthTimeField_MissingKey(t *testing.T) {
 	t.Parallel()
 	assert.EqualValues(t, 0, authTimeField(map[string]*structpb.Value{}))
 }
+
+func TestAuthTimeField_NumberZero_IsDistinctFromAbsent(t *testing.T) {
+	t.Parallel()
+	// structpb.GetNumberValue() returns 0.0 for both the number zero and for
+	// a non-number kind. Checking v.Kind.(*structpb.Value_NumberValue) correctly
+	// distinguishes auth_time:0 (a legitimate number) from absent/non-numeric.
+	// In practice auth_time=0 (Unix epoch) is not issued by any real IdP, but
+	// the code must not conflate it with "claim absent" — the zero-number case
+	// must return 0, same as absent, without using GetNumberValue() != 0 check.
+	fields := map[string]*structpb.Value{"auth_time": structpb.NewNumberValue(0)}
+	assert.EqualValues(t, 0, authTimeField(fields), "auth_time=0 must decode as 0, not be confused with absent")
+}
+
+func TestAuthTimeField_NonNumericKind_ReturnsZero(t *testing.T) {
+	t.Parallel()
+	// A boolean auth_time (malformed JWT) must not be mistakenly read as a
+	// number via GetNumberValue() — both return 0.0, so only the Kind check
+	// prevents a false positive.
+	fields := map[string]*structpb.Value{"auth_time": structpb.NewBoolValue(true)}
+	assert.EqualValues(t, 0, authTimeField(fields))
+}

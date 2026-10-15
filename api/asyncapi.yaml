@@ -149,7 +149,7 @@ info:
       publishes_events: false
     TenantSettingChanged:
       on_receipt:
-        - "Evict ae:tenant:{tenant} (no payload decode — tenant_id from envelope is sufficient; CD-37, LLD §16 AE-38)"
+        - "Evict ae:tenant:{tenant} (no payload decode — tenant_id from envelope is sufficient; CD-37, LLD §16 AE-40)"
       publishes_events: false
       note: >-
         Tenant owner changed a setting (e.g. residency_mode). The ae:tenant
@@ -169,9 +169,18 @@ info:
         - "Update the in-process realm→tenant map (realm from payload → this event's tenant_id) — NO cache eviction"
       publishes_events: false
       note: >-
-        Wiring this (not just TenantConverted) matters: a newly-dedicated
-        realm created via direct-paid signup fires only TenantRealmReady,
-        never TenantConverted (LLD §5).
+        Wiring this (not just TenantConverted) matters because both events
+        must reach this consumer to keep the realm→tenant map correct for
+        all provisioning paths. Both RP-2 (direct-paid signup) and RP-3
+        (trial→dedicated conversion) always emit TenantRealmReady followed
+        by TenantConverted in the same outbox transaction — the filter on
+        tenant-authz-q MUST include both event types. With only
+        TenantConverted in the filter, HandleTenantRealmReady is never
+        invoked, and any future RP path that emits TenantRealmReady without
+        TenantConverted would leave the realm map un-updated, causing
+        DENY_UNRESOLVABLE_SUBJECT for all users in that realm. The note in
+        an earlier revision of this spec that said "direct-paid signup fires
+        only TenantRealmReady" was incorrect — RP-2 has always emitted both.
     TenantSuspended:
       on_receipt:
         - "Evict ae:tenant:{tenant} (no payload decode needed — AE-RP-GAP-002)"
@@ -406,6 +415,21 @@ channels:
         deadLetterQueue:
           name: tenant-authz-q-dlq
           maxReceiveCount: 5
+      sns:
+        consumers:
+          - protocol: sqs
+            endpoint:
+              url: "https://sqs.ap-south-1.amazonaws.com/000000000000/tenant-authz-q"
+            filterPolicy:
+              type:
+                - TenantConverted
+                - TenantRealmReady
+                - TenantSuspended
+                - TenantReactivated
+                - TenantOffboarded
+                - TrialExpired
+                - TrialReactivated
+            filterPolicyScope: MessageAttributes
 
   tender-authz-q:
     address: tender-authz-q
@@ -494,7 +518,7 @@ operations:
       Receives eight event types from tenant-authz-q on two sub-families.
       TenantConverted and TenantRealmReady update the in-process realm→tenant
       map (TenantConverted additionally evicts ae:tenant). TenantSettingChanged
-      (CD-37, LLD §16 AE-38), TenantSuspended, TenantReactivated
+      (CD-37, LLD §16 AE-40), TenantSuspended, TenantReactivated
       (operator-sourced, distinct from billing-authz-q's TenantReactivated),
       TenantOffboarded, TrialExpired, and TrialReactivated all evict ae:tenant
       so the next Check rebuilds tenant context from I-8 rather than serving
@@ -912,6 +936,156 @@ components:
           note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
         producer-lifecycle-status: unknown
 
+    TenantSuspended:
+      name: TenantSuspended
+      title: Tenant Suspended
+      summary: A tenant's realm was suspended (operator lockout or billing lapse).
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/EnvelopeOnlyPayload"
+      examples:
+        - name: TenantSuspendedExample
+          summary: A typical TenantSuspended event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d5d"
+            type: "TenantSuspended"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T04:00:00Z"
+            data:
+              realm: "acme-corp"
+              suspended_at: "2026-08-26T04:00:00Z"
+              source: "operator"
+      x-consumer-schema-dependency:
+        # Confirmed against Realm Provisioner's api/asyncapi.yaml
+        # (TenantSuspendedPayload: realm, suspended_at, source, reason?).
+        # This service reads NO payload fields — only the envelope's tenant_id
+        # drives the eviction. The source field distinguishes operator vs
+        # billing_lapse at the producer; this service handles both identically.
+        depends-on-shape:
+          note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
+        producer-lifecycle-status: stable
+
+    TenantReactivatedOperator:
+      name: TenantReactivated
+      title: Tenant Reactivated (Operator)
+      summary: A suspended tenant was reactivated by a platform operator (source=operator). Distinct from the billing-sourced TenantReactivated on billing-authz-q.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/EnvelopeOnlyPayload"
+      examples:
+        - name: TenantReactivatedExample
+          summary: A typical TenantReactivated (operator-sourced) event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d5e"
+            type: "TenantReactivated"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T04:05:00Z"
+            data:
+              realm: "acme-corp"
+              source: "operator"
+      x-consumer-schema-dependency:
+        # Confirmed against Realm Provisioner's api/asyncapi.yaml
+        # (TenantReactivatedPayload: tenant_id, realm, source=operator, reason?).
+        # This service reads NO payload fields. The billing-sourced
+        # TenantReactivated (consumed on billing-authz-q, handler: billingHandler)
+        # has the same event name but comes from a different producer (Billing
+        # Service) via a different queue — no conflict, they are independent
+        # subscriptions with independent SNS filter scopes.
+        depends-on-shape:
+          note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
+        producer-lifecycle-status: stable
+
+    TenantOffboarded:
+      name: TenantOffboarded
+      title: Tenant Offboarded
+      summary: A tenant's realm was fully offboarded (realm deleted, S3 export created).
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/EnvelopeOnlyPayload"
+      examples:
+        - name: TenantOffboardedExample
+          summary: A typical TenantOffboarded event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d5f"
+            type: "TenantOffboarded"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T04:10:00Z"
+            data:
+              realm: "acme-corp"
+              export_s3_key: "exports/acme-corp/2026-08-26.zip"
+              offboarded_at: "2026-08-26T04:10:00Z"
+      x-consumer-schema-dependency:
+        # Confirmed against Realm Provisioner's api/asyncapi.yaml
+        # (TenantOffboardedPayload: tenant_id, realm, export_s3_key, offboarded_at).
+        # This service reads NO payload fields.
+        depends-on-shape:
+          note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
+        producer-lifecycle-status: stable
+
+    TrialExpired:
+      name: TrialExpired
+      title: Trial Expired
+      summary: A trial tenant's trial period ended (Realm Provisioner RP-C1 trial-expiry CronJob).
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/EnvelopeOnlyPayload"
+      examples:
+        - name: TrialExpiredExample
+          summary: A typical TrialExpired event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d60"
+            type: "TrialExpired"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T02:05:00Z"
+            data:
+              trial_ends_at: "2026-08-26T00:00:00Z"
+              grace_ends_at: "2026-09-02T00:00:00Z"
+      x-consumer-schema-dependency:
+        # Confirmed against Realm Provisioner's api/asyncapi.yaml
+        # (TrialExpiredPayload: tenant_id, trial_ends_at, grace_ends_at).
+        # This service reads NO payload fields. Trial expiry changes the
+        # tenant's subscription_status and may gate read_only enforcement —
+        # evicting ae:tenant ensures the next Check reads fresh values rather
+        # than continuing to allow mutations during the grace window.
+        depends-on-shape:
+          note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
+        producer-lifecycle-status: stable
+
+    TrialReactivated:
+      name: TrialReactivated
+      title: Trial Reactivated
+      summary: A trial tenant's trial was extended or reactivated with a new trial_ends_at (Realm Provisioner RP-10).
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/EnvelopeOnlyPayload"
+      examples:
+        - name: TrialReactivatedExample
+          summary: A typical TrialReactivated event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d61"
+            type: "TrialReactivated"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-08-26T04:15:00Z"
+            data:
+              new_trial_ends_at: "2026-09-26T00:00:00Z"
+      x-consumer-schema-dependency:
+        # Confirmed against Realm Provisioner's api/asyncapi.yaml
+        # (TrialReactivatedPayload: tenant_id, new_trial_ends_at).
+        # This service reads NO payload fields.
+        depends-on-shape:
+          note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
+        producer-lifecycle-status: stable
+
     TenantConverted:
       name: TenantConverted
       title: Tenant Converted
@@ -946,7 +1120,7 @@ components:
     TenantRealmReady:
       name: TenantRealmReady
       title: Tenant Realm Ready
-      summary: A dedicated realm finished provisioning and is ready for tenant resolution (fires alone for direct-paid signups, without a preceding TenantConverted).
+      summary: A dedicated realm finished provisioning and is ready for tenant resolution. Always co-emitted with TenantConverted by the Realm Provisioner (RP-2 direct-paid signup and RP-3 trial conversion). HandleTenantRealmReady updates the realm→tenant map only with no cache eviction; TenantConverted additionally evicts ae:tenant.
       tags:
         - $ref: "#/components/tags/consumed"
       contentType: application/json
@@ -974,7 +1148,7 @@ components:
     TenantSettingChanged:
       name: TenantSettingChanged
       title: Tenant Setting Changed
-      summary: A tenant owner changed a tenant-level setting (e.g. residency_mode — CD-37, LLD §16 AE-38).
+      summary: A tenant owner changed a tenant-level setting (e.g. residency_mode — CD-37, LLD §16 AE-40).
       tags:
         - $ref: "#/components/tags/consumed"
       contentType: application/json
@@ -994,124 +1168,6 @@ components:
         # only the envelope's tenant_id is needed to evict ae:tenant.
         # The data payload may carry changed_settings, previous_value, etc.
         # in the producer's schema; all are ignored by this handler.
-        depends-on-shape: {}
-        producer-lifecycle-status: stable
-
-    TenantSuspended:
-      name: TenantSuspended
-      title: Tenant Suspended
-      summary: A tenant was operator-suspended (RP-14) or billing-lapse-suspended. Evicts ae:tenant.
-      tags:
-        - $ref: "#/components/tags/consumed"
-      contentType: application/json
-      payload:
-        $ref: "#/components/schemas/EmptyPayload"
-      examples:
-        - name: TenantSuspendedExample
-          summary: A typical TenantSuspended event envelope.
-          payload:
-            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d5d"
-            type: "TenantSuspended"
-            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
-            time: "2026-10-15T09:01:00Z"
-            data: {}
-      x-consumer-schema-dependency:
-        # No payload fields consumed — only tenant_id from envelope.
-        # Producer payload likely carries reason, source, suspended_at.
-        depends-on-shape: {}
-        producer-lifecycle-status: stable
-
-    TenantReactivatedOperator:
-      name: TenantReactivatedOperator
-      title: Tenant Reactivated (Operator-Sourced)
-      summary: An operator reactivated a suspended tenant (RP-10, source=operator). Distinct from billing-authz-q's TenantReactivated.
-      tags:
-        - $ref: "#/components/tags/consumed"
-      contentType: application/json
-      payload:
-        $ref: "#/components/schemas/EmptyPayload"
-      examples:
-        - name: TenantReactivatedOperatorExample
-          summary: A typical operator-sourced TenantReactivated event envelope.
-          payload:
-            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d5e"
-            type: "TenantReactivated"
-            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
-            time: "2026-10-15T09:02:00Z"
-            data: {}
-      x-consumer-schema-dependency:
-        # Same wire type name as billing-authz-q's TenantReactivated but
-        # arrives on tenant-authz-q from iam-tenant-events SNS (produced by
-        # Realm Provisioner). No payload fields consumed.
-        depends-on-shape: {}
-        producer-lifecycle-status: stable
-
-    TenantOffboarded:
-      name: TenantOffboarded
-      title: Tenant Offboarded
-      summary: Full tenant offboarding complete (Keycloak realm deleted, S3 export created). Evicts ae:tenant.
-      tags:
-        - $ref: "#/components/tags/consumed"
-      contentType: application/json
-      payload:
-        $ref: "#/components/schemas/EmptyPayload"
-      examples:
-        - name: TenantOffboardedExample
-          summary: A typical TenantOffboarded event envelope.
-          payload:
-            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d5f"
-            type: "TenantOffboarded"
-            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
-            time: "2026-10-15T09:03:00Z"
-            data: {}
-      x-consumer-schema-dependency:
-        # No payload fields consumed — only tenant_id from envelope.
-        depends-on-shape: {}
-        producer-lifecycle-status: stable
-
-    TrialExpired:
-      name: TrialExpired
-      title: Trial Expired
-      summary: A tenant's trial period expired (RP-C1 CronJob). Evicts ae:tenant so read_only gate applies immediately.
-      tags:
-        - $ref: "#/components/tags/consumed"
-      contentType: application/json
-      payload:
-        $ref: "#/components/schemas/EmptyPayload"
-      examples:
-        - name: TrialExpiredExample
-          summary: A typical TrialExpired event envelope.
-          payload:
-            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d60"
-            type: "TrialExpired"
-            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
-            time: "2026-10-15T09:04:00Z"
-            data: {}
-      x-consumer-schema-dependency:
-        # Producer payload carries trial_ends_at, grace_ends_at; both ignored.
-        depends-on-shape: {}
-        producer-lifecycle-status: stable
-
-    TrialReactivated:
-      name: TrialReactivated
-      title: Trial Reactivated
-      summary: A tenant's trial was extended (RP-10, new_trial_ends_at). Evicts ae:tenant.
-      tags:
-        - $ref: "#/components/tags/consumed"
-      contentType: application/json
-      payload:
-        $ref: "#/components/schemas/EmptyPayload"
-      examples:
-        - name: TrialReactivatedExample
-          summary: A typical TrialReactivated event envelope.
-          payload:
-            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d61"
-            type: "TrialReactivated"
-            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
-            time: "2026-10-15T09:05:00Z"
-            data: {}
-      x-consumer-schema-dependency:
-        # Producer payload carries new_trial_ends_at; ignored by this handler.
         depends-on-shape: {}
         producer-lifecycle-status: stable
 

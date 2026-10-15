@@ -1,6 +1,10 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
 
 // Department is a single department membership at a specific level
 // (preparator/reviewer/approver, per the parent HLD's three-level model).
@@ -35,7 +39,7 @@ type TenantContext struct {
 	// (tenants.residency_mode — "standard" | "strict"). An empty string means
 	// Core has not yet populated the field (pre-CD-37 cache entry or an
 	// unupgraded Core instance); the check layer normalizes it to "strict"
-	// (fail-safe) and increments authz_residency_unknown_total (LLD §16 AE-38).
+	// (fail-safe) and increments authz_residency_unknown_total (LLD §16 AE-40).
 	ResidencyMode string `json:"residency_mode,omitempty"`
 }
 
@@ -54,10 +58,67 @@ func NewTenantContext() TenantContext {
 	return TenantContext{FeatureFlags: []string{}}
 }
 
-// TenderACL is the result of the tender-ACL overlay check (I-12). Cacheable
+// TenderACL is the result of the tender-ACL overlay check (TAC-4). Cacheable
 // under the normal 15s TTL — unlike the membership rebuild, this endpoint
 // never returns 404; absence of a grant is HasAccess: false.
+//
+// AccessLevel is a pointer so that an absent field on the wire (which
+// iam-tender-acl omits via omitempty when HasAccess is false) is represented
+// as nil rather than an empty string — making the "no level granted" case
+// unambiguous and distinguishable from an explicit empty-string value.
+// Callers must use Satisfies() rather than inspecting AccessLevel directly.
 type TenderACL struct {
+	HasAccess   bool      `json:"has_access"`
+	AccessLevel *string   `json:"access_level"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler. It decodes access_level as
+// *string so an absent field (omitempty on the wire when HasAccess=false)
+// becomes nil rather than an empty string — TAC-GAP-001. It also tolerates
+// an empty-string or null expires_at (treating both as zero time) so a
+// misconfigured test double or an unexpected wire edge case does not silently
+// fail closed to DENY_TENDER_ACL_INSUFFICIENT on an otherwise-valid grant.
+func (a *TenderACL) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		HasAccess   bool    `json:"has_access"`
+		AccessLevel *string `json:"access_level"`
+		ExpiresAt   string  `json:"expires_at"`
+	}
+	var w wire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	a.HasAccess = w.HasAccess
+	a.AccessLevel = w.AccessLevel
+	if w.ExpiresAt != "" {
+		// RFC3339Nano accepts both "2006-01-02T15:04:05Z" (no fractional
+		// seconds) and "2006-01-02T15:04:05.999999999Z" — unlike RFC3339
+		// which rejects any fractional-second suffix. Using RFC3339Nano here
+		// ensures the Valkey round-trip is safe even if ExpiresAt is ever
+		// constructed with non-zero nanoseconds (e.g. in tests via time.Now()).
+		t, err := time.Parse(time.RFC3339Nano, w.ExpiresAt)
+		if err != nil {
+			return fmt.Errorf("expires_at: %w", err)
+		}
+		a.ExpiresAt = t
+	}
+	return nil
+}
+
+// BatchTenderACLItem is one entry in a TAC-5 batch authorization check
+// request (iam-tender-acl POST /internal/tenants/:id/acl/batch-check).
+type BatchTenderACLItem struct {
+	TenderID string `json:"tender_id"`
+	UserID   string `json:"user_id"`
+}
+
+// BatchTenderACLResult is one entry in a TAC-5 batch authorization check
+// response. Same never-404 posture as TAC-4 — a missing grant appears as
+// HasAccess:false. ExpiresAt zero means the grant has no expiry set.
+type BatchTenderACLResult struct {
+	TenderID    string    `json:"tender_id"`
+	UserID      string    `json:"user_id"`
 	HasAccess   bool      `json:"has_access"`
 	AccessLevel string    `json:"access_level"`
 	ExpiresAt   time.Time `json:"expires_at"`
@@ -80,12 +141,16 @@ var accessLevelRank = map[string]int{
 }
 
 // Satisfies reports whether this ACL's granted level meets or exceeds the
-// required level. An unrecognized level never satisfies anything.
+// required level. A nil AccessLevel (absent on the wire) or an unrecognized
+// level never satisfies anything — both fail closed.
 func (a TenderACL) Satisfies(required string) bool {
 	if !a.HasAccess {
 		return false
 	}
-	granted, ok := accessLevelRank[a.AccessLevel]
+	if a.AccessLevel == nil {
+		return false
+	}
+	granted, ok := accessLevelRank[*a.AccessLevel]
 	if !ok {
 		return false
 	}

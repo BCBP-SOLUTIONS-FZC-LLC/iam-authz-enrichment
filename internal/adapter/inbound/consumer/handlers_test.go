@@ -78,7 +78,7 @@ func TestMembershipHandler_UnknownType_NoOp(t *testing.T) {
 	assert.Empty(t, cache.SortedCalls())
 }
 
-func TestUserHandler_UserUpdated_EmailFilter(t *testing.T) {
+func TestUserHandler_UserUpdated_NonEvictionField_IsNoOp(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
 	handler := userHandler(testDeps(cache))
@@ -87,9 +87,15 @@ func TestUserHandler_UserUpdated_EmailFilter(t *testing.T) {
 		"user_id": "alice", "changed_fields": []string{"display_name"},
 	}))
 	require.NoError(t, err)
-	assert.Empty(t, cache.SortedCalls(), "non-eviction UserUpdated must be a no-op")
+	assert.Empty(t, cache.SortedCalls(), "non-eviction field change must be a no-op")
+}
 
-	err = handler(context.Background(), envelope(t, "UserUpdated", "tenant-1", map[string]any{
+func TestUserHandler_UserUpdated_EmailChange_Evicts(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	handler := userHandler(testDeps(cache))
+
+	err := handler(context.Background(), envelope(t, "UserUpdated", "tenant-1", map[string]any{
 		"user_id": "alice", "changed_fields": []string{"email"},
 	}))
 	require.NoError(t, err)
@@ -234,6 +240,19 @@ func TestTenantHandler_TenantRealmReady_NoEviction(t *testing.T) {
 	tenant, ok := realmMap.Lookup(context.Background(), "realm-direct-paid")
 	assert.True(t, ok)
 	assert.Equal(t, "tenant-direct-paid", tenant)
+}
+
+// CD-37 / §16 AE-40: TenantSettingChanged must route to
+// HandleTenantSettingChanged and evict ae:tenant only.
+func TestTenantHandler_TenantSettingChanged_EvictsTenantSliceOnly(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	handler := tenantHandler(testDeps(cache))
+
+	err := handler(context.Background(), envelope(t, "TenantSettingChanged", "tenant-1", map[string]string{}))
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls())
 }
 
 // §5 / AE-RP-GAP-002..006: Realm Provisioner lifecycle events must route to

@@ -52,6 +52,11 @@ func TestLoadAsyncSpec_RealEmbeddedSpec_AllMessagesConsumed(t *testing.T) {
 	assert.Contains(t, con, "MembershipRevoked")
 	assert.Contains(t, con, "UserDeleted")
 	assert.Contains(t, con, "TenderRestricted")
+	assert.Contains(t, con, "TenantSuspended")
+	assert.Contains(t, con, "TenantReactivatedOperator")
+	assert.Contains(t, con, "TenantOffboarded")
+	assert.Contains(t, con, "TrialExpired")
+	assert.Contains(t, con, "TrialReactivated")
 }
 
 // ── asyncMessage.isConsumed / splitMessagesByDirection ────────────────────────
