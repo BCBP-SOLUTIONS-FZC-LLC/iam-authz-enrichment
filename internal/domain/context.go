@@ -35,6 +35,12 @@ type TenantContext struct {
 	FeatureFlags       []string `json:"feature_flags"`
 	SubscriptionStatus string   `json:"subscription_status"`
 	ReadOnly           bool     `json:"read_only"`
+	// ResidencyMode is the tenant's data-residency setting from Core
+	// (tenants.residency_mode — "standard" | "strict"). An empty string means
+	// Core has not yet populated the field (pre-CD-37 cache entry or an
+	// unupgraded Core instance); the check layer normalizes it to "strict"
+	// (fail-safe) and increments authz_residency_unknown_total (LLD §16 AE-40).
+	ResidencyMode string `json:"residency_mode,omitempty"`
 }
 
 // NewMembershipContext returns a MembershipContext with all list fields

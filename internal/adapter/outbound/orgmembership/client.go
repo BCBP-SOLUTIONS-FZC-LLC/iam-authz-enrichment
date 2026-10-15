@@ -115,6 +115,10 @@ type membershipsResponse struct {
 	SubscriptionStatus  string          `json:"subscription_status"`
 	ReadOnly            bool            `json:"read_only"`
 	MFAFreshnessSeconds int             `json:"mfa_freshness_seconds"`
+	// ResidencyMode is Core's tenants.residency_mode ("standard"|"strict").
+	// Added by CD-37. An absent field (pre-CD-37 Core) decodes to "" and the
+	// check layer normalises it to "strict" (fail-safe).
+	ResidencyMode string `json:"residency_mode,omitempty"`
 }
 
 // MembershipContext converts the wire response to the domain type actually
@@ -138,6 +142,7 @@ func (r membershipsResponse) TenantContext() domain.TenantContext {
 	t.Plan = r.Plan
 	t.SubscriptionStatus = r.SubscriptionStatus
 	t.ReadOnly = r.ReadOnly
+	t.ResidencyMode = r.ResidencyMode
 	if r.FeatureFlags != nil {
 		t.FeatureFlags = r.FeatureFlags
 	}

@@ -94,19 +94,17 @@ func NewBillingConsumer(queueURL string, deps Deps, opts ...events.ConsumerOptio
 	return buildConsumer(queueURL, deps, billingHandler(deps), opts...)
 }
 
-// tenantHandler implements tenant-authz-q (§5). It handles two families:
+// tenantHandler implements tenant-authz-q (§5). Two families:
 //
 //   - TenantConverted / TenantRealmReady (Realm Provisioner provisioning
 //     paths RP-2/RP-3) — decode the `realm` field, update the in-process
 //     realm→tenant map; TenantConverted additionally evicts ae:tenant.
 //
-//   - TenantSuspended / TenantReactivated (operator, RP-10/RP-14) /
-//     TenantOffboarded / TrialExpired / TrialReactivated — no payload
-//     decode needed; evict ae:tenant so the next Check fetches fresh tenant
-//     context (plan, feature_flags, subscription_status, read_only). Note:
-//     the billing-sourced TenantReactivated is handled separately on
-//     billing-authz-q; this handler covers only the operator-sourced one
-//     from iam-tenant-events.
+//   - TenantSettingChanged (CD-37, LLD §16 AE-40) / TenantSuspended /
+//     TenantReactivated (operator-sourced, RP-10) / TenantOffboarded /
+//     TrialExpired / TrialReactivated — no payload decode needed; evict
+//     ae:tenant so the next Check fetches fresh tenant context. Note: the
+//     billing-sourced TenantReactivated is handled separately on billing-authz-q.
 func tenantHandler(deps Deps) events.Handler {
 	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 		switch env.Type {
@@ -119,6 +117,8 @@ func tenantHandler(deps Deps) events.Handler {
 				return deps.Invalidator.HandleTenantConverted(ctx, env.TenantID, p)
 			}
 			return deps.Invalidator.HandleTenantRealmReady(ctx, env.TenantID, p)
+		case "TenantSettingChanged":
+			return deps.Invalidator.HandleTenantSettingChanged(ctx, env.TenantID)
 		case "TenantSuspended", "TenantReactivated", "TenantOffboarded", "TrialExpired", "TrialReactivated":
 			return deps.Invalidator.HandleTenantLifecycleEvent(ctx, env.TenantID)
 		default:

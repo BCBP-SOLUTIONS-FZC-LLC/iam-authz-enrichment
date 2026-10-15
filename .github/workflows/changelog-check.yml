@@ -10,6 +10,7 @@ name: Changelog check
     branches: [main, master]
     paths:
       - 'internal/**'
+      - 'api/**'
       - 'cmd/**'
       - 'deploy/**'
       - 'api/**'
@@ -17,13 +18,16 @@ name: Changelog check
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   changelog:
     name: changelog
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -34,6 +38,6 @@ jobs:
           if git diff --name-only "$BASE" "$HEAD" | grep -q '^CHANGELOG\.md$'; then
             echo "CHANGELOG.md updated in this PR — OK."
           else
-            echo "::error file=CHANGELOG.md,title=CHANGELOG not updated::This PR changes internal/, cmd/, or deploy/ but does not update CHANGELOG.md. Add an entry under the Unreleased section before merging."
+            echo "::error file=CHANGELOG.md,title=CHANGELOG not updated::This PR changes internal/, api/, cmd/, or deploy/ but does not update CHANGELOG.md. Add an entry under the Unreleased section before merging."
             exit 1
           fi

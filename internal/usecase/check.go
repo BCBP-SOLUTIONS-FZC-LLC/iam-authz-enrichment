@@ -155,6 +155,19 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 		}
 	}
 
+	// CD-37 / §16 AE-40: normalise residency_mode before injecting it as a
+	// header. "standard" and "strict" are the two valid values; anything else
+	// (including the empty string a pre-CD-37 Core or a cached entry written
+	// before the field existed will return) fails safe to "strict" — we must
+	// never forward data abroad because the value was unknown. The mutation is
+	// on the local copy of tenantCtx only; the cached entry is not affected.
+	if tenantCtx.ResidencyMode != "standard" && tenantCtx.ResidencyMode != "strict" {
+		c.log.Warn("unknown residency_mode, defaulting to strict",
+			map[string]interface{}{"tenant": tenant, "value": tenantCtx.ResidencyMode})
+		c.metrics.ObserveResidencyUnknown()
+		tenantCtx.ResidencyMode = "strict"
+	}
+
 	return domain.Allowed(buildHeaders(tenant, subject, membership, tenantCtx))
 }
 
@@ -163,13 +176,28 @@ func buildHeaders(tenant, subject string, m domain.MembershipContext, t domain.T
 	for _, d := range m.Departments {
 		departments = append(departments, d.DepartmentID+":"+d.Level)
 	}
+	// x-feature-flags is I-8's feature_flags[] verbatim, with one server-side
+	// addition: when the tenant is in read-only (cancelled-grace) mode the
+	// "read_only" flag is appended so downstream services can adapt their UI
+	// (hide write actions, show an upgrade banner) without a separate API call.
+	// Mutations are already denied at §3.1 step 2, so this header is only ever
+	// seen on allowed read requests — consistent with the gap-closure contract
+	// (IAM-to-Commercial-Gap-Closure-Summary §4.6).
+	flags := append([]string{}, t.FeatureFlags...)
+	if t.ReadOnly {
+		flags = append(flags, "read_only")
+	}
 	return map[string]string{
 		domain.HeaderTenantID:     tenant,
 		domain.HeaderUserID:       subject,
 		domain.HeaderDepartments:  strings.Join(departments, ","),
 		domain.HeaderTenantRoles:  strings.Join(m.Roles, ","),
 		domain.HeaderPlan:         t.Plan,
-		domain.HeaderFeatureFlags: strings.Join(t.FeatureFlags, ","),
+		domain.HeaderFeatureFlags: strings.Join(flags, ","),
+		// x-residency-mode is always server-computed — never read from the
+		// inbound request (§16 AE-40). The check() caller has already
+		// normalised ResidencyMode to "standard" or "strict".
+		domain.HeaderResidencyMode: t.ResidencyMode,
 	}
 }
 

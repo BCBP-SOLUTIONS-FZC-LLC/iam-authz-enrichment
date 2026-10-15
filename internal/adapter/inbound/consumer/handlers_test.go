@@ -102,6 +102,9 @@ func TestUserHandler_UserUpdated_EmailChange_Evicts(t *testing.T) {
 	assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:tenant-1:alice")
 }
 
+// TestUserHandler_UserUpdated_StatusChange_Evicts guards against UP-AE-GAP-001:
+// a user-disable fires UserUpdated with changed_fields=["status"]; without this
+// eviction the ae:ctx entry serves stale Allow decisions for up to AE_CTX_TTL.
 func TestUserHandler_UserUpdated_StatusChange_Evicts(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
@@ -112,7 +115,7 @@ func TestUserHandler_UserUpdated_StatusChange_Evicts(t *testing.T) {
 	}))
 	require.NoError(t, err)
 	assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:tenant-1:alice",
-		"a user-disable fires UserUpdated with status in changed_fields — must evict to close the 60 s stale-Allow window")
+		"a user-disable fires UserUpdated with status in changed_fields — must evict to close the stale-Allow window")
 }
 
 func TestUserHandler_DecodeError(t *testing.T) {
@@ -181,29 +184,6 @@ func TestBillingHandler_UnknownType_NoOp(t *testing.T) {
 	assert.Empty(t, cache.SortedCalls())
 }
 
-func TestTenantHandler_LifecycleEvents_EvictTenantSliceOnly(t *testing.T) {
-	t.Parallel()
-	for _, eventType := range []string{
-		"TenantSuspended", "TenantReactivated", "TenantOffboarded", "TrialExpired", "TrialReactivated",
-	} {
-		t.Run(eventType, func(t *testing.T) {
-			t.Parallel()
-			cache := fixtures.NewFakeCache()
-			realmMap := usecase.NewRealmMap(nil, 5*time.Second)
-			inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
-			handler := tenantHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
-
-			err := handler(context.Background(), envelope(t, eventType, "tenant-1", map[string]string{}))
-
-			require.NoError(t, err)
-			assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls(),
-				"%s must evict ae:tenant and nothing else — no realm map update, no per-user eviction", eventType)
-			_, ok := realmMap.Lookup(context.Background(), "realm-1")
-			assert.False(t, ok, "%s must not modify the realm map", eventType)
-		})
-	}
-}
-
 func TestTenantHandler_DecodeError(t *testing.T) {
 	t.Parallel()
 	handler := tenantHandler(testDeps(fixtures.NewFakeCache()))
@@ -260,6 +240,45 @@ func TestTenantHandler_TenantRealmReady_NoEviction(t *testing.T) {
 	tenant, ok := realmMap.Lookup(context.Background(), "realm-direct-paid")
 	assert.True(t, ok)
 	assert.Equal(t, "tenant-direct-paid", tenant)
+}
+
+// CD-37 / §16 AE-40: TenantSettingChanged must route to
+// HandleTenantSettingChanged and evict ae:tenant only.
+func TestTenantHandler_TenantSettingChanged_EvictsTenantSliceOnly(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	handler := tenantHandler(testDeps(cache))
+
+	err := handler(context.Background(), envelope(t, "TenantSettingChanged", "tenant-1", map[string]string{}))
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls())
+}
+
+// §5 / AE-RP-GAP-002..006: Realm Provisioner lifecycle events must route to
+// HandleTenantLifecycleEvent and evict ae:tenant only — no realm map update,
+// no per-user ae:ctx eviction.
+func TestTenantHandler_LifecycleEvents_EvictTenantSliceOnly(t *testing.T) {
+	t.Parallel()
+	for _, eventType := range []string{
+		"TenantSuspended", "TenantReactivated", "TenantOffboarded", "TrialExpired", "TrialReactivated",
+	} {
+		t.Run(eventType, func(t *testing.T) {
+			t.Parallel()
+			cache := fixtures.NewFakeCache()
+			realmMap := usecase.NewRealmMap(nil, 5*time.Second)
+			inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+			handler := tenantHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
+
+			err := handler(context.Background(), envelope(t, eventType, "tenant-1", map[string]string{}))
+
+			require.NoError(t, err)
+			assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls(),
+				"%s must evict ae:tenant and nothing else — no realm map update, no per-user eviction", eventType)
+			_, ok := realmMap.Lookup(context.Background(), "realm-1")
+			assert.False(t, ok, "%s must not modify the realm map", eventType)
+		})
+	}
 }
 
 func TestTenderHandler_TenderRestricted_FlipsFact(t *testing.T) {

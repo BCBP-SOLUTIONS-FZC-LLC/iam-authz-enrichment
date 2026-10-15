@@ -77,6 +77,10 @@ type Recorder interface {
 	ObserveI12Latency(d time.Duration)
 	ObserveI14Latency(d time.Duration)
 	ObserveDecisionLatency(d time.Duration)
+	// ObserveResidencyUnknown increments the counter for Allow decisions where
+	// Core returned an unrecognised residency_mode (empty or unknown value),
+	// triggering the fail-safe "strict" default (LLD §16 AE-40, CD-37).
+	ObserveResidencyUnknown()
 	// ObserveTACDependencyError increments the TAC-4 error counter when
 	// resolveTenderACL returns an error — distinguishing a real iam-tender-acl
 	// outage from legitimate insufficient-access denials in Prometheus.
@@ -99,6 +103,7 @@ func (NoopRecorder) ObserveI8Latency(time.Duration)          {}
 func (NoopRecorder) ObserveI12Latency(time.Duration)         {}
 func (NoopRecorder) ObserveI14Latency(time.Duration)         {}
 func (NoopRecorder) ObserveDecisionLatency(time.Duration)    {}
+func (NoopRecorder) ObserveResidencyUnknown()                {}
 func (NoopRecorder) ObserveTACDependencyError()              {}
 func (NoopRecorder) ObserveEvictionError(string)             {}
 

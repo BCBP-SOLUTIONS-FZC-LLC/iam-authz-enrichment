@@ -31,20 +31,21 @@ import (
 // constructor API has only NewHistogramVec; Observe goes through
 // WithLabelValues() with no values.
 type Recorder struct {
-	decisionsTotal   *gincommon.CounterVec
-	denyReasonTotal  *gincommon.CounterVec
-	decisionLatency  *gincommon.HistogramVec
-	cacheLookups     gincommon.Counter
-	cacheHits        gincommon.Counter
-	negCacheLookups  gincommon.Counter
-	negCacheHits     gincommon.Counter
-	staleServedTotal gincommon.Counter
-	sfCoalescedTotal gincommon.Counter
-	i8Latency        *gincommon.HistogramVec
-	i12Latency       *gincommon.HistogramVec
-	i14Latency       *gincommon.HistogramVec
-	tac4ErrorsTotal  gincommon.Counter
-	evictionErrors   *gincommon.CounterVec
+	decisionsTotal        *gincommon.CounterVec
+	denyReasonTotal       *gincommon.CounterVec
+	decisionLatency       *gincommon.HistogramVec
+	cacheLookups          gincommon.Counter
+	cacheHits             gincommon.Counter
+	negCacheLookups       gincommon.Counter
+	negCacheHits          gincommon.Counter
+	staleServedTotal      gincommon.Counter
+	sfCoalescedTotal      gincommon.Counter
+	i8Latency             *gincommon.HistogramVec
+	i12Latency            *gincommon.HistogramVec
+	i14Latency            *gincommon.HistogramVec
+	residencyUnknownTotal gincommon.Counter
+	tac4ErrorsTotal       gincommon.Counter
+	evictionErrors        *gincommon.CounterVec
 }
 
 // latencyBuckets is 0.5ms .. ~16s (16 exponential buckets, factor 2) —
@@ -102,6 +103,8 @@ func New(reg gincommon.Registerer) (*Recorder, error) {
 			"iam-tender-acl TAC-4 (formerly Org & Membership's I-12) tender-ACL call latency; name kept for continuity (LLD §16 AE-19)."),
 		i14Latency: b.histogram("iam_authz_enrichment_i14_call_latency_seconds",
 			"Org & Membership MFA-freshness (I-14) call latency."),
+		residencyUnknownTotal: b.counter("iam_authz_enrichment_authz_residency_unknown_total",
+			"Allow decisions where Core returned an unrecognised residency_mode; the fail-safe 'strict' default was applied (LLD §16 AE-40, CD-37). A persistent nonzero rate means Core has not yet deployed the CD-37 field or is sending an unexpected value."),
 		tac4ErrorsTotal: b.counter("iam_authz_enrichment_tac4_errors_total",
 			"GetTenderACL (TAC-4) errors — iam-tender-acl dependency failures that made the tender-ACL overlay fail closed. Distinct from legitimate DENY_TENDER_ACL_INSUFFICIENT policy denials."),
 		evictionErrors: b.counterVec("iam_authz_enrichment_eviction_errors_total",
@@ -194,3 +197,5 @@ func (r *Recorder) ObserveI14Latency(d time.Duration) {
 func (r *Recorder) ObserveDecisionLatency(d time.Duration) {
 	r.decisionLatency.WithLabelValues().Observe(d.Seconds())
 }
+
+func (r *Recorder) ObserveResidencyUnknown() { r.residencyUnknownTotal.Inc() }

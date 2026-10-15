@@ -98,11 +98,12 @@ type UserEventPayload struct {
 //     changes, so the cached ae:ctx entry is stale.
 //   - "status" — the user has been enabled or disabled; a disabled user can no
 //     longer authenticate and Org & Membership's I-8 will return 404 on the
-//     next live call. Without eviction the stale ae:ctx entry serves Allow
-//     decisions for up to 60 s (AE_CTX_TTL) after disable. UserUpdated with
-//     changed_fields=["status"] fires in the same UP transaction as
-//     UserStatusChanged, but user-authz-q only subscribes to UserUpdated —
-//     this consumer-side check is the only eviction path for a status change.
+//     next live call. Without evicting on "status", the ae:ctx entry would
+//     serve stale Allow decisions for up to AE_CTX_TTL after the user is
+//     disabled. UserUpdated with changed_fields=["status"] fires in the same
+//     UP transaction as UserStatusChanged, but user-authz-q only subscribes to
+//     UserUpdated — this consumer-side check is the only eviction path for a
+//     status change (UP-AE-GAP-001).
 //
 // All other changed_fields values (display_name, job_title, timezone, …) are
 // no-ops — they do not affect any fact the AE decision cache holds.
@@ -161,14 +162,23 @@ func (inv *Invalidator) HandleBillingEvent(ctx context.Context, tenant string) e
 	return inv.cache.EvictTenantContext(ctx, tenant)
 }
 
+// HandleTenantSettingChanged implements tenant-authz-q TenantSettingChanged
+// (CD-37, LLD §16 AE-40): a tenant-owner changed a setting such as
+// residency_mode, so the ae:tenant entry is stale. Evict it; the next
+// request will rebuild from I-8 and pick up the new value. No payload
+// decoding needed — the tenant_id on the envelope is the only fact required.
+func (inv *Invalidator) HandleTenantSettingChanged(ctx context.Context, tenant string) error {
+	return inv.cache.EvictTenantContext(ctx, tenant)
+}
+
 // HandleTenantLifecycleEvent evicts ae:tenant:{tenant} for any Realm
 // Provisioner lifecycle event that changes tenant status (§5): TenantSuspended,
-// TenantReactivated (operator-sourced, distinct from billing's TenantReactivated
-// on billing-authz-q), TenantOffboarded, TrialExpired, TrialReactivated. All
-// arrive on tenant-authz-q via the iam-tenant-events SNS topic. No payload
-// decode is needed — the eviction is driven entirely by the envelope's
-// own tenant_id, and the tenant-scoped ae:tenant entry will be rebuilt
-// fresh on the next Check that needs it.
+// TenantReactivated (operator-sourced, distinct from the billing-sourced
+// TenantReactivated handled on billing-authz-q), TenantOffboarded,
+// TrialExpired, TrialReactivated. All arrive on tenant-authz-q via the
+// iam-tenant-events SNS topic. No payload decode needed — the eviction is
+// driven entirely by the envelope's tenant_id; the ae:tenant entry rebuilds
+// fresh from I-8 on the next Check.
 func (inv *Invalidator) HandleTenantLifecycleEvent(ctx context.Context, tenant string) error {
 	return inv.cache.EvictTenantContext(ctx, tenant)
 }
