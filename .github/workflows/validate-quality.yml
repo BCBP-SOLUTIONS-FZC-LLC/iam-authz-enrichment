@@ -110,7 +110,7 @@ jobs:
       # Step 11: Dockerfile base image digest pin check
       - name: Dockerfile digest pin check
         run: |
-          if ! grep -qP 'FROM .+@sha256:[0-9a-f]{64}' Dockerfile; then
+          if ! grep -qE 'FROM .+@sha256:[0-9a-f]{64}' Dockerfile; then
             echo "::error file=Dockerfile::All FROM lines must use @sha256:… digest pins (no floating tags). Run 'make pin-base-images' to update."
             exit 1
           fi
@@ -124,8 +124,8 @@ jobs:
             [[ -z "$line" || "$line" == '#'* ]] && continue
             image=$(echo "$line" | awk '{print $1}')
             digest=$(echo "$line" | awk '{print $2}')
-            if ! grep -qF "@sha256:${digest}" Dockerfile; then
-              echo "::error file=.docker-digests::Digest mismatch for ${image}: .docker-digests records sha256:${digest} but Dockerfile does not contain that exact digest. Run 'make pin-base-images' to sync."
+            if ! grep -qF "@${digest}" Dockerfile; then
+              echo "::error file=.docker-digests::Digest mismatch for ${image}: .docker-digests records ${digest} but Dockerfile does not contain that exact digest. Run 'make pin-base-images' to sync."
               exit 1
             fi
           done < .docker-digests
