@@ -139,6 +139,23 @@ jobs:
       # against the same Valkey + LocalStack service containers already
       # running in this job. Runs last (same pattern as iam-tender-acl)
       # so it doesn't block coverage or arch-lint if e2e is slow.
+      # Purge all queues before e2e so the binary's SQS consumer does not
+      # pick up leftover/malformed messages from the integration tests
+      # (TestSQS_DLQForwarding_* leaves messages in the queues). Without
+      # this purge those stale messages delay or block the e2e test's
+      # DepartmentMembershipGranted event from being consumed within 10 s.
+      - name: Purge LocalStack queues before e2e
+        env:
+          AWS_ACCESS_KEY_ID: localstack
+          AWS_SECRET_ACCESS_KEY: localstack
+          AWS_DEFAULT_REGION: ap-south-1
+          AWS_ENDPOINT_URL: http://localhost:4566
+        run: |
+          for queue in membership-authz-q user-authz-q billing-authz-q tenant-authz-q tender-authz-q; do
+            aws sqs purge-queue \
+              --queue-url "http://localhost:4566/000000000000/${queue}" || true
+          done
+
       - name: Build binary (e2e)
         run: make build
 
