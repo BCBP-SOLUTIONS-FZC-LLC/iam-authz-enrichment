@@ -5,7 +5,7 @@
 ```
 iam-authz-enrichment/
 ├── api/
-│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels / 15 event types / 0 published
+│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels / 21 event types / 0 published
 │   └── embed.go                       # //go:embed asyncapi.yaml — served at GET /asyncapi (HTML viewer) and
 │                                       # GET /asyncapi.yaml (raw), gated by DocsConfig (internal/adapter/inbound/
 │                                       # http/router.go) — same convention as iam-org-membership/iam-tender-acl
@@ -87,13 +87,13 @@ iam-authz-enrichment/
 
 ```go
 require (
-    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon v1.6.0
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2 v2.0.0
     github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2    v2.1.0
-    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2  v2.0.1
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2  v2.0.2
 )
 ```
 
-- **`platform-gincommon`** — `pkg/logger` (zap + redaction), `pkg/grpccommon` (`ObservabilityUnaryInterceptors`: panic-recovery → request-id → tracing → metrics → logging). Uses `ObservabilityUnaryInterceptors`, **not** `ProtectedUnaryInterceptors` — Envoy calls over mTLS, no JWT bearer auth to require. `grpccommon.RegisterKnownMethods` bounds the `grpc_method` label. `pkg/gincommon` is the **only** OTel/Prometheus entry point: `InitTracingWithConfig`, `MetricsHandler`, `NewCounterVec`/`NewCounter`/`NewHistogramVec`, `NewTracer`, `NewSpanTracer`, `InjectTraceContext`. Don't reintroduce local copies (hand-rolled tracer, `promauto`, `promhttp`, local Glue decoder). One direct OTel import remains: `otelhttp` on the outbound transport.
+- **`platform-gincommon/v2`** — module path `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2`. `pkg/logger` (zap + redaction), `pkg/grpccommon` (`ObservabilityUnaryInterceptors`: error sanitizer → panic-recovery → request-id → tracing → metrics → logging — non-status handler errors are now sanitized to `Internal "internal server error"`, never leaking `err.Error()` to gRPC clients). Uses `ObservabilityUnaryInterceptors`, **not** `ProtectedUnaryInterceptors` — Envoy calls over mTLS, no JWT bearer auth to require. `grpccommon.RegisterKnownMethods` bounds the `grpc_method` label. `pkg/gincommon` is the **only** OTel/Prometheus entry point: `InitTracingWithConfig`, `MetricsHandler`, `NewCounterVec`/`NewCounter`/`NewHistogramVec`, `NewTracer`, `NewSpanTracer`, `InjectTraceContext`, `AbortWithProblem` (RFC 9457 HTTP error response). `pkg/problem` owns all RFC 9457 Problem Details construction — `NewServiceUnavailableError`, `NewUnauthorizedError`, `NewInternalError`, etc.; `problem.FromResponse`/`Decode` for clients. All HTTP management-surface errors (`/readyz` 503, `docsAuthMiddleware` 401, `/asyncapi` 500) go through `gincommon.AbortWithProblem` with `Content-Type: application/problem+json`. Do not use `ErrorResponse` (removed in v2) or any custom error DTO. Don't reintroduce local copies (hand-rolled tracer, `promauto`, `promhttp`, local Glue decoder). One direct OTel import remains: `otelhttp` on the outbound transport.
 
 - **`platform-events/v2`** — import path `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/...`. `pkg/events` SQS consumer loop (`NewSQSConsumer`, `WithMaxReceiveCount`, `WithConcurrency`, `WithDrainTimeout`, `WithConsumerCodec`), `pkg/config` (`LoadSQS`/`LoadSNS`/`LoadOutbox`/`SNSConfigFromEnv`/`RunnerConfigFromEnv`/`SQSConsumerOptions`). **No publisher or runner** — consume-only (HLD §5.4). Dedup via `skipDuplicate`/`ackUnknown`; store is Valkey SET NX (AE-6).
 

@@ -9,7 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
 
 	httpadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/adapter/inbound/http"
 )
@@ -55,7 +55,9 @@ func TestReadyz_NotReadyBeforeMarkReady(t *testing.T) {
 	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
-	assert.JSONEq(t, `{"status":"starting"}`, rec.Body.String())
+	assert.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"))
+	assert.Contains(t, rec.Body.String(), "SERVICE_UNAVAILABLE")
+	assert.Contains(t, rec.Body.String(), "Service is still starting up.")
 }
 
 func TestReadyz_OKAfterMarkReady(t *testing.T) {

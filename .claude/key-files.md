@@ -90,6 +90,8 @@ All five non-dev fail-fasts live here, not in `main.go`, so `config_test.go` can
 
 AsyncAPI HTML viewer (`GET /asyncapi`) and raw-spec endpoint (`GET /asyncapi.yaml`), gated by `DocsConfig` (`Environment`/`Enabled`/`AuthToken`): always mounted outside `APP_ENV=prod`, opt-in via `DOCS_ENABLED` in prod, optionally bearer-token-gated via `DOCS_AUTH_TOKEN`. No Swagger half (no business HTTP API).
 
+**RFC 9457 Problem Details (platform-gincommon/v2):** all HTTP error responses on the management surface use `gincommon.AbortWithProblem(c, problem.New*Error(...))` from `platform-gincommon/v2/pkg/problem` — the response `Content-Type` is `application/problem+json`. There is no custom error helper; the deleted `writeError` function is gone. Specifically: `docsAuthMiddleware` returns `problem.NewUnauthorizedError("Missing or invalid authentication headers.")`, `/readyz`'s 503 returns `problem.NewServiceUnavailableError("Service is still starting up.")`, and `AsyncAPIHandler`'s spec-parse error returns `problem.NewInternalError(err)` (no detail in 500s per RFC 9457 — the cause is passed as a Go error for logging only, never sent to the client).
+
 `asyncapi.go`'s description/summary truncation **must** go through `truncateRunes` (rune-boundary-safe), never a bare `s[:N]` slice — this was a real bug: `api/asyncapi.yaml`'s `info.description` uses multi-byte box-drawing characters (`─`, U+2500); a byte-level cut landed mid-character, rendering `<EFBFBD>` (U+FFFD). Caught by `TestAsyncAPIHandler_RealSpec_NeverEmitsReplacementCharacter`.
 
 ## internal/adapter/outbound/metrics/recorder.go

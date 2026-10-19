@@ -380,14 +380,8 @@ func TestAsyncAPIHandler_SpecParseError_Returns500(t *testing.T) {
 	AsyncAPIHandler(c)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
-	assert.Contains(t, w.Body.String(), "internal_server_error")
-}
-
-func TestWriteError_WritesJSONErrorBody(t *testing.T) {
-	c, w := newTestGinContext()
-	writeError(c, http.StatusInternalServerError, "internal_server_error")
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
-	assert.Contains(t, w.Body.String(), "internal_server_error")
+	assert.Equal(t, "application/problem+json", w.Header().Get("Content-Type"))
+	assert.Contains(t, w.Body.String(), "INTERNAL_ERROR")
 }
 
 func TestEnvLabelFromGin_NonStringValue_ReturnsEmpty(t *testing.T) {
