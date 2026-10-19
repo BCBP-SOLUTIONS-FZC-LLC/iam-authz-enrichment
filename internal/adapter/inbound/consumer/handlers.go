@@ -101,10 +101,11 @@ func NewBillingConsumer(queueURL string, deps Deps, opts ...events.ConsumerOptio
 //     realm→tenant map; TenantConverted additionally evicts ae:tenant.
 //
 //   - TenantSettingChanged (CD-37, LLD §16 AE-40) / TenantSuspended /
-//     TenantReactivated (operator-sourced, RP-10) / TenantOffboarded /
-//     TrialExpired / TrialReactivated — no payload decode needed; evict
-//     ae:tenant so the next Check fetches fresh tenant context. Note: the
-//     billing-sourced TenantReactivated is handled separately on billing-authz-q.
+//     TenantReactivated (operator-sourced, RP-10) / TrialExpired /
+//     TrialReactivated — no payload decode needed; evict ae:tenant only.
+//
+//   - TenantOffboarded — no payload decode; evict ae:tenant AND best-effort
+//     clear ae:restricted and ae:realm for the tenant (LLD §16 AE-17).
 func tenantHandler(deps Deps) events.Handler {
 	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 		switch env.Type {
@@ -119,7 +120,9 @@ func tenantHandler(deps Deps) events.Handler {
 			return deps.Invalidator.HandleTenantRealmReady(ctx, env.TenantID, p)
 		case "TenantSettingChanged":
 			return deps.Invalidator.HandleTenantSettingChanged(ctx, env.TenantID)
-		case "TenantSuspended", "TenantReactivated", "TenantOffboarded", "TrialExpired", "TrialReactivated":
+		case "TenantOffboarded":
+			return deps.Invalidator.HandleTenantOffboarded(ctx, env.TenantID)
+		case "TenantSuspended", "TenantReactivated", "TrialExpired", "TrialReactivated":
 			return deps.Invalidator.HandleTenantLifecycleEvent(ctx, env.TenantID)
 		default:
 			return ackUnknown(deps.Log, env)

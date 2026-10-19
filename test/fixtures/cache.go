@@ -50,19 +50,21 @@ type FakeCache struct {
 	// Set*Err/Evict*Err simulate a write-side failure on the matching
 	// operation — distinct from the Get-side Err* fields above, so a test
 	// can make reads succeed while a specific write fails (or vice versa).
-	SetCtxErr         error
-	SetTenantErr      error
-	SetTenderACLErr   error
-	SetNegErr         error
-	GetTenderACLErr   error
-	EvictCtxErr       error
-	EvictTenantErr    error
-	EvictNegErr       error
-	EvictTenderACLErr error
-	RealmErr          error
-	RestrictedErr     error
-	SetRealmErr       error
-	SetRestrictedErr  error
+	SetCtxErr                  error
+	SetTenantErr               error
+	SetTenderACLErr            error
+	SetNegErr                  error
+	GetTenderACLErr            error
+	EvictCtxErr                error
+	EvictTenantErr             error
+	EvictNegErr                error
+	EvictTenderACLErr          error
+	RealmErr                   error
+	RestrictedErr              error
+	SetRealmErr                error
+	SetRestrictedErr           error
+	EvictRestrictedByTenantErr error
+	EvictRealmsByTenantErr     error
 
 	Calls []string
 }
@@ -283,6 +285,37 @@ func (f *FakeCache) EvictProcessed(_ context.Context, _, eventID string) error {
 		return f.EvictProcessedErr
 	}
 	delete(f.proc, eventID)
+	return nil
+}
+
+func (f *FakeCache) EvictRestrictedByTenant(_ context.Context, tenant string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("EvictRestrictedByTenant:" + tenant)
+	if f.EvictRestrictedByTenantErr != nil {
+		return f.EvictRestrictedByTenantErr
+	}
+	prefix := tenant + ":"
+	for k := range f.restricted {
+		if strings.HasPrefix(k, prefix) {
+			delete(f.restricted, k)
+		}
+	}
+	return nil
+}
+
+func (f *FakeCache) EvictRealmsByTenant(_ context.Context, tenant string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("EvictRealmsByTenant:" + tenant)
+	if f.EvictRealmsByTenantErr != nil {
+		return f.EvictRealmsByTenantErr
+	}
+	for realm, t := range f.realm {
+		if t == tenant {
+			delete(f.realm, realm)
+		}
+	}
 	return nil
 }
 

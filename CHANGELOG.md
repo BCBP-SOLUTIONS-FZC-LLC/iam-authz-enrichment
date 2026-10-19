@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Fixed (2026-10-19 — AE-17: TenantOffboarded full cleanup)
+
+- **`HandleTenantOffboarded` now clears the no-TTL Valkey keys** (`ae:realm`, `ae:restricted:{tenant}:*`) that would otherwise persist indefinitely after tenant offboarding (LLD §16 AE-17). Previously `TenantOffboarded` only evicted `ae:tenant` via `HandleTenantLifecycleEvent`. Now it routes to a dedicated `HandleTenantOffboarded` which additionally: SCAN+deletes every `ae:restricted:{tenant}:*` key via new `EvictRestrictedByTenant`, SCAN+deletes `ae:realm:{issuer}` keys whose stored value equals the tenant via new `EvictRealmsByTenant`, and clears the matching in-process `RestrictedTenderSet` and `RealmMap` L1 entries. Both extended evictions are best-effort (log-and-continue on error) — same semantics as `HandleMembershipRevoked`'s tender-ACL eviction. A reused realm issuer after offboarding will no longer resolve to the old tenant.
+- **Go-live checklist in `docs/runbook.md` resolved**: AE-17 closed (code fix above); §8.5.1/§7/AE-37 marked as accepted/signed-off design decisions; `google.golang.org/grpc` dependency tracking item marked done (GO-2026-6443 was already removed at v1.40).
+- **New Cache interface methods**: `EvictRestrictedByTenant(ctx, tenant)` and `EvictRealmsByTenant(ctx, tenant)` added to `usecase.Cache` port, Valkey implementation, and `FakeCache` test fixture.
+- **New L1 eviction methods**: `RestrictedTenderSet.ClearByTenant(tenant)` and `RealmMap.DeleteByTenant(tenant)`.
+- **Tests**: `TestInvalidator_TenantOffboarded_EvictsAll`, `TestInvalidator_TenantOffboarded_TenantEvictError_Propagates`, `TestInvalidator_TenantOffboarded_BestEffortErrors_DoNotPropagate`, `TestTenantHandler_TenantOffboarded_EvictsAll`. 100% coverage maintained.
+
 ### Changed (2026-10-19 — platform library upgrades + RFC 9457 HTTP adoption)
 
 - **`platform-gincommon` → `platform-gincommon/v2 v2.0.0` (major migration — new module path).** Import path changed from `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/...` to `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/...` across all 12 Go files. v2.0.0 adds the RFC 9457 Problem Details contract (`pkg/problem`), a gRPC error sanitizer in `ObservabilityUnaryInterceptors` (non-status errors → `Internal "internal server error"`, never leaks `err.Error()` to gRPC clients), and `gincommon.AbortWithProblem` / `gincommon.ClassifyError` / `pkg/problem.New*Error` constructors. Fixes six standard-library CVEs (GO-2026-6603/6605/6607/6608/6611/6612/6613/6617) by bumping the library's own toolchain to `go1.26.9` and `golang.org/x/net` to v0.60.0.

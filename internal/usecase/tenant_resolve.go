@@ -94,6 +94,20 @@ func (r *RealmMap) Lookup(ctx context.Context, realm string) (string, bool) {
 	return r.lookupStore(ctx, realm)
 }
 
+// DeleteByTenant removes all L1 entries for the given tenant. Called during
+// HandleTenantOffboarded so the in-process map doesn't resolve offboarded
+// tenant realms. Valkey cleanup is the caller's responsibility
+// (EvictRealmsByTenant on the Cache).
+func (r *RealmMap) DeleteByTenant(tenant string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for realm, e := range r.m {
+		if e.tenant == tenant {
+			delete(r.m, realm)
+		}
+	}
+}
+
 // Set inserts or updates the realm → tenant mapping. Writes the store
 // first so other replicas can observe it, then L1. A store error is
 // returned so SQS retries the event.

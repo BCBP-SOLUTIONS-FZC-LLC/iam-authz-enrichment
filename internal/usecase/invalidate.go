@@ -171,16 +171,43 @@ func (inv *Invalidator) HandleTenantSettingChanged(ctx context.Context, tenant s
 	return inv.cache.EvictTenantContext(ctx, tenant)
 }
 
-// HandleTenantLifecycleEvent evicts ae:tenant:{tenant} for any Realm
-// Provisioner lifecycle event that changes tenant status (§5): TenantSuspended,
-// TenantReactivated (operator-sourced, distinct from the billing-sourced
-// TenantReactivated handled on billing-authz-q), TenantOffboarded,
-// TrialExpired, TrialReactivated. All arrive on tenant-authz-q via the
-// iam-tenant-events SNS topic. No payload decode needed — the eviction is
-// driven entirely by the envelope's tenant_id; the ae:tenant entry rebuilds
-// fresh from I-8 on the next Check.
+// HandleTenantLifecycleEvent evicts ae:tenant:{tenant} for Realm Provisioner
+// status-change events (§5): TenantSuspended, TenantReactivated
+// (operator-sourced), TrialExpired, TrialReactivated. No payload decode needed.
+// TenantOffboarded is handled by HandleTenantOffboarded — it requires the
+// wider cleanup of ae:realm and ae:restricted (LLD §16 AE-17).
 func (inv *Invalidator) HandleTenantLifecycleEvent(ctx context.Context, tenant string) error {
 	return inv.cache.EvictTenantContext(ctx, tenant)
+}
+
+// HandleTenantOffboarded handles TenantOffboarded (full realm deletion, §5).
+// In addition to the ae:tenant eviction shared by all lifecycle events, it
+// clears the no-TTL keys that would otherwise persist in Valkey indefinitely
+// and cause stale resolution on a reused realm issuer (LLD §16 AE-17):
+//
+//   - ae:restricted:{tenant}:* (all restricted-tender facts for this tenant)
+//   - ae:realm:{issuer} entries whose stored tenant equals this tenant
+//   - The matching L1 entries in RestrictedTenderSet and RealmMap
+//
+// Both extended evictions are best-effort: a failure is logged as a warning
+// but does not return an error (degradation is bounded — stale ae:realm /
+// ae:restricted facts for an offboarded tenant persist until the next pod
+// restart or a manual flush, not indefinitely after the next deploy).
+func (inv *Invalidator) HandleTenantOffboarded(ctx context.Context, tenant string) error {
+	if err := inv.cache.EvictTenantContext(ctx, tenant); err != nil {
+		return fmt.Errorf("evict ae:tenant: %w", err)
+	}
+	if err := inv.cache.EvictRestrictedByTenant(ctx, tenant); err != nil {
+		inv.log.Warn("best-effort ae:restricted eviction failed on TenantOffboarded",
+			map[string]interface{}{"error": err.Error()})
+	}
+	inv.restricted.ClearByTenant(tenant)
+	if err := inv.cache.EvictRealmsByTenant(ctx, tenant); err != nil {
+		inv.log.Warn("best-effort ae:realm eviction failed on TenantOffboarded",
+			map[string]interface{}{"error": err.Error()})
+	}
+	inv.realmMap.DeleteByTenant(tenant)
+	return nil
 }
 
 // TenantRealmEventPayload is tenant-authz-q's decoded payload.

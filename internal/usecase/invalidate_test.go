@@ -343,12 +343,13 @@ func TestInvalidator_TenantSettingChanged_EvictsTenantSliceOnly(t *testing.T) {
 }
 
 // §5 / AE-RP-GAP-002..006: lifecycle events from Realm Provisioner (TenantSuspended,
-// TenantReactivated operator-sourced, TenantOffboarded, TrialExpired, TrialReactivated)
-// must all evict ae:tenant and nothing else — no realm map update, no per-user eviction.
+// TenantReactivated operator-sourced, TrialExpired, TrialReactivated) must all
+// evict ae:tenant and nothing else. TenantOffboarded is handled separately by
+// HandleTenantOffboarded (LLD §16 AE-17).
 func TestInvalidator_TenantLifecycleEvent_EvictsTenantSliceOnly(t *testing.T) {
 	t.Parallel()
 	for _, eventType := range []string{
-		"TenantSuspended", "TenantReactivated", "TenantOffboarded", "TrialExpired", "TrialReactivated",
+		"TenantSuspended", "TenantReactivated", "TrialExpired", "TrialReactivated",
 	} {
 		t.Run(eventType, func(t *testing.T) {
 			t.Parallel()
@@ -359,7 +360,7 @@ func TestInvalidator_TenantLifecycleEvent_EvictsTenantSliceOnly(t *testing.T) {
 
 			require.NoError(t, err)
 			assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls(),
-				"%s must be a single ae:tenant eviction — never touching per-user ae:ctx or ae:neg", eventType)
+				"%s must be a single ae:tenant eviction — never touching ae:realm or ae:restricted", eventType)
 		})
 	}
 }
@@ -373,6 +374,75 @@ func TestInvalidator_TenantLifecycleEvent_EvictError_Propagates(t *testing.T) {
 	err := inv.HandleTenantLifecycleEvent(context.Background(), "tenant-1")
 
 	require.Error(t, err)
+}
+
+// AE-17: TenantOffboarded must evict ae:tenant, ae:restricted:*, ae:realm, and
+// the in-process L1 caches — ae:realm and ae:restricted have no TTL and would
+// otherwise persist indefinitely after offboarding.
+func TestInvalidator_TenantOffboarded_EvictsAll(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	_ = cache.SetRealm(context.Background(), "https://kc.example.com/realms/tenant-1", "tenant-1")
+	_ = cache.SetRestricted(context.Background(), "tenant-1", "tender-a")
+	_ = cache.SetRestricted(context.Background(), "tenant-1", "tender-b")
+	_ = cache.SetRestricted(context.Background(), "tenant-2", "tender-c") // different tenant — must survive
+
+	realmMap := usecase.NewRealmMap(nil, 5*time.Second)
+	realmMap.BindStore(cache)
+	_ = realmMap.Set(context.Background(), "https://kc.example.com/realms/tenant-1", "tenant-1")
+
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	restricted.BindStore(cache)
+	_ = restricted.MarkRestricted(context.Background(), "tenant-1", "tender-a")
+	cache.Calls = nil // reset after seeding
+
+	inv := usecase.NewInvalidator(cache, realmMap, restricted, fixtures.NoopLogger{})
+
+	err := inv.HandleTenantOffboarded(context.Background(), "tenant-1")
+
+	require.NoError(t, err)
+	// ae:tenant evicted
+	assert.Contains(t, cache.SortedCalls(), "EvictTenantContext:tenant-1")
+	// ae:restricted and ae:realm cleared
+	assert.Contains(t, cache.SortedCalls(), "EvictRestrictedByTenant:tenant-1")
+	assert.Contains(t, cache.SortedCalls(), "EvictRealmsByTenant:tenant-1")
+	// ae:restricted entries for tenant-1 gone; tenant-2 untouched
+	ok, _ := cache.GetRestricted(context.Background(), "tenant-1", "tender-a")
+	assert.False(t, ok, "tenant-1 restricted tender must be cleared")
+	ok, _ = cache.GetRestricted(context.Background(), "tenant-2", "tender-c")
+	assert.True(t, ok, "tenant-2 restricted tender must be untouched")
+	// ae:realm entry gone
+	_, ok, _ = cache.GetRealm(context.Background(), "https://kc.example.com/realms/tenant-1")
+	assert.False(t, ok, "tenant-1 realm must be cleared")
+	// L1 RealmMap cleared
+	_, found := realmMap.Lookup(context.Background(), "https://kc.example.com/realms/tenant-1")
+	assert.False(t, found, "L1 RealmMap entry for tenant-1 must be cleared")
+	// L1 RestrictedTenderSet cleared
+	assert.False(t, restricted.IsRestricted(context.Background(), "tenant-1", "tender-a"),
+		"L1 RestrictedTenderSet entry for tenant-1 must be cleared")
+}
+
+func TestInvalidator_TenantOffboarded_TenantEvictError_Propagates(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.EvictTenantErr = errors.New("valkey down")
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+
+	err := inv.HandleTenantOffboarded(context.Background(), "tenant-1")
+
+	require.Error(t, err)
+}
+
+func TestInvalidator_TenantOffboarded_BestEffortErrors_DoNotPropagate(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.EvictRestrictedByTenantErr = errors.New("scan failed")
+	cache.EvictRealmsByTenantErr = errors.New("scan failed")
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+
+	err := inv.HandleTenantOffboarded(context.Background(), "tenant-1")
+
+	require.NoError(t, err, "best-effort restricted/realm eviction errors must not propagate")
 }
 
 func TestInvalidator_TenderRestricted_StoreError(t *testing.T) {

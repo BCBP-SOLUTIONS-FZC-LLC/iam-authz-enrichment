@@ -37,6 +37,13 @@ type Cache interface {
 	SetRealm(ctx context.Context, realm, tenant string) error
 	GetRestricted(ctx context.Context, tenant, tender string) (bool, error)
 	SetRestricted(ctx context.Context, tenant, tender string) error
+
+	// EvictRestrictedByTenant best-effort-deletes every ae:restricted entry for
+	// a tenant (TenantOffboarded full-cleanup — ae:restricted has no TTL).
+	EvictRestrictedByTenant(ctx context.Context, tenant string) error
+	// EvictRealmsByTenant best-effort-deletes every ae:realm entry whose stored
+	// value equals tenant (TenantOffboarded — ae:realm has no TTL).
+	EvictRealmsByTenant(ctx context.Context, tenant string) error
 }
 
 // OrgMembershipClient is the port this layer needs from the sibling Org &

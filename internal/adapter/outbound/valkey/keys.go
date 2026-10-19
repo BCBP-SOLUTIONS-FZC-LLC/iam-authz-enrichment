@@ -42,3 +42,9 @@ func realmKey(realm string) string {
 func restrictedFactKey(tenant, tender string) string {
 	return fmt.Sprintf("ae:restricted:%s:%s", tenant, tender)
 }
+
+// restrictedTenantPattern matches every restricted-tender entry for a tenant —
+// used only for the TenantOffboarded full-cleanup SCAN+delete (§5).
+func restrictedTenantPattern(tenant string) string {
+	return fmt.Sprintf("ae:restricted:%s:*", tenant)
+}

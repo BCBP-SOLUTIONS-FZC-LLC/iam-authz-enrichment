@@ -209,6 +209,73 @@ func (c *Cache) EvictTenderACLForUser(ctx context.Context, tenant, user string) 
 	}
 }
 
+// EvictRestrictedByTenant best-effort-deletes every ae:restricted entry for a
+// tenant (§5 TenantOffboarded). SCAN, not KEYS, to avoid blocking Valkey.
+// Same best-effort posture as EvictTenderACLForUser.
+func (c *Cache) EvictRestrictedByTenant(ctx context.Context, tenant string) error {
+	pattern := restrictedTenantPattern(tenant)
+	var cursor uint64
+	for {
+		keys, next, err := c.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			if err := c.client.Del(ctx, keys...).Err(); err != nil {
+				return err
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return nil
+		}
+	}
+}
+
+// EvictRealmsByTenant best-effort-deletes every ae:realm entry whose stored
+// value equals tenant (§5 TenantOffboarded). ae:realm has no TTL, so without
+// this cleanup a reused realm issuer would still resolve to the old tenant.
+// Scans ae:realm:*, checks each value, deletes matches in batches.
+func (c *Cache) EvictRealmsByTenant(ctx context.Context, tenant string) error {
+	var cursor uint64
+	for {
+		keys, next, err := c.client.Scan(ctx, cursor, "ae:realm:*", 100).Result()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			cmds, err := c.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				for _, k := range keys {
+					pipe.Get(ctx, k)
+				}
+				return nil
+			})
+			if err != nil && !errors.Is(err, redis.Nil) {
+				return err
+			}
+			var toDelete []string
+			for i, cmd := range cmds {
+				val, err := cmd.(*redis.StringCmd).Result()
+				if errors.Is(err, redis.Nil) || err != nil {
+					continue
+				}
+				if val == tenant {
+					toDelete = append(toDelete, keys[i])
+				}
+			}
+			if len(toDelete) > 0 {
+				if err := c.client.Del(ctx, toDelete...).Err(); err != nil {
+					return err
+				}
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return nil
+		}
+	}
+}
+
 // GetNegative checks ae:neg:{tenant}:{user} — a cached "subject rebuild
 // returned 404" sentinel (§4.3).
 func (c *Cache) GetNegative(ctx context.Context, tenant, user string) (bool, error) {

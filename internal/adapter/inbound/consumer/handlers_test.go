@@ -257,11 +257,11 @@ func TestTenantHandler_TenantSettingChanged_EvictsTenantSliceOnly(t *testing.T) 
 
 // §5 / AE-RP-GAP-002..006: Realm Provisioner lifecycle events must route to
 // HandleTenantLifecycleEvent and evict ae:tenant only — no realm map update,
-// no per-user ae:ctx eviction.
+// no restricted-tender eviction. TenantOffboarded is handled separately.
 func TestTenantHandler_LifecycleEvents_EvictTenantSliceOnly(t *testing.T) {
 	t.Parallel()
 	for _, eventType := range []string{
-		"TenantSuspended", "TenantReactivated", "TenantOffboarded", "TrialExpired", "TrialReactivated",
+		"TenantSuspended", "TenantReactivated", "TrialExpired", "TrialReactivated",
 	} {
 		t.Run(eventType, func(t *testing.T) {
 			t.Parallel()
@@ -274,11 +274,37 @@ func TestTenantHandler_LifecycleEvents_EvictTenantSliceOnly(t *testing.T) {
 
 			require.NoError(t, err)
 			assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls(),
-				"%s must evict ae:tenant and nothing else — no realm map update, no per-user eviction", eventType)
+				"%s must evict ae:tenant only — no realm map update, no per-user eviction", eventType)
 			_, ok := realmMap.Lookup(context.Background(), "realm-1")
 			assert.False(t, ok, "%s must not modify the realm map", eventType)
 		})
 	}
+}
+
+// AE-17: TenantOffboarded routes to HandleTenantOffboarded which clears
+// ae:tenant + ae:restricted + ae:realm (no-TTL keys).
+func TestTenantHandler_TenantOffboarded_EvictsAll(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	_ = cache.SetRealm(context.Background(), "https://kc.example.com/realms/tenant-1", "tenant-1")
+	_ = cache.SetRestricted(context.Background(), "tenant-1", "tender-a")
+	realmMap := usecase.NewRealmMap(nil, 5*time.Second)
+	realmMap.BindStore(cache)
+	_ = realmMap.Set(context.Background(), "https://kc.example.com/realms/tenant-1", "tenant-1")
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	restricted.BindStore(cache)
+	_ = restricted.MarkRestricted(context.Background(), "tenant-1", "tender-a")
+	cache.Calls = nil
+
+	inv := usecase.NewInvalidator(cache, realmMap, restricted, fixtures.NoopLogger{})
+	handler := tenantHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
+
+	err := handler(context.Background(), envelope(t, "TenantOffboarded", "tenant-1", map[string]string{}))
+
+	require.NoError(t, err)
+	assert.Contains(t, cache.SortedCalls(), "EvictTenantContext:tenant-1")
+	assert.Contains(t, cache.SortedCalls(), "EvictRestrictedByTenant:tenant-1")
+	assert.Contains(t, cache.SortedCalls(), "EvictRealmsByTenant:tenant-1")
 }
 
 func TestTenderHandler_TenderRestricted_FlipsFact(t *testing.T) {
