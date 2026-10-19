@@ -14,7 +14,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-registry="$(go list -m -f '{{.Dir}}' github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon)/internal/obsregistry/registry.json"
+registry="$(go list -m -f '{{.Dir}}' github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2)/internal/obsregistry/registry.json"
 
 python3 - "$registry" deploy/monitoring/app-alerts.yml <<'PYEOF'
 import json
