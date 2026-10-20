@@ -18,11 +18,11 @@ This service is the platform's **Policy Decision Point**. Envoy is the **Policy 
 | **Identity input** | Reading `sub`/`iss`/`tenant_id`/`auth_time` from Envoy's already-validated JWT metadata | JWT signature/`iss`/`aud`/`exp` validation — exclusively `jwt_authn`'s job |
 | **Tenant resolution** | `iss` → dedicated realm (in-process map) or `tenant_id` claim → shared trial realm | Realm/tenant provisioning, the Keycloak Admin API — never called directly |
 | **Policy decision** | Allow/Deny + typed `DenyReason`, evaluated via the fixed §3.1 precedence chain | Policy *authoring* — policies are Go code, compiled in, redeployed to change; no Rego/OPA, no UI |
-| **Context enrichment** | The 6 trust-boundary headers (`x-tenant-id`, `x-user-id`, `x-departments`, `x-tenant-roles`, `x-plan`, `x-feature-flags`) injected on Allow | User profile data, MFA enrollment — owned by Org & Membership / User Profile |
+| **Context enrichment** | The 7 trust-boundary headers (`x-tenant-id`, `x-user-id`, `x-departments`, `x-tenant-roles`, `x-plan`, `x-feature-flags`, `x-residency-mode`) injected on Allow | User profile data, MFA enrollment — owned by Org & Membership / User Profile |
 | **Caching** | A Valkey-backed read-through cache in front of Org & Membership, with its own TTL/jitter/stale-if-error rules | The source of truth — Org & Membership's own cache/DB is authoritative; this service only bounds staleness |
 | **Event consumption** | 5 SQS queues that keep the cache honest | Publishing — this service emits nothing to the bus |
 
-**Source of truth for one platform-wide contract:** the six injected headers. Every downstream service trusts them implicitly over the mTLS-enforced mesh — there is no other authorization layer between Envoy and a destination service.
+**Source of truth for one platform-wide contract:** the seven injected headers. Every downstream service trusts them implicitly over the mTLS-enforced mesh — there is no other authorization layer between Envoy and a destination service.
 
 ---
 
@@ -68,13 +68,13 @@ Envoy calls `Check(CheckRequest) → CheckResponse` after `jwt_authn` has valida
 
 > **Route-design requirement.** Every tender-scoped route — `GET`, `POST`, `PUT`, `PATCH`, `DELETE` alike — **must** carry the tender ID as a `/tenders/{id}` URL path segment. `tenderIDFromPath` never reads a request body and never reads `context_extensions` for this value, so a route that only places the tender ID in a POST/PATCH/DELETE JSON body will silently skip the tender-ACL overlay for that route (`RequiresTenderACL()` sees an empty `TenderID` and returns `false`) instead of failing loudly — a restricted tender would not actually be protected on that route. This is the responsibility of whoever authors the Envoy/gateway route config for tender-scoped APIs, not something this service can detect or enforce on its own. See [`docs/lld/iam-lld-authz-enrichment.md`](docs/lld/iam-lld-authz-enrichment.md) §4.2 policy 8 and §16 AE-22 for the full rationale.
 
-**On Allow**, `OkHttpResponse.Headers` carries exactly six headers, nothing else — see [decision.go](internal/domain/decision.go):
+**On Allow**, `OkHttpResponse.Headers` carries exactly seven headers, nothing else — see [decision.go](internal/domain/decision.go):
 
 ```
-x-tenant-id  x-user-id  x-departments  x-tenant-roles  x-plan  x-feature-flags
+x-tenant-id  x-user-id  x-departments  x-tenant-roles  x-plan  x-feature-flags  x-residency-mode
 ```
 
-`x-departments` is `department_id:level` pairs, comma-joined. `x-tenant-roles` and `x-feature-flags` are comma-joined lists.
+`x-departments` is `department_id:level` pairs, comma-joined. `x-tenant-roles` and `x-feature-flags` are comma-joined lists. `x-residency-mode` is always server-computed (`"standard"` or `"strict"`) — never read from the inbound request (CD-37 / LLD §16 AE-40). `x-feature-flags` includes a server-side `"read_only"` sentinel appended when the tenant's subscription is cancelled-grace.
 
 **On Deny**, `DeniedHttpResponse` carries a `DenyReason` (see [`ARCHITECTURE.md` §Request flow](ARCHITECTURE.md#request-flow) for the full precedence table) as both the gRPC status message and the HTTP body, mapped to 401/403/503.
 
@@ -132,7 +132,7 @@ Clean Architecture — dependencies point inward; outer layers never import inne
 ```
 iam-authz-enrichment/
 ├── api/
-│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels, 15 event types, 0 published
+│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels, 21 event types, 0 published
 │   └── embed.go                       # //go:embed asyncapi.yaml — served at GET /asyncapi · GET /asyncapi.yaml
 ├── cmd/server/                        # Composition root: config, logger, tracing/metrics identity, gRPC+HTTP+metrics servers, 5 SQS consumers
 │   ├── main.go                        # wiring + graceful shutdown; a fatal background failure exits non-zero (SIGTERM exits 0)
@@ -201,9 +201,9 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 
 | Library | Version | Purpose |
 |---------|---------|---------|
-| `platform-gincommon` | v1.6.0 | zap logger, gRPC observability interceptors (panic-recovery/request-id/tracing/metrics/logging) + `RegisterKnownMethods`, Gin observability middlewares (`/healthz`/`/readyz`), health handler, `InitTracingWithConfig`, `MetricsHandler` (`/metrics`), Tier 3 metric constructors (`NewCounterVec`/`NewCounter`/`NewHistogramVec`, registry-validated), `NewTracer`/`NewSpanTracer`/`InjectTraceContext` — the only OTel/Prometheus entry points, same as iam-org-membership |
+| `platform-gincommon/v2` | v2.0.0 | zap logger, gRPC observability interceptors (error-sanitizer → panic-recovery → request-id → tracing → metrics → logging; non-status handler errors sanitized to `Internal "internal server error"`, never leaking error text to gRPC clients) + `RegisterKnownMethods`, Gin observability middlewares (`/healthz`/`/readyz`), health handler, `InitTracingWithConfig`, `MetricsHandler` (`/metrics`), Tier 3 metric constructors (`NewCounterVec`/`NewCounter`/`NewHistogramVec`, registry-validated), `NewTracer`/`NewSpanTracer`/`InjectTraceContext` — the only OTel/Prometheus entry points, same as iam-org-membership. **RFC 9457 Problem Details**: `pkg/problem` + `gincommon.AbortWithProblem` are the sole HTTP error boundary for all management-surface errors; `Content-Type: application/problem+json` on all 4xx/5xx responses from `/readyz`, `/asyncapi`, and `docsAuthMiddleware` |
 | `platform-events/v2` | v2.1.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]`), Glue decoding (`GlueDecodeCodec`), `InitMetrics`, SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table) |
-| `platform-pgcommon/v2` | v2.0.1 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, query tracer (`gincommon.NewSpanTracer`), `pgmetrics.InitWithIdentity` — same wiring as iam-user-profile / iam-org-membership. **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox |
+| `platform-pgcommon/v2` | v2.0.2 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, query tracer (`gincommon.NewSpanTracer`), `pgmetrics.InitWithIdentity` — same wiring as iam-user-profile / iam-org-membership. v2.0.2: database spans now emit `SpanKindClient` per OTel semantic conventions (was `SpanKindInternal`). **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox |
 | `go-redis/v9` | v9.23.0 | Valkey/Redis client — the only non-platform library with a significant version; import path `github.com/redis/go-redis/v9` |
 
 ---
@@ -212,7 +212,7 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 
 This service is a **pure event consumer** — it subscribes to five SQS queues and publishes **zero** events. `cmd/server` still loads platform-events SNS and outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) so operators see the same `SNS_*` / `OUTBOX_*` warnings as iam-user-profile / iam-org-membership, then skips `NewSNSPublisher`, `outbox.ApplySchema`, and `NewRunner` (HLD §5.4 / EVT-2). Every event received is a cache-invalidation trigger against this service's own Valkey cache, never a domain state mutation of its own.
 
-The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 15 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile, Realm Provisioner) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
+The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 21 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile, Realm Provisioner) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
 
 **Envelope shape:** `{id, type, tenant_id, time, data}` — `tenant_id` is a top-level envelope field, never duplicated inside `data`; the `billing-authz-q` events below read only that field, no `data` decode at all.
 
@@ -245,12 +245,18 @@ The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) �
 | `TenantSubscriptionCancelled` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
 | `TenantReactivated` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` |
 
-**`tenant-authz-q`** (Realm Provisioner, 2 event types) — keep the in-process realm→tenant map fresh for JWT-issuer-based tenant resolution (LLD §8.3); both must be wired. The Realm Provisioner always co-emits both events (RP-2 direct-paid signup and RP-3 trial→dedicated conversion each emit `TenantRealmReady` followed by `TenantConverted` in the same outbox transaction). The SNS subscription filter for this queue **must include both** `EventType` values — omitting `TenantRealmReady` leaves `HandleTenantRealmReady` as dead code and breaks any future provisioning path that may emit it without a co-emitted `TenantConverted`:
+**`tenant-authz-q`** (Realm Provisioner + Tenant Owner, 8 event types) — two sub-families: provisioning events keep the in-process realm→tenant map fresh; lifecycle/settings events evict `ae:tenant:{tenant}` so the next Check picks up fresh tenant context (plan, feature_flags, subscription_status, read_only, residency_mode) from I-8. The Realm Provisioner always co-emits `TenantRealmReady` followed by `TenantConverted` (RP-2 direct-paid signup and RP-3 trial→dedicated conversion, same outbox transaction), so the SNS subscription filter for this queue **must include both** `EventType` values — omitting `TenantRealmReady` leaves `HandleTenantRealmReady` as dead code:
 
 | Event type | Consumed field(s) | Effect |
 |---|---|---|
 | `TenantConverted` | `realm` | Update the realm→tenant map, **plus** evict `ae:tenant:{tenant}` (the realm strategy changed) |
 | `TenantRealmReady` | `realm` | Update the realm→tenant map only — **no** cache eviction |
+| `TenantSettingChanged` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — CD-37/LLD §16 AE-40: a tenant owner changed a setting (e.g. `residency_mode`) |
+| `TenantSuspended` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — operator suspension (RP-14); no billing event covers this path (AE-RP-GAP-002) |
+| `TenantReactivated` (operator-sourced) | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — operator reactivation (RP-10, source=operator); distinct from billing-authz-q's `TenantReactivated` (AE-RP-GAP-003) |
+| `TenantOffboarded` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — after eviction the next Check fetches I-8, receives ErrNotFound, and correctly denies (AE-RP-GAP-004) |
+| `TrialExpired` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — trial expiry changes `subscription_status` and `read_only`; without eviction pre-expiry values persist for up to `AE_TENANT_TTL` (AE-RP-GAP-005) |
+| `TrialReactivated` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — trial extension (new `trial_ends_at`), so the next Check picks up the refreshed date (AE-RP-GAP-006) |
 
 **`tender-authz-q`** (Tender Service, 1 event type) — flips an in-process fact, not a Valkey write:
 
@@ -271,7 +277,8 @@ Every `Authorization.Check` traverses the §3.1 precedence chain. Not every call
 | **Valkey** | Every `Check()` — cache read (`ae:ctx`, `ae:tenant`) | `outbound/valkey/` | soft — bypass | Call Org & Membership directly for this request; a Valkey miss is not an error |
 | **Org & Membership** (`ORG_MEMBERSHIP_BASE_URL`) | Cache miss or Valkey unavailable — I-8 membership rebuild | `outbound/orgmembership/` | stale-if-error, capped 5 min | Stale `ae:ctx`/`ae:tenant` entry present → serve it (§7 row 2). No stale entry → `DENY_SERVICE_UNAVAILABLE` (§7 row 3) |
 | **Org & Membership** (`ORG_MEMBERSHIP_BASE_URL`) | Approver-gated requests only — I-14 MFA-freshness | `outbound/orgmembership/` | fail-closed | `DENY_MFA_STALE` — **never cached**; a sibling outage on this check is treated as "can't confirm freshness", not "service unavailable" |
-| **iam-tender-acl** (`TENDER_ACL_BASE_URL`) | Restricted tender-scoped requests only — TAC-4 tender-ACL | `outbound/orgmembership/` | fail-closed, overlay only | `DENY_TENDER_ACL_INSUFFICIENT` — never escalates to `DENY_SERVICE_UNAVAILABLE`; does not affect non-tender aspects of the same request |
+| **iam-tender-acl** (`TENDER_ACL_BASE_URL`) | Restricted tender-scoped requests only — TAC-4 tender-ACL check | `outbound/orgmembership/` | fail-closed, overlay only | `DENY_TENDER_ACL_INSUFFICIENT` — never escalates to `DENY_SERVICE_UNAVAILABLE`; does not affect non-tender aspects of the same request |
+| **iam-tender-acl** (`TENDER_ACL_BASE_URL`) | Dashboard/batch reads — TAC-5 batch tender-ACL (POST `/internal/tenants/:id/acl/batch-check`, max 50 items, Gin-enforced) | `outbound/orgmembership/` | fail-closed, overlay only | Same posture as TAC-4; callers must chunk requests to ≤ 50 items |
 
 The common path at 95%+ cache-hit rate hits **Valkey only** — no synchronous sibling call at all.
 
@@ -292,10 +299,10 @@ No other service calls this service directly. There is no REST or HTTP business 
 | Queue | Producer | Event types | Action |
 |---|---|---|---|
 | `membership-authz-q` | Org & Membership | `DepartmentMembershipGranted`, `DepartmentMembershipRevoked`, `DepartmentMembershipLevelChanged`, `TenantRoleGranted`, `TenantRoleRevoked`, `MembershipRevoked` | Evict `ae:ctx`/`ae:neg` for the user; `MembershipRevoked` additionally performs a best-effort eviction of all `ae:tender_acl:{tenant}:*:{user}` entries — the whole-membership-removal cascade signal (LLD §16 AE-20) |
-| `user-authz-q` | User Profile (`iam-user-profile`) | `UserUpdated`, `UserAvailabilityChanged`, `UserDeleted` | Evict `ae:ctx`/`ae:neg`; `UserUpdated` only evicts if `"email"` appears in `changed_fields`; `UserDeleted` also evicts all `ae:tender_acl` entries for the user |
+| `user-authz-q` | User Profile (`iam-user-profile`) | `UserUpdated`, `UserAvailabilityChanged`, `UserDeleted` | Evict `ae:ctx`/`ae:neg`; `UserUpdated` only evicts if `"email"` or `"status"` appears in `changed_fields` (UP-AE-GAP-001); `UserAvailabilityChanged` evicts unconditionally but is no longer load-bearing after AE-18 (delegation removed from I-8); `UserDeleted` also evicts all `ae:tender_acl` entries for the user |
 | `billing-authz-q` | Billing Service | `TenantPlanChanged`, `TenantSubscriptionCancelled`, `TenantReactivated` | Evict `ae:tenant:{tenant}` — no payload decode beyond the envelope's `tenant_id` |
-| `tenant-authz-q` | Realm Provisioner | `TenantConverted`, `TenantRealmReady` | Update in-process realm→tenant map; `TenantConverted` also evicts `ae:tenant:{tenant}` (realm strategy changed) |
-| `tender-authz-q` | Tender Service | `TenderRestricted` | Mark `(tenant, tender_id)` restricted in in-process `RestrictedTenderSet` — gates whether TAC-4 is called on subsequent tender-scoped `Check()` calls |
+| `tenant-authz-q` | Realm Provisioner + Tenant Owner (Org & Membership) | `TenantConverted`, `TenantRealmReady`, `TenantSettingChanged`, `TenantSuspended`, `TenantReactivated` (operator), `TenantOffboarded`, `TrialExpired`, `TrialReactivated` | Update in-process realm→tenant map; `TenantConverted` also evicts `ae:tenant`; lifecycle/settings events evict `ae:tenant`; `TenantOffboarded` additionally clears no-TTL `ae:realm` + `ae:restricted` entries (AE-17) |
+| `tender-authz-q` | Tender Service | `TenderRestricted` | Mark `(tenant, tender_id)` restricted in in-process `RestrictedTenderSet`; payload validation rejects events with a missing or empty `tender_id` (AE-TAC-GAP-001 fix) — gates whether TAC-4 is called on subsequent tender-scoped `Check()` calls |
 
 **Events this service produces:** **None.** This service is a pure consumer. `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner` are never called (HLD §5.4 / EVT-2). The full machine-readable consumer contract is [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `GET /asyncapi`.
 
@@ -402,6 +409,7 @@ cat > mockorg/api/v1/internal/users/alice/memberships <<'EOF'
   "feature_flags": ["flag-a"],
   "subscription_status": "active",
   "read_only": false,
+  "residency_mode": "standard",
   "mfa_freshness_seconds": 300
 }
 EOF
@@ -417,7 +425,7 @@ ORG_MEMBERSHIP_BASE_URL=http://localhost:8081 ORG_MEMBERSHIP_TIMEOUT=2s \
 TENDER_ACL_BASE_URL=http://localhost:8081 TENDER_ACL_TIMEOUT=2s make run
 ```
 
-Re-running the same `grpcurl`/`grpcui` `Check` call from above (`sub: "alice"`, `tenant_id: "tenant-acme"`) now returns `okResponse` with all six headers (`x-tenant-id: tenant-acme`, `x-user-id: alice`, `x-departments: fd72f513-45f0-46ca-a1ed-9183be72484c:reviewer`, `x-tenant-roles: tenant_admin`, `x-plan: pro`, `x-feature-flags: flag-a`) instead of a denial. `department_id` is a UUID here to match the real Org & Membership schema (`departments.id`) — this service passes whatever string the sibling sends straight through as `<department_id>:<level>` (`internal/usecase/check.go`'s `buildHeaders`) without interpreting its format, so the mock could use any string, but a UUID is what production actually looks like.
+Re-running the same `grpcurl`/`grpcui` `Check` call from above (`sub: "alice"`, `tenant_id: "tenant-acme"`) now returns `okResponse` with all seven headers (`x-tenant-id: tenant-acme`, `x-user-id: alice`, `x-departments: fd72f513-45f0-46ca-a1ed-9183be72484c:reviewer`, `x-tenant-roles: tenant_admin`, `x-plan: pro`, `x-feature-flags: flag-a`, `x-residency-mode: standard`) instead of a denial. `department_id` is a UUID here to match the real Org & Membership schema (`departments.id`) — this service passes whatever string the sibling sends straight through as `<department_id>:<level>` (`internal/usecase/check.go`'s `buildHeaders`) without interpreting its format, so the mock could use any string, but a UUID is what production actually looks like.
 
 From there, edit the JSON file (or the request) to exercise other branches of §3.1 without touching any code:
 - A `sub` with no matching file → 404 → `DENY_UNRESOLVABLE_SUBJECT`.
@@ -770,7 +778,7 @@ Every `Check()` touches at most two synchronous dependencies (Valkey, Org & Memb
 - [`.claude/CLAUDE.md`](.claude/CLAUDE.md) — top-level guidance for Claude Code working in this repo.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layer model, request-flow/cache/event/failure-handling diagrams, key invariants, threat model.
 - [`docs/lld/iam-lld-authz-enrichment.md`](docs/lld/iam-lld-authz-enrichment.md) — the Low-Level Design: precedence chain, cache-key table, §7 event-invalidation narrative, §9 `DenyReason`/status table, §16 `AE-#` decision register.
-- [`api/asyncapi.yaml`](api/asyncapi.yaml) — the 5-queue/15-event-type consumer contract (see [§ Event architecture](#event-architecture)); also served live at `GET /asyncapi`/`GET /asyncapi.yaml`.
+- [`api/asyncapi.yaml`](api/asyncapi.yaml) — the 5-queue/21-event-type consumer contract (see [§ Event architecture](#event-architecture)); also served live at `GET /asyncapi`/`GET /asyncapi.yaml`.
 - [`VERSIONING.md`](VERSIONING.md) — SemVer rules for the runtime contract, image tag scheme, maintainer release checklist.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch naming, PR checklist, commit style, how to extend each layer.
 - [`docs/architecture/`](docs/architecture/) — standalone Mermaid diagram sources.

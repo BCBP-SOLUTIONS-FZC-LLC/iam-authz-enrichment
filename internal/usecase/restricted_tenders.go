@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 )
@@ -66,6 +67,21 @@ func (s *RestrictedTenderSet) MarkRestricted(ctx context.Context, tenant, tender
 	defer s.mu.Unlock()
 	s.m[restrictedKey(tenant, tender)] = restrictedEntry{restricted: true}
 	return nil
+}
+
+// ClearByTenant removes all L1 entries for the given tenant. Called during
+// HandleTenantOffboarded so the in-process map doesn't serve stale facts for
+// an offboarded tenant until the pod restarts. Valkey cleanup is the caller's
+// responsibility (EvictRestrictedByTenant on the Cache).
+func (s *RestrictedTenderSet) ClearByTenant(tenant string) {
+	prefix := tenant + ":"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.m {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.m, k)
+		}
+	}
 }
 
 // IsRestricted reports whether (tenant, tender) is flagged restricted.

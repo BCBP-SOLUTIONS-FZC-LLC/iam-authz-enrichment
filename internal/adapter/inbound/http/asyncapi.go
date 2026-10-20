@@ -14,6 +14,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	apispec "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/api"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/problem"
 )
 
 // asyncSpecOnce/asyncSpecVal/asyncSpecErr cache the parsed AsyncAPI spec
@@ -148,9 +150,7 @@ type asyncProp struct {
 func AsyncAPIHandler(c *gin.Context) {
 	spec, err := loadAsyncSpec()
 	if err != nil {
-		// Do not leak the raw YAML-parse error to the caller — log the full
-		// detail and return a generic 500.
-		writeError(c, http.StatusInternalServerError, "internal_server_error")
+		gincommon.AbortWithProblem(c, problem.NewInternalError(err))
 		return
 	}
 
@@ -191,15 +191,6 @@ func envMiddleware(env string) gin.HandlerFunc {
 // in-memory []byte, not a disk read.
 func AsyncAPIYAMLHandler(c *gin.Context) {
 	c.Data(http.StatusOK, "application/yaml; charset=utf-8", apispec.AsyncAPISpec)
-}
-
-// writeError writes a minimal {"error": code} JSON body — this service has
-// no shared error-response helper (it has no business HTTP API to have
-// grown one for), so the doc-route handlers above own this one locally
-// rather than pulling in a whole error-response package for a single 500
-// path.
-func writeError(c *gin.Context, status int, code string) {
-	c.JSON(status, gin.H{"error": code})
 }
 
 // ── Renderer ──────────────────────────────────────────────────────────────────

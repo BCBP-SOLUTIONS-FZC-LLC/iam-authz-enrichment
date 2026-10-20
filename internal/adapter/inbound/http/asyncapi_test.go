@@ -36,9 +36,11 @@ func TestParseAsyncSpec_InvalidYAML_ReturnsError(t *testing.T) {
 
 // TestLoadAsyncSpec_RealEmbeddedSpec exercises the actual embedded
 // api/asyncapi.yaml (via loadAsyncSpec, which sync.Once-wraps this same
-// parse) end to end — this service is receive-only, so all 20 event types
-// must come back tagged consumed, and there must be zero published
-// messages. Count: 6 membership + 3 user + 3 billing + 7 tenant + 1 tender.
+// parse) end to end — this service is receive-only, so all 21 event types
+// must come back tagged consumed, and there must be zero published messages.
+// tenant-authz-q grew from 2 → 8 types: +TenantSettingChanged (CD-37),
+// +TenantSuspended/TenantReactivatedOperator/TenantOffboarded/TrialExpired/
+// TrialReactivated (AE-RP-GAP-002..006).
 func TestLoadAsyncSpec_RealEmbeddedSpec_AllMessagesConsumed(t *testing.T) {
 	spec, err := loadAsyncSpec()
 	require.NoError(t, err)
@@ -46,7 +48,7 @@ func TestLoadAsyncSpec_RealEmbeddedSpec_AllMessagesConsumed(t *testing.T) {
 
 	pub, con := splitMessagesByDirection(spec.Comps.Messages)
 	assert.Empty(t, pub, "this service publishes zero events")
-	assert.Len(t, con, 20)
+	assert.Len(t, con, 21)
 	assert.Contains(t, con, "MembershipRevoked")
 	assert.Contains(t, con, "UserDeleted")
 	assert.Contains(t, con, "TenderRestricted")
@@ -378,14 +380,8 @@ func TestAsyncAPIHandler_SpecParseError_Returns500(t *testing.T) {
 	AsyncAPIHandler(c)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
-	assert.Contains(t, w.Body.String(), "internal_server_error")
-}
-
-func TestWriteError_WritesJSONErrorBody(t *testing.T) {
-	c, w := newTestGinContext()
-	writeError(c, http.StatusInternalServerError, "internal_server_error")
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
-	assert.Contains(t, w.Body.String(), "internal_server_error")
+	assert.Equal(t, "application/problem+json", w.Header().Get("Content-Type"))
+	assert.Contains(t, w.Body.String(), "INTERNAL_ERROR")
 }
 
 func TestEnvLabelFromGin_NonStringValue_ReturnsEmpty(t *testing.T) {

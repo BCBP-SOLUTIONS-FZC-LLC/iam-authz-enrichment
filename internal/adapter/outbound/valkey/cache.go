@@ -140,9 +140,15 @@ func (c *Cache) EvictMembershipContext(ctx context.Context, tenant, user string)
 	return c.client.Del(ctx, ctxKey(tenant, user)).Err()
 }
 
-// GetTenantContext reads ae:tenant:{tenant}.
+// GetTenantContext reads ae:tenant:{tenant} and normalises ResidencyMode so
+// that all callers receive a canonical ("standard" | "strict") value even
+// when the cached entry was written before CD-37 or by a pre-upgrade Core.
 func (c *Cache) GetTenantContext(ctx context.Context, tenant string) (domain.TenantContext, domain.CacheResult, error) {
-	return getJittered[domain.TenantContext](ctx, c, tenantKey(tenant))
+	tc, result, err := getJittered[domain.TenantContext](ctx, c, tenantKey(tenant))
+	if result != domain.CacheMiss {
+		tc.NormaliseResidencyMode()
+	}
+	return tc, result, err
 }
 
 // SetTenantContext writes ae:tenant:{tenant}.
@@ -209,6 +215,50 @@ func (c *Cache) EvictTenderACLForUser(ctx context.Context, tenant, user string) 
 	}
 }
 
+// EvictRestrictedByTenant best-effort-deletes every ae:restricted entry for a
+// tenant (§5 TenantOffboarded). SCAN, not KEYS, to avoid blocking Valkey.
+// Same best-effort posture as EvictTenderACLForUser.
+func (c *Cache) EvictRestrictedByTenant(ctx context.Context, tenant string) error {
+	pattern := restrictedTenantPattern(tenant)
+	var cursor uint64
+	for {
+		keys, next, err := c.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			if err := c.client.Del(ctx, keys...).Err(); err != nil {
+				return err
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return nil
+		}
+	}
+}
+
+// EvictRealmsByTenant deletes every ae:realm:{issuer} entry for a tenant and
+// the ae:realm-by-tenant:{tenant} reverse-index Set in a single DEL (§5
+// TenantOffboarded). Uses the reverse index written by SetRealm so the
+// lookup is O(k) where k is the number of realms for this tenant, not O(n)
+// where n is the total number of ae:realm keys across all tenants.
+func (c *Cache) EvictRealmsByTenant(ctx context.Context, tenant string) error {
+	reverseKey := realmByTenantKey(tenant)
+	realms, err := c.client.SMembers(ctx, reverseKey).Result()
+	if err != nil {
+		return err
+	}
+	// Build the full DEL key list: every forward ae:realm:{issuer} plus the
+	// reverse-index key itself.
+	keysToDelete := make([]string, 0, len(realms)+1)
+	for _, r := range realms {
+		keysToDelete = append(keysToDelete, realmKey(r))
+	}
+	keysToDelete = append(keysToDelete, reverseKey)
+	return c.client.Del(ctx, keysToDelete...).Err()
+}
+
 // GetNegative checks ae:neg:{tenant}:{user} — a cached "subject rebuild
 // returned 404" sentinel (§4.3).
 func (c *Cache) GetNegative(ctx context.Context, tenant, user string) (bool, error) {
@@ -269,9 +319,18 @@ func (c *Cache) GetRealm(ctx context.Context, realm string) (string, bool, error
 	return s, true, nil
 }
 
-// SetRealm writes ae:realm:{issuer} with no TTL.
+// SetRealm writes ae:realm:{issuer} (forward) and adds the issuer to the
+// ae:realm-by-tenant:{tenant} reverse-index Set in a single MULTI/EXEC
+// transaction so both writes are atomic — a partial failure (forward key
+// written but SAdd not reached) would leave EvictRealmsByTenant unable to
+// find and clean up the forward key on offboarding.
 func (c *Cache) SetRealm(ctx context.Context, realm, tenant string) error {
-	return c.client.Set(ctx, realmKey(realm), tenant, 0).Err()
+	_, err := c.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.Set(ctx, realmKey(realm), tenant, 0)
+		pipe.SAdd(ctx, realmByTenantKey(tenant), realm)
+		return nil
+	})
+	return err
 }
 
 // GetRestricted reports whether ae:restricted:{tenant}:{tender} exists.

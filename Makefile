@@ -61,6 +61,7 @@ help:
 	@echo "  make fmt             - go fmt ./..."
 	@echo "  make vet             - go vet (default build + every test build tag)"
 	@echo "  make lint            - run golangci-lint (default build + every test build tag)"
+
 	@echo "  make arch-lint       - enforce .go-arch-lint.yml component boundaries"
 	@echo "  make observability-lint - enforce all logs/metrics/traces route through platform-gincommon"
 	@echo "  make database-lint      - enforce all DB connections/config/ops route through platform-pgcommon"

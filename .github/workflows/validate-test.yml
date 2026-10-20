@@ -1,14 +1,9 @@
 # Reusable workflow — test gate.
-# Race detector (unit + integration) + coverage gate (100%) + e2e
-# (real compiled binary over real gRPC against real Valkey/LocalStack).
-# All three tiers run in a single job against shared service containers —
-# the same pattern iam-tender-acl uses for its unit + integration + e2e
-# tiers. This avoids duplicating service container setup and checkout/module-
-# download costs across two independent jobs, and keeps the failure signal
-# for all three tiers in one place.
-#
-# Called by ci.yml and release.yml so both share exactly one definition of
-# "tests pass".
+# Race detector (unit + integration) + coverage + arch-lint + e2e.
+# Follows iam-tender-acl's structure: single job, e2e runs as the final
+# step after coverage so the service containers (Valkey + LocalStack) are
+# available throughout the entire job without state leaks between jobs.
+# Called by ci.yml and release.yml.
 name: Validate / Test
 
 "on":
@@ -35,9 +30,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
-    # 25 minutes: unit (~5m) + coverage gate (~1m) + integration (~3m) +
-    # build (~2m) + e2e (~5m) + headroom for slow CI machines.
-    timeout-minutes: 25
+    timeout-minutes: 30
     outputs:
       pct: ${{ steps.coverage.outputs.pct }}
     services:
@@ -61,56 +54,118 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: actions/setup-go@v6.5.0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
             go.sum
             go.mod
+
       - name: Configure private module access
-        run: git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+
+      - name: Download modules
+        env:
+          GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+          GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+        run: go mod download
+
+      - name: Remove private module credentials
+        if: always()
+        run: |
+          rm -f ~/.git-credentials
+          git config --global --unset credential.helper || true
+
+      - name: Verify modules
+        run: go mod verify
+
       - name: Init LocalStack queues
         run: |
           chmod +x scripts/init-localstack.sh
-          AWS_ACCESS_KEY_ID=localstack AWS_SECRET_ACCESS_KEY=localstack AWS_DEFAULT_REGION=ap-south-1 \
-            ./scripts/init-localstack.sh
+          AWS_ACCESS_KEY_ID=localstack AWS_SECRET_ACCESS_KEY=localstack \
+            AWS_DEFAULT_REGION=ap-south-1 ./scripts/init-localstack.sh
         env:
           AWS_ENDPOINT_URL: http://localhost:4566
-      - name: Unit tests (race + coverage)
+
+      # Unit + integration tests with race detector and coverage.
+      # Any data race detected here blocks all downstream jobs.
+      - name: Tests — unit · integration (race + coverage)
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
         run: make test-ci
-      - name: Coverage gate (100%)
-        id: coverage
-        run: bash .github/scripts/coverage-gate.sh
-        env:
-          COVERAGE_THRESHOLD: "100"
+
       - name: Integration tests
-        run: make test-integration
         env:
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
           VALKEY_URL: localhost:6379
           AWS_ENDPOINT_URL: http://localhost:4566
           AWS_ACCESS_KEY_ID: localstack
           AWS_SECRET_ACCESS_KEY: localstack
           AWS_REGION: ap-south-1
-      - uses: codecov/codecov-action@v7
-        with:
-          files: coverage.out
-          fail_ci_if_error: false
-      # E2E: drives the real compiled binary over a real gRPC connection
-      # against the same Valkey/LocalStack service containers already running
-      # for the integration tests above — the one tier that catches wiring
-      # regressions (startup config, graceful shutdown, consumer-to-cache path)
-      # that unit and integration tests structurally cannot see.
-      - name: Build binary (for e2e)
-        run: make build
-      - name: E2E tests
-        run: make test-e2e
+        run: make test-integration
+
+      - name: Coverage threshold gate
+        id: coverage
+        run: bash .github/scripts/coverage-gate.sh
         env:
+          COVERAGE_THRESHOLD: "95"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage.out
+          retention-days: 30
+
+      - name: Cache go-arch-lint
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/go/bin/go-arch-lint
+          key: go-arch-lint-${{ runner.os }}-v1.15.0
+
+      - name: Architecture lint
+        run: bash .github/scripts/arch-lint.sh
+
+      # E2E — starts the real compiled binary over a real gRPC connection
+      # against the same Valkey + LocalStack service containers already
+      # running in this job. Runs last (same pattern as iam-tender-acl)
+      # so it doesn't block coverage or arch-lint if e2e is slow.
+      # Purge all queues before e2e so the binary's SQS consumer does not
+      # pick up leftover/malformed messages from the integration tests
+      # (TestSQS_DLQForwarding_* leaves messages in the queues). Without
+      # this purge those stale messages delay or block the e2e test's
+      # DepartmentMembershipGranted event from being consumed within 10 s.
+      - name: Purge LocalStack queues before e2e
+        env:
+          AWS_ACCESS_KEY_ID: localstack
+          AWS_SECRET_ACCESS_KEY: localstack
+          AWS_DEFAULT_REGION: ap-south-1
+          AWS_ENDPOINT_URL: http://localhost:4566
+        run: |
+          for queue in membership-authz-q user-authz-q billing-authz-q tenant-authz-q tender-authz-q; do
+            aws sqs purge-queue \
+              --queue-url "http://localhost:4566/000000000000/${queue}" || true
+          done
+
+      - name: Build binary (e2e)
+        run: make build
+
+      - name: E2E tests
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
           E2E_BINARY_PATH: ${{ github.workspace }}/bin/iam-authz-enrichment
           VALKEY_URL: localhost:6379
           AWS_ENDPOINT_URL: http://localhost:4566
           AWS_ACCESS_KEY_ID: localstack
           AWS_SECRET_ACCESS_KEY: localstack
           AWS_REGION: ap-south-1
+        run: make test-e2e

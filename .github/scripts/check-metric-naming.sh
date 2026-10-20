@@ -5,16 +5,21 @@
 # the emitted scrape; this pins how the collectors are built.) Ported from
 # iam-org-membership's script of the same name.
 #
-# Rules:
-#   - no collector is built with prometheus.New* or promauto in non-test code:
-#     every one comes from a gincommon constructor, which injects the
-#     {domain, service, environment} const labels and validates the name
-#   - New() builds only Tier 3 iam_authz_enrichment_* names through the
-#     builder (counterVec / counter / histogram): snake_case, _total on
-#     counters, _seconds on histograms
+# Rules enforced:
+#   1. No collector is built with prometheus.New* or promauto in non-test code:
+#      every one must come from a gincommon constructor, which injects the
+#      {domain, service, environment} const labels and validates the name.
+#   2. New() builds only Tier 3 iam_authz_enrichment_* names through the
+#      builder (counterVec / counter / histogram): snake_case, _total on
+#      counters, _seconds on histograms.
+#   3. No high-cardinality label names. The Standard prohibits:
+#      user_id, email, tenant_id, request_id, event_id, session_id
+#      (and equivalents) on any shared or service-specific metric.
 #
-# Does NOT validate the classification itself (shared vs. service-specific) —
-# that is a review-time call per the standard's decision tree.
+# Tier classification (Tier 1/2 vs Tier 3) is a design-time call documented
+# in internal/adapter/outbound/metrics/recorder.go's leading comment block.
+# This script enforces the Tier 3 naming contract; classification rationale
+# must be updated there whenever a metric is added or reclassified.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -34,12 +39,15 @@ pkg = sys.argv[1]
 errors = []
 sources = {p: open(p, encoding="utf-8").read() for p in sorted(glob.glob(f"{pkg}/*.go")) if not p.endswith("_test.go")}
 
+# Rule 1: no raw prometheus.New* or promauto in production code
 for path, text in sources.items():
     for m in re.finditer(r"prometheus\.New(Counter|CounterVec|Gauge|GaugeVec|Histogram|HistogramVec|Summary|SummaryVec)\(|promauto\.", text):
         line = text[: m.start()].count("\n") + 1
         errors.append(f"{path}:{line}: {m.group(0)} — build collectors with gincommon's constructors (NewCounterVec / NewCounter / NewHistogramVec)")
 
 recorder = sources.get(f"{pkg}/recorder.go", "")
+
+# Rule 2: naming and suffix conventions on all Tier 3 collectors
 collectors = re.findall(r'b\.(counterVec|counter|histogram)\("([^"]+)"', recorder)
 if not collectors:
     errors.append(f"{pkg}/recorder.go: New() builds no collectors through the builder")
@@ -51,10 +59,31 @@ for kind, name in collectors:
     if kind == "histogram" and not name.endswith("_seconds"):
         errors.append(f'"{name}": a histogram must end in _seconds')
 
+# Rule 3: high-cardinality label names are prohibited
+# (Standard: user_id, email, tenant_id, request_id, event_id, session_id and
+#  any equivalent unbounded identifier must not appear as a label name)
+PROHIBITED_LABELS = {
+    "user_id", "email", "tenant_id", "request_id",
+    "event_id", "session_id", "user", "tenant",
+}
+# Extract all label names from counterVec calls: b.counterVec("name","help","lbl1","lbl2",...)
+for m in re.finditer(r'b\.counterVec\([^)]+\)', recorder, re.DOTALL):
+    call = m.group(0)
+    # Strip name and help (first two quoted strings), collect the rest as labels
+    quoted = re.findall(r'"([^"]*)"', call)
+    label_names = quoted[2:]  # first=name, second=help, rest=labels
+    for lbl in label_names:
+        if lbl in PROHIBITED_LABELS:
+            metric_name = quoted[0] if quoted else "<unknown>"
+            errors.append(
+                f'"{metric_name}": label "{lbl}" is prohibited — '
+                f"high-cardinality label names are forbidden by the observability standard"
+            )
+
 if errors:
     for e in errors:
         print(f"::error::{e}")
     print(f"\n{len(errors)} violation(s) across {len(collectors)} collectors.")
     sys.exit(1)
-print(f"  ✔  {len(collectors)} collectors — all built with gincommon constructors; naming and suffix rules OK")
+print(f"  ✔  {len(collectors)} collectors — gincommon constructors; naming, suffix, and label rules OK")
 PYEOF

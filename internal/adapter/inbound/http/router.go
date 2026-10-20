@@ -13,7 +13,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/problem"
 )
 
 // ReadinessProbe reports whether this process has finished startup wiring.
@@ -78,7 +79,7 @@ func NewRouter(probe *ReadinessProbe, ginCfg gincommon.Config, docs DocsConfig) 
 	r.GET("/healthz", gincommon.HealthHandler())
 	r.GET("/readyz", func(c *gin.Context) {
 		if !probe.Ready() {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "starting"})
+			gincommon.AbortWithProblem(c, problem.NewServiceUnavailableError("Service is still starting up."))
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -117,7 +118,7 @@ func registerDocsRoutes(engine *gin.Engine, docs DocsConfig) {
 func docsAuthMiddleware(token string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.GetHeader("Authorization") != "Bearer "+token {
-			c.AbortWithStatus(http.StatusUnauthorized)
+			gincommon.AbortWithProblem(c, problem.NewUnauthorizedError("Missing or invalid authentication headers."))
 			return
 		}
 		c.Next()

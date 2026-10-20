@@ -42,3 +42,18 @@ func realmKey(realm string) string {
 func restrictedFactKey(tenant, tender string) string {
 	return fmt.Sprintf("ae:restricted:%s:%s", tenant, tender)
 }
+
+// restrictedTenantPattern matches every restricted-tender entry for a tenant —
+// used only for the TenantOffboarded full-cleanup SCAN+delete (§5).
+func restrictedTenantPattern(tenant string) string {
+	return fmt.Sprintf("ae:restricted:%s:*", tenant)
+}
+
+// realmByTenantKey is the reverse-index key for the tenant→realm mapping.
+// Stored as a Redis Set; members are the realm issuer URLs that map to this
+// tenant. Written alongside ae:realm:{issuer} by SetRealm so that
+// EvictRealmsByTenant can look up a tenant's realms in O(1) instead of
+// scanning the entire ae:realm:* keyspace.
+func realmByTenantKey(tenant string) string {
+	return fmt.Sprintf("ae:realm-by-tenant:%s", tenant)
+}

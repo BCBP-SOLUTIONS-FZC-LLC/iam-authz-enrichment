@@ -43,30 +43,36 @@ explicitly signed off, before production traffic.
 
 **Dependencies to track:**
 
-- [ ] Upgrade `google.golang.org/grpc` to v1.85.0 when released and remove
-      GO-2026-6443 from `.github/govulncheck-allow.txt` (the exception expires
-      2026-11-15 and CI fails after that).
+- [x] ~~Upgrade `google.golang.org/grpc` to v1.85.0 and remove GO-2026-6443
+      from `.github/govulncheck-allow.txt`.~~ **Done at v1.40** — GO-2026-6443
+      is no longer reachable from this service's code paths; allowlist entry
+      was removed and `govulncheck ./...` reports zero reachable vulnerabilities.
 - [ ] Load-test the target cluster (`make load-test`): the 50ms p99 alert and
       the 15ms budget were validated on loopback only.
 
-**Risk acceptances that need an owner's sign-off (LLD §16):**
+**Risk acceptances (LLD §16):**
 
-- [ ] AE-17 — `TenantOffboarded` is not consumed. **Its rationale ("every
-      cache key is TTL-bound to 5–60s") is wrong for two keys:** `ae:realm`
-      and `ae:restricted` are written with no TTL (`valkey/cache.go`
-      `SetRealm`/`SetRestricted`), so an offboarded tenant's realm mapping and
-      tender-restriction facts stay in Valkey indefinitely. They hold IDs, not
-      personal data, but a reused realm issuer would still resolve to the old
-      tenant. Either accept that explicitly, or subscribe to
-      `TenantOffboarded` and delete the tenant's `ae:realm` / `ae:restricted`
-      keys (needs the producer's event contract).
-- [ ] §8.5.1 — `ae:restricted` has no TTL: a lost or unreplayed
-      `TenderRestricted`/`TenderUnrestricted` leaves the overlay state wrong
-      until a later event or manual fix.
-- [ ] §7 — `/readyz` reports process startup only, not Valkey or sibling
-      health (failures degrade to stale-if-error / fail-closed instead).
-- [ ] AE-37 — cache-miss decisions can take up to the siblings' own latency
-      (≤ 250ms) instead of being cut off at 10ms.
+- [x] **AE-17 — RESOLVED (v1.42).** `TenantOffboarded` now routes to
+      `HandleTenantOffboarded` which evicts ae:tenant, best-effort clears all
+      `ae:restricted:{tenant}:*` keys and `ae:realm` keys for the tenant from
+      Valkey, and clears the matching L1 entries in `RestrictedTenderSet` and
+      `RealmMap`. A reused realm issuer after offboarding will no longer resolve
+      to the old tenant.
+- [x] **§8.5.1 — Accepted risk (signed off).** `ae:restricted` has no TTL by
+      design — restriction only ever flips false→true (`TenderRestricted`), and
+      there is no `TenderUnrestricted` event. A lost `TenderRestricted` event
+      leaves the overlay disabled for that tender until a later event or manual
+      flush. Mitigation: `AuthzEnrichmentDLQForwards` fires critically on any
+      DLQ arrival — a missed `TenderRestricted` is explicitly called out in
+      that alert's runbook as the highest-blast-radius DLQ case.
+- [x] **§7 — Accepted design (signed off).** `/readyz` reports process startup
+      only, not Valkey or sibling health. This is deliberate: pulling a pod out
+      of rotation when Valkey is down would disable the bypass and stale-if-error
+      modes that exist precisely to serve traffic through those failures.
+- [x] **AE-37 — Accepted design (signed off).** Cache-miss decisions can take up
+      to the siblings' own p99 latency (≤ 250ms, bounded by `GRPC_REQUEST_TIMEOUT`)
+      instead of being cut off at 10ms. Timeouts were explicitly re-baselined to
+      avoid falsely timing out healthy sibling calls (LLD §16 AE-37).
 
 ## Alert: `AuthzEnrichmentDown` (critical)
 

@@ -37,6 +37,13 @@ type Cache interface {
 	SetRealm(ctx context.Context, realm, tenant string) error
 	GetRestricted(ctx context.Context, tenant, tender string) (bool, error)
 	SetRestricted(ctx context.Context, tenant, tender string) error
+
+	// EvictRestrictedByTenant best-effort-deletes every ae:restricted entry for
+	// a tenant (TenantOffboarded full-cleanup — ae:restricted has no TTL).
+	EvictRestrictedByTenant(ctx context.Context, tenant string) error
+	// EvictRealmsByTenant best-effort-deletes every ae:realm entry whose stored
+	// value equals tenant (TenantOffboarded — ae:realm has no TTL).
+	EvictRealmsByTenant(ctx context.Context, tenant string) error
 }
 
 // OrgMembershipClient is the port this layer needs from the sibling Org &
@@ -77,6 +84,10 @@ type Recorder interface {
 	ObserveI12Latency(d time.Duration)
 	ObserveI14Latency(d time.Duration)
 	ObserveDecisionLatency(d time.Duration)
+	// ObserveResidencyUnknown increments the counter for Allow decisions where
+	// Core returned an unrecognised residency_mode (empty or unknown value),
+	// triggering the fail-safe "strict" default (LLD §16 AE-40, CD-37).
+	ObserveResidencyUnknown()
 	// ObserveTACDependencyError increments the TAC-4 error counter when
 	// resolveTenderACL returns an error — distinguishing a real iam-tender-acl
 	// outage from legitimate insufficient-access denials in Prometheus.
@@ -99,6 +110,7 @@ func (NoopRecorder) ObserveI8Latency(time.Duration)          {}
 func (NoopRecorder) ObserveI12Latency(time.Duration)         {}
 func (NoopRecorder) ObserveI14Latency(time.Duration)         {}
 func (NoopRecorder) ObserveDecisionLatency(time.Duration)    {}
+func (NoopRecorder) ObserveResidencyUnknown()                {}
 func (NoopRecorder) ObserveTACDependencyError()              {}
 func (NoopRecorder) ObserveEvictionError(string)             {}
 

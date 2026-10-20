@@ -98,11 +98,12 @@ type UserEventPayload struct {
 //     changes, so the cached ae:ctx entry is stale.
 //   - "status" — the user has been enabled or disabled; a disabled user can no
 //     longer authenticate and Org & Membership's I-8 will return 404 on the
-//     next live call. Without eviction the stale ae:ctx entry serves Allow
-//     decisions for up to 60 s (AE_CTX_TTL) after disable. UserUpdated with
-//     changed_fields=["status"] fires in the same UP transaction as
-//     UserStatusChanged, but user-authz-q only subscribes to UserUpdated —
-//     this consumer-side check is the only eviction path for a status change.
+//     next live call. Without evicting on "status", the ae:ctx entry would
+//     serve stale Allow decisions for up to AE_CTX_TTL after the user is
+//     disabled. UserUpdated with changed_fields=["status"] fires in the same
+//     UP transaction as UserStatusChanged, but user-authz-q only subscribes to
+//     UserUpdated — this consumer-side check is the only eviction path for a
+//     status change (UP-AE-GAP-001).
 //
 // All other changed_fields values (display_name, job_title, timezone, …) are
 // no-ops — they do not affect any fact the AE decision cache holds.
@@ -161,16 +162,54 @@ func (inv *Invalidator) HandleBillingEvent(ctx context.Context, tenant string) e
 	return inv.cache.EvictTenantContext(ctx, tenant)
 }
 
-// HandleTenantLifecycleEvent evicts ae:tenant:{tenant} for any Realm
-// Provisioner lifecycle event that changes tenant status (§5): TenantSuspended,
-// TenantReactivated (operator-sourced, distinct from billing's TenantReactivated
-// on billing-authz-q), TenantOffboarded, TrialExpired, TrialReactivated. All
-// arrive on tenant-authz-q via the iam-tenant-events SNS topic. No payload
-// decode is needed — the eviction is driven entirely by the envelope's
-// own tenant_id, and the tenant-scoped ae:tenant entry will be rebuilt
-// fresh on the next Check that needs it.
+// HandleTenantSettingChanged implements tenant-authz-q TenantSettingChanged
+// (CD-37, LLD §16 AE-40): a tenant-owner changed a setting such as
+// residency_mode, so the ae:tenant entry is stale. Evict it; the next
+// request will rebuild from I-8 and pick up the new value. No payload
+// decoding needed — the tenant_id on the envelope is the only fact required.
+func (inv *Invalidator) HandleTenantSettingChanged(ctx context.Context, tenant string) error {
+	return inv.cache.EvictTenantContext(ctx, tenant)
+}
+
+// HandleTenantLifecycleEvent evicts ae:tenant:{tenant} for Realm Provisioner
+// status-change events (§5): TenantSuspended, TenantReactivated
+// (operator-sourced), TrialExpired, TrialReactivated. No payload decode needed.
+// TenantOffboarded is handled by HandleTenantOffboarded — it requires the
+// wider cleanup of ae:realm and ae:restricted (LLD §16 AE-17).
 func (inv *Invalidator) HandleTenantLifecycleEvent(ctx context.Context, tenant string) error {
 	return inv.cache.EvictTenantContext(ctx, tenant)
+}
+
+// HandleTenantOffboarded handles TenantOffboarded (full realm deletion, §5).
+// In addition to the ae:tenant eviction shared by all lifecycle events, it
+// clears the no-TTL keys that would otherwise persist in Valkey indefinitely
+// and cause stale resolution on a reused realm issuer (LLD §16 AE-17):
+//
+//   - ae:restricted:{tenant}:* (all restricted-tender facts for this tenant)
+//   - ae:realm:{issuer} entries whose stored tenant equals this tenant
+//   - The matching L1 entries in RestrictedTenderSet and RealmMap
+//
+// Both extended evictions are best-effort: a failure is logged as a warning
+// but does not return an error (degradation is bounded — stale ae:realm /
+// ae:restricted facts for an offboarded tenant persist until the next pod
+// restart or a manual flush, not indefinitely after the next deploy).
+func (inv *Invalidator) HandleTenantOffboarded(ctx context.Context, tenant string) error {
+	if err := inv.cache.EvictTenantContext(ctx, tenant); err != nil {
+		return fmt.Errorf("evict ae:tenant: %w", err)
+	}
+	if err := inv.cache.EvictRestrictedByTenant(ctx, tenant); err != nil {
+		inv.log.Warn("best-effort ae:restricted eviction failed on TenantOffboarded",
+			map[string]interface{}{"error": err.Error()})
+		inv.recorder.ObserveEvictionError("tenant_offboarded_restricted")
+	}
+	inv.restricted.ClearByTenant(tenant)
+	if err := inv.cache.EvictRealmsByTenant(ctx, tenant); err != nil {
+		inv.log.Warn("best-effort ae:realm eviction failed on TenantOffboarded",
+			map[string]interface{}{"error": err.Error()})
+		inv.recorder.ObserveEvictionError("tenant_offboarded_realm")
+	}
+	inv.realmMap.DeleteByTenant(tenant)
+	return nil
 }
 
 // TenantRealmEventPayload is tenant-authz-q's decoded payload.
@@ -207,7 +246,15 @@ type TenderRestrictedPayload struct {
 
 // HandleTenderRestricted flips the restricted-tender fact (L1 + shared
 // Valkey). Not a cache eviction (§5).
+//
+// An empty TenderID means the producer payload is malformed or the field was
+// renamed — writing ae:restricted:{tenant}: (empty key) would be a silent
+// correctness bug, so we return an error and let the platform retry/DLQ
+// (AE-TAC-GAP-001 fix).
 func (inv *Invalidator) HandleTenderRestricted(ctx context.Context, tenant string, p TenderRestrictedPayload) error {
+	if p.TenderID == "" {
+		return fmt.Errorf("TenderRestricted payload missing tender_id: producer schema drift or malformed envelope")
+	}
 	if err := inv.restricted.MarkRestricted(ctx, tenant, p.TenderID); err != nil {
 		return fmt.Errorf("persist restricted tender: %w", err)
 	}

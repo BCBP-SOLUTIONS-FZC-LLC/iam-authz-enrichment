@@ -102,6 +102,9 @@ func TestUserHandler_UserUpdated_EmailChange_Evicts(t *testing.T) {
 	assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:tenant-1:alice")
 }
 
+// TestUserHandler_UserUpdated_StatusChange_Evicts guards against UP-AE-GAP-001:
+// a user-disable fires UserUpdated with changed_fields=["status"]; without this
+// eviction the ae:ctx entry serves stale Allow decisions for up to AE_CTX_TTL.
 func TestUserHandler_UserUpdated_StatusChange_Evicts(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
@@ -112,7 +115,7 @@ func TestUserHandler_UserUpdated_StatusChange_Evicts(t *testing.T) {
 	}))
 	require.NoError(t, err)
 	assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:tenant-1:alice",
-		"a user-disable fires UserUpdated with status in changed_fields — must evict to close the 60 s stale-Allow window")
+		"a user-disable fires UserUpdated with status in changed_fields — must evict to close the stale-Allow window")
 }
 
 func TestUserHandler_DecodeError(t *testing.T) {
@@ -181,29 +184,6 @@ func TestBillingHandler_UnknownType_NoOp(t *testing.T) {
 	assert.Empty(t, cache.SortedCalls())
 }
 
-func TestTenantHandler_LifecycleEvents_EvictTenantSliceOnly(t *testing.T) {
-	t.Parallel()
-	for _, eventType := range []string{
-		"TenantSuspended", "TenantReactivated", "TenantOffboarded", "TrialExpired", "TrialReactivated",
-	} {
-		t.Run(eventType, func(t *testing.T) {
-			t.Parallel()
-			cache := fixtures.NewFakeCache()
-			realmMap := usecase.NewRealmMap(nil, 5*time.Second)
-			inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
-			handler := tenantHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
-
-			err := handler(context.Background(), envelope(t, eventType, "tenant-1", map[string]string{}))
-
-			require.NoError(t, err)
-			assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls(),
-				"%s must evict ae:tenant and nothing else — no realm map update, no per-user eviction", eventType)
-			_, ok := realmMap.Lookup(context.Background(), "realm-1")
-			assert.False(t, ok, "%s must not modify the realm map", eventType)
-		})
-	}
-}
-
 func TestTenantHandler_DecodeError(t *testing.T) {
 	t.Parallel()
 	handler := tenantHandler(testDeps(fixtures.NewFakeCache()))
@@ -262,6 +242,71 @@ func TestTenantHandler_TenantRealmReady_NoEviction(t *testing.T) {
 	assert.Equal(t, "tenant-direct-paid", tenant)
 }
 
+// CD-37 / §16 AE-40: TenantSettingChanged must route to
+// HandleTenantSettingChanged and evict ae:tenant only.
+func TestTenantHandler_TenantSettingChanged_EvictsTenantSliceOnly(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	handler := tenantHandler(testDeps(cache))
+
+	err := handler(context.Background(), envelope(t, "TenantSettingChanged", "tenant-1", map[string]string{}))
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls())
+}
+
+// §5 / AE-RP-GAP-002..006: Realm Provisioner lifecycle events must route to
+// HandleTenantLifecycleEvent and evict ae:tenant only — no realm map update,
+// no restricted-tender eviction. TenantOffboarded is handled separately.
+func TestTenantHandler_LifecycleEvents_EvictTenantSliceOnly(t *testing.T) {
+	t.Parallel()
+	for _, eventType := range []string{
+		"TenantSuspended", "TenantReactivated", "TrialExpired", "TrialReactivated",
+	} {
+		t.Run(eventType, func(t *testing.T) {
+			t.Parallel()
+			cache := fixtures.NewFakeCache()
+			realmMap := usecase.NewRealmMap(nil, 5*time.Second)
+			inv := usecase.NewInvalidator(cache, realmMap, usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+			handler := tenantHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
+
+			err := handler(context.Background(), envelope(t, eventType, "tenant-1", map[string]string{}))
+
+			require.NoError(t, err)
+			assert.Equal(t, []string{"EvictTenantContext:tenant-1"}, cache.SortedCalls(),
+				"%s must evict ae:tenant only — no realm map update, no per-user eviction", eventType)
+			_, ok := realmMap.Lookup(context.Background(), "realm-1")
+			assert.False(t, ok, "%s must not modify the realm map", eventType)
+		})
+	}
+}
+
+// AE-17: TenantOffboarded routes to HandleTenantOffboarded which clears
+// ae:tenant + ae:restricted + ae:realm (no-TTL keys).
+func TestTenantHandler_TenantOffboarded_EvictsAll(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	_ = cache.SetRealm(context.Background(), "https://kc.example.com/realms/tenant-1", "tenant-1")
+	_ = cache.SetRestricted(context.Background(), "tenant-1", "tender-a")
+	realmMap := usecase.NewRealmMap(nil, 5*time.Second)
+	realmMap.BindStore(cache)
+	_ = realmMap.Set(context.Background(), "https://kc.example.com/realms/tenant-1", "tenant-1")
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	restricted.BindStore(cache)
+	_ = restricted.MarkRestricted(context.Background(), "tenant-1", "tender-a")
+	cache.Calls = nil
+
+	inv := usecase.NewInvalidator(cache, realmMap, restricted, fixtures.NoopLogger{})
+	handler := tenantHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
+
+	err := handler(context.Background(), envelope(t, "TenantOffboarded", "tenant-1", map[string]string{}))
+
+	require.NoError(t, err)
+	assert.Contains(t, cache.SortedCalls(), "EvictTenantContext:tenant-1")
+	assert.Contains(t, cache.SortedCalls(), "EvictRestrictedByTenant:tenant-1")
+	assert.Contains(t, cache.SortedCalls(), "EvictRealmsByTenant:tenant-1")
+}
+
 func TestTenderHandler_TenderRestricted_FlipsFact(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
@@ -297,6 +342,56 @@ func TestTenderHandler_DecodeError(t *testing.T) {
 	err := handler(context.Background(), badPayloadEnvelope("TenderRestricted"))
 
 	assert.Error(t, err)
+}
+
+// TestTenderHandler_TenderRestricted_ContractFixture pins the wire payload shape
+// this service expects from Tender Service (AE-TAC-GAP-001). The raw JSON
+// string is the exact payload after the Glue header is stripped by
+// platform-events. If Tender Service renames "tender_id" this test will catch
+// the schema drift before it silently corrupts ae:restricted keys.
+// Additional unknown fields must be ignored (open-schema contract).
+func TestTenderHandler_TenderRestricted_ContractFixture(t *testing.T) {
+	t.Parallel()
+	const rawPayload = `{"tender_id":"018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d99","future_field":"ignored"}`
+
+	cache := fixtures.NewFakeCache()
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), restricted, fixtures.NoopLogger{})
+	handler := tenderHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
+
+	env := events.Envelope[json.RawMessage]{
+		ID:       "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d00",
+		Type:     "TenderRestricted",
+		TenantID: "tenant-abc",
+		Payload:  json.RawMessage(rawPayload),
+	}
+
+	require.NoError(t, handler(context.Background(), env))
+	assert.True(t, restricted.IsRestricted(context.Background(), "tenant-abc", "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d99"),
+		"tender_id must be extracted from raw wire payload and registered as restricted")
+	assert.Empty(t, cache.SortedCalls(), "TenderRestricted must not touch the eviction cache")
+}
+
+// TestTenderHandler_TenderRestricted_MissingTenderID_ReturnsError guards against
+// silent schema drift: if Tender Service renames tender_id (e.g. to tdr_id),
+// JSON unmarshal succeeds but TenderID is "". Without this check the handler
+// would write ae:restricted:{tenant}: (empty key) and mark ALL tenders as
+// restricted. The fix (AE-TAC-GAP-001) returns an error so platform-events
+// retries and eventually DLQs the malformed message.
+func TestTenderHandler_TenderRestricted_MissingTenderID_ReturnsError(t *testing.T) {
+	t.Parallel()
+	const rawPayload = `{"tdr_id":"018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d99"}` // renamed field
+
+	handler := tenderHandler(testDeps(fixtures.NewFakeCache()))
+	env := events.Envelope[json.RawMessage]{
+		ID:       "evt-drift",
+		Type:     "TenderRestricted",
+		TenantID: "tenant-abc",
+		Payload:  json.RawMessage(rawPayload),
+	}
+
+	err := handler(context.Background(), env)
+	assert.Error(t, err, "renamed/missing tender_id must return an error, not write ae:restricted:tenant-abc:")
 }
 
 func TestDedupingHandler_RetriesAfterHandlerFailure(t *testing.T) {
