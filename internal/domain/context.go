@@ -39,7 +39,7 @@ type TenantContext struct {
 	// (tenants.residency_mode — "standard" | "strict"). An empty string means
 	// Core has not yet populated the field (pre-CD-37 cache entry or an
 	// unupgraded Core instance); the check layer normalizes it to "strict"
-	// (fail-safe) and increments authz_residency_unknown_total (LLD §16 AE-40).
+	// (fail-safe) and increments residency_unknown_total (LLD §16 AE-40).
 	ResidencyMode string `json:"residency_mode,omitempty"`
 }
 
@@ -56,6 +56,18 @@ func NewMembershipContext() MembershipContext {
 // an empty (never nil) slice.
 func NewTenantContext() TenantContext {
 	return TenantContext{FeatureFlags: []string{}}
+}
+
+// NormaliseResidencyMode coerces ResidencyMode to one of the two canonical
+// values ("standard" or "strict"). Any other value — empty string from a
+// pre-CD-37 cache entry, an unknown future value, or a malformed I-8 response
+// — is treated as "strict" (fail-safe: never forward data abroad under an
+// unknown policy). Called at the decode layer so every consumer of
+// TenantContext receives the canonical value without needing its own guard.
+func (tc *TenantContext) NormaliseResidencyMode() {
+	if tc.ResidencyMode != "standard" && tc.ResidencyMode != "strict" {
+		tc.ResidencyMode = "strict"
+	}
 }
 
 // TenderACL is the result of the tender-ACL overlay check (TAC-4). Cacheable

@@ -270,7 +270,8 @@ flowchart TD
         k4["ae:neg:{tenant}:{user} → sentinel — subject rebuild returned 404\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
         k5["ae:processed:{event_id} → SET NX sentinel, 7-day TTL\nconsumer idempotency — the SET-NX equivalent of ON CONFLICT DO NOTHING"]
         k6["mfa_freshness_seconds  →  NEVER CACHED, no key exists (§4.4)\nfetched fresh per approver-gated request from I-14 ONLY —\nfolding it into ae:ctx would delay a tightened MFA window by up to 60s"]
-        k7["ae:realm:{issuer} → tenant_id, no TTL — write-once, never unmapped\nRealmMap's L1: positive entries cached forever; negative entries cached\nfor AE_REALM_NEG_TTL (default 5s) only — a transient store error is\nnever cached, only a confirmed miss"]
+        k7["ae:realm:{issuer} → tenant_id, no TTL — write-once, never unmapped\nRealmMap's L1: positive entries cached forever; negative entries cached\nfor AE_REALM_NEG_TTL (default 5s) only — a transient store error is\nnever cached, only a confirmed miss\nSetRealm writes this + ae:realm-by-tenant atomically (MULTI/EXEC)"]
+        k7b["ae:realm-by-tenant:{tenant} → Redis Set of issuer URLs for this tenant\nno TTL — reverse index enabling O(k) EvictRealmsByTenant on TenantOffboarded\n(vs O(n) full SCAN before this index was added)"]
         k8["ae:restricted:{tenant}:{tender} → sentinel, no TTL — write-once, never un-restricted\nRestrictedTenderSet's L1: same positive-forever/negative-for-AE_RESTRICTED_NEG_TTL\nsplit as ae:realm above, same transient-error-not-cached rule"]
     end
 
@@ -381,12 +382,13 @@ sequenceDiagram
 |-------|-------------|--------|
 | `membership-authz-q` | `DepartmentMembershipGranted/Revoked/LevelChanged`, `TenantRoleGranted/Revoked` | Evict `ae:ctx:{tenant}:{user}` + `ae:neg` |
 | `membership-authz-q` | `MembershipRevoked` (§16 AE-20 — Org & Membership's per-user removal cascade signal) | Evict `ae:ctx` + `ae:neg` + best-effort `ae:tender_acl:*:{user}` — the only whole-membership-removal trigger; per-grant rows are left inert rather than individually revoked |
-| `user-authz-q` | `UserUpdated` (email changes only), `UserAvailabilityChanged`, `UserDeleted` | Evict `ae:ctx` + `ae:neg`; `UserDeleted` also best-effort-evicts `ae:tender_acl:*:{user}` |
+| `user-authz-q` | `UserUpdated` (`"email"` or `"status"` in `changed_fields`), `UserAvailabilityChanged`, `UserDeleted` | Evict `ae:ctx` + `ae:neg`; `UserDeleted` also best-effort-evicts `ae:tender_acl:*:{user}`; `UserAvailabilityChanged` evicts unconditionally (retained for AE-18 hygiene, no longer load-bearing) |
 | `billing-authz-q` | `TenantPlanChanged`, `TenantSubscriptionCancelled`, `TenantReactivated` | Evict `ae:tenant:{tenant}` (single key) |
-| `tenant-authz-q` | `TenantConverted`, `TenantRealmReady` | Refresh the in-process realm map; `TenantConverted` also evicts `ae:tenant` |
+| `tenant-authz-q` | `TenantConverted`, `TenantRealmReady` | Refresh the in-process realm map + ae:realm-by-tenant reverse index (SetRealm is MULTI/EXEC atomic); `TenantConverted` also evicts `ae:tenant` |
 | `tenant-authz-q` | `TenantSettingChanged` (CD-37, §16 AE-40) | Evict `ae:tenant:{tenant}` — no payload decode; next Check rebuilds from I-8 with fresh `residency_mode` |
-| `tenant-authz-q` | `TenantSuspended`, `TenantReactivated` (operator-sourced), `TenantOffboarded`, `TrialExpired`, `TrialReactivated` (§16 AE-45) | Evict `ae:tenant:{tenant}` only — all route through `HandleTenantLifecycleEvent`, no payload decode |
-| `tender-authz-q` | `TenderRestricted` | Flip the in-memory restricted-tender fact — not a cache eviction |
+| `tenant-authz-q` | `TenantSuspended`, `TenantReactivated` (operator-sourced), `TrialExpired`, `TrialReactivated` (§16 AE-45) | Evict `ae:tenant:{tenant}` — all route through `HandleTenantLifecycleEvent`, no payload decode |
+| `tenant-authz-q` | `TenantOffboarded` (§16 AE-17) | Evict `ae:tenant` + best-effort SCAN+DEL `ae:restricted:{tenant}:*` + O(k) DEL of `ae:realm` entries via `ae:realm-by-tenant` reverse index + L1 ClearByTenant/DeleteByTenant; failures logged as WARN, `ObserveEvictionError("tenant_offboarded_*")` |
+| `tender-authz-q` | `TenderRestricted` | Flip the in-memory restricted-tender fact + L2 `ae:restricted` key (MULTI/EXEC not needed — monotonic write); payload validation rejects empty `tender_id` (AE-TAC-GAP-001) |
 
 **Why both `TenantConverted` and `TenantRealmReady` matter:** a tenant converting from shared-trial to dedicated fires `TenantConverted`. A tenant that signs up directly for a paid plan and gets a dedicated realm from day one fires *only* `TenantRealmReady`. Subscribing to just one leaves a real gap in the realm→tenant map.
 

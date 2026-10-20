@@ -293,6 +293,23 @@ func TestInvalidator_TenderRestricted_FlipsInMemoryFact_NoEviction(t *testing.T)
 	assert.False(t, restricted.IsRestricted(ctx, "tenant-2", "tender-9"), "restriction is tenant-scoped")
 }
 
+// TestInvalidator_TenderRestricted_EmptyTenderID_ReturnsError guards against
+// writing ae:restricted:{tenant}: (empty-key corruption) when the producer
+// renames or omits tender_id. Must return an error so the platform retries
+// and DLQs the message rather than silently corrupting state (AE-TAC-GAP-001).
+func TestInvalidator_TenderRestricted_EmptyTenderID_ReturnsError(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cache := fixtures.NewFakeCache()
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), restricted, fixtures.NoopLogger{})
+
+	err := inv.HandleTenderRestricted(ctx, "tenant-1", usecase.TenderRestrictedPayload{TenderID: ""})
+
+	require.Error(t, err, "empty TenderID must be rejected to prevent ae:restricted:tenant-1: corruption")
+	assert.Empty(t, cache.SortedCalls(), "no cache writes must occur on validation failure")
+}
+
 func TestInvalidator_BillingEvent_EvictError_Propagates(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()

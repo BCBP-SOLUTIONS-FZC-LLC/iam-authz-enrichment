@@ -24,7 +24,7 @@ func TestFactStore_RoutesWritesToEventCache(t *testing.T) {
 
 	require.NoError(t, s.SetRestricted(ctx, "t1", "td1"))
 	require.NoError(t, s.SetRealm(ctx, "https://kc/realms/acme", "t1"))
-	assert.Len(t, evMR.Keys(), 2, "both writes go to the event Cache")
+	assert.Len(t, evMR.Keys(), 3, "SetRestricted (1 key) + SetRealm (forward ae:realm + reverse ae:realm-by-tenant = 2 keys) → 3 total")
 	assert.Empty(t, reqMR.Keys(), "nothing is written through the request Cache")
 
 	got, err := s.GetRestricted(ctx, "t1", "td1")

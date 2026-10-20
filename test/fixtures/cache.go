@@ -168,7 +168,9 @@ func (f *FakeCache) GetTenantContext(_ context.Context, tenant string) (domain.T
 	if !ok {
 		return domain.TenantContext{}, domain.CacheMiss, nil
 	}
-	return e.v, e.result, nil
+	tc := e.v
+	tc.NormaliseResidencyMode()
+	return tc, e.result, nil
 }
 
 func (f *FakeCache) SetTenantContext(_ context.Context, tenant string, v domain.TenantContext) error {

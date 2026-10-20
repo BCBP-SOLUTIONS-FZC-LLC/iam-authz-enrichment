@@ -67,7 +67,7 @@ func TestStandard_ProductionRegistrationOrder(t *testing.T) {
 		"platform_build_info", "platform_library_info", "platform_grpc_server_handled_total",
 		"iam_authz_enrichment_decisions_total", "iam_authz_enrichment_deny_reason_total",
 		"iam_authz_enrichment_decision_latency_seconds", "iam_authz_enrichment_i14_call_latency_seconds",
-		"iam_authz_enrichment_authz_residency_unknown_total",
+		"iam_authz_enrichment_residency_unknown_total",
 	} {
 		assert.True(t, names[want], "%s must be exported", want)
 	}

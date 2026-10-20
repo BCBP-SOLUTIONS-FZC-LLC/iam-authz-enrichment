@@ -221,6 +221,7 @@ info:
         next Check picks up the refreshed trial-end date from I-8.
     TenderRestricted:
       on_receipt:
+        - "Validate tender_id is non-empty — a missing or renamed field returns an error (retry/DLQ); AE-TAC-GAP-001"
         - "Flip the in-memory restricted-tender fact for (tenant, tender) — NOT a cache eviction"
       publishes_events: false
       note: >-
@@ -228,7 +229,10 @@ info:
         RestrictedTenderSet is a plain in-process map, independently held
         per replica (every replica consumes every queue, LLD §3.4), rebuilt
         from scratch on pod restart by whatever backlog of TenderRestricted
-        events SQS still has undelivered.
+        events SQS still has undelivered. Payload validation (AE-TAC-GAP-001):
+        an empty or absent tender_id is rejected so the handler never writes
+        ae:restricted:{tenant}: (empty key), which would incorrectly mark
+        every tender for the tenant as restricted.
 
 defaultContentType: application/json
 

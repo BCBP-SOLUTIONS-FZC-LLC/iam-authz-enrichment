@@ -15,6 +15,36 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
 
+// ─── Enterprise Platform Observability Standard — Tier Classification ────────
+//
+// All metrics registered below are Tier 3 (iam_authz_enrichment_*).
+// Decision-tree analysis per the Standard:
+//
+// TIER 1 (platform_*) — not applicable.
+//   The closest candidate is HTTP dependency call latency (i8 / i14).
+//   platform_dependency_request_seconds is already in the Platform Registry
+//   but covers only SQS/SNS/Glue (from platform-events). Extending it to
+//   HTTP calls requires registry ratification; until approved, these remain
+//   Tier 3 (Standard §REGISTRY RATIFICATION REQUIREMENT).
+//
+// TIER 2 (iam_*) — not applicable.
+//   No metric below has semantics that are reusable across multiple IAM
+//   services unchanged: decisions, deny-reasons, ae:ctx/ae:neg/ae:tenant
+//   cache key families, singleflight coalescing, and stale-if-error policy
+//   are all unique to this service's ext_authz PDP role. The i8 call latency
+//   could eventually be iam_dependency_request_seconds once the IAM Domain
+//   Registry defines it; until then, inventing a domain metric unilaterally
+//   violates the Standard (§NAMESPACE SELECTION RULES rule 11).
+//
+// TIER 3 (iam_authz_enrichment_*) — all collectors below.
+//   Required {domain, service, environment} const labels are injected
+//   centrally by gincommon.MetricsConstLabels() via the Registerer passed
+//   to New(). Application code never supplies these labels explicitly.
+//   High-cardinality label names (user_id, email, tenant_id, request_id,
+//   event_id, session_id) are prohibited and enforced by CI
+//   (check-metric-naming.sh).
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Recorder implements usecase.Recorder against gincommon's Prometheus
 // registerer (the same registry cmd/server's /metrics listener scrapes via
 // gincommon.MetricsHandler()).
@@ -103,12 +133,12 @@ func New(reg gincommon.Registerer) (*Recorder, error) {
 			"iam-tender-acl TAC-4 (formerly Org & Membership's I-12) tender-ACL call latency; name kept for continuity (LLD §16 AE-19)."),
 		i14Latency: b.histogram("iam_authz_enrichment_i14_call_latency_seconds",
 			"Org & Membership MFA-freshness (I-14) call latency."),
-		residencyUnknownTotal: b.counter("iam_authz_enrichment_authz_residency_unknown_total",
+		residencyUnknownTotal: b.counter("iam_authz_enrichment_residency_unknown_total",
 			"Allow decisions where Core returned an unrecognised residency_mode; the fail-safe 'strict' default was applied (LLD §16 AE-40, CD-37). A persistent nonzero rate means Core has not yet deployed the CD-37 field or is sending an unexpected value."),
 		tac4ErrorsTotal: b.counter("iam_authz_enrichment_tac4_errors_total",
 			"GetTenderACL (TAC-4) errors — iam-tender-acl dependency failures that made the tender-ACL overlay fail closed. Distinct from legitimate DENY_TENDER_ACL_INSUFFICIENT policy denials."),
 		evictionErrors: b.counterVec("iam_authz_enrichment_eviction_errors_total",
-			"Best-effort EvictTenderACLForUser failures, by event. A nonzero rate means ae:tender_acl entries for revoked/deleted users may persist until their 15s TTL.", "event"),
+			"Best-effort cache eviction failures, by event (membership_revoked, user_deleted, tenant_offboarded_restricted, tenant_offboarded_realm). A nonzero rate means evicted entries may persist until their TTL or the next pod restart.", "event"),
 	}
 	if err := errors.Join(b.errs...); err != nil {
 		return nil, fmt.Errorf("register iam_authz_enrichment metrics: %w", err)

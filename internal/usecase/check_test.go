@@ -857,7 +857,13 @@ func TestCheck_Allow_StrictResidency_HeaderInjected(t *testing.T) {
 		"x-residency-mode must carry the tenant's value when it is 'strict'")
 }
 
-func TestCheck_Allow_UnknownResidency_DefaultsToStrict_MetricIncremented(t *testing.T) {
+// TestCheck_Allow_UnknownResidency_CacheHit_DefaultsToStrict_Silent verifies
+// that a cache hit with an unknown residency_mode is normalised to "strict" at
+// the decode layer (GetTenantContext → NormaliseResidencyMode) without
+// incrementing the metric. The metric fires only on the fresh I-8 path where
+// Core can be actively sending a bad value worth alerting on; silent
+// normalisation of stale cached entries avoids alert fatigue on redeploys.
+func TestCheck_Allow_UnknownResidency_CacheHit_DefaultsToStrict_Silent(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
@@ -877,9 +883,9 @@ func TestCheck_Allow_UnknownResidency_DefaultsToStrict_MetricIncremented(t *test
 
 	require.True(t, decision.Allow)
 	assert.Equal(t, "strict", decision.Headers[domain.HeaderResidencyMode],
-		"unknown residency_mode must fail-safe to strict")
-	assert.Equal(t, 1, rec.residencyUnknownCount(),
-		"authz_residency_unknown_total must be incremented exactly once")
+		"unknown residency_mode must fail-safe to strict via decode-layer normalisation")
+	assert.Equal(t, 0, rec.residencyUnknownCount(),
+		"cache-hit normalisation is silent — metric fires only on fresh I-8 reads")
 }
 
 func TestCheck_Allow_UnknownResidency_ExplicitlyBadValue_DefaultsToStrict(t *testing.T) {

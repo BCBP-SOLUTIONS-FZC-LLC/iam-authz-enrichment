@@ -155,12 +155,11 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 		}
 	}
 
-	// CD-37 / §16 AE-40: normalise residency_mode before injecting it as a
-	// header. "standard" and "strict" are the two valid values; anything else
-	// (including the empty string a pre-CD-37 Core or a cached entry written
-	// before the field existed will return) fails safe to "strict" — we must
-	// never forward data abroad because the value was unknown. The mutation is
-	// on the local copy of tenantCtx only; the cached entry is not affected.
+	// CD-37 / §16 AE-40: normalise residency_mode for fresh I-8 results.
+	// Cache hits are already normalised by GetTenantContext at the decode layer
+	// (domain.TenantContext.NormaliseResidencyMode). This guard covers only
+	// the cache-miss path where the raw I-8 value arrives here directly before
+	// being stored — the Warn + metric are intentional for that path only.
 	if tenantCtx.ResidencyMode != "standard" && tenantCtx.ResidencyMode != "strict" {
 		c.log.Warn("unknown residency_mode, defaulting to strict",
 			map[string]interface{}{"tenant": tenant, "value": tenantCtx.ResidencyMode})
@@ -183,9 +182,13 @@ func buildHeaders(tenant, subject string, m domain.MembershipContext, t domain.T
 	// Mutations are already denied at §3.1 step 2, so this header is only ever
 	// seen on allowed read requests — consistent with the gap-closure contract
 	// (IAM-to-Commercial-Gap-Closure-Summary §4.6).
-	flags := append([]string{}, t.FeatureFlags...)
+	// Only copy the slice when ReadOnly=true to avoid a per-request heap
+	// allocation on the common (active tenant, non-read-only) path.
+	var featureFlagsHeader string
 	if t.ReadOnly {
-		flags = append(flags, "read_only")
+		featureFlagsHeader = strings.Join(append(append([]string{}, t.FeatureFlags...), "read_only"), ",")
+	} else {
+		featureFlagsHeader = strings.Join(t.FeatureFlags, ",")
 	}
 	return map[string]string{
 		domain.HeaderTenantID:     tenant,
@@ -193,7 +196,7 @@ func buildHeaders(tenant, subject string, m domain.MembershipContext, t domain.T
 		domain.HeaderDepartments:  strings.Join(departments, ","),
 		domain.HeaderTenantRoles:  strings.Join(m.Roles, ","),
 		domain.HeaderPlan:         t.Plan,
-		domain.HeaderFeatureFlags: strings.Join(flags, ","),
+		domain.HeaderFeatureFlags: featureFlagsHeader,
 		// x-residency-mode is always server-computed — never read from the
 		// inbound request (§16 AE-40). The check() caller has already
 		// normalised ResidencyMode to "standard" or "strict".

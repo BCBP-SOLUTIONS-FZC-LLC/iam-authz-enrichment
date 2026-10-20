@@ -49,7 +49,7 @@ iam-authz-enrichment/
 │       │       └── handlers.go        # 5 New*Consumer builders + per-event-type switch statements → internal/usecase/invalidate.go
 │       └── outbound/
 │           ├── valkey/                # Cache port implementation (go-redis/v9)
-│           │   ├── keys.go            # ae:ctx / ae:tenant / ae:tender_acl / ae:neg / ae:processed key builders
+│           │   ├── keys.go            # ae:ctx / ae:tenant / ae:tender_acl / ae:neg / ae:processed / ae:realm / ae:realm-by-tenant / ae:restricted key builders
 │           │   └── cache.go           # entry[T]{Value,FetchedAt,SoftTTL} — single-envelope trick for fresh-read AND §7 stale-if-error
 │           ├── orgmembership/
 │           │   └── client.go          # I-8/I-14 HTTP client (Org & Membership) + TAC-4/I-12 HTTP client (iam-tender-acl); getJSON() classifies 404 → domain.ErrNotFound; GetTenderACL also classifies 400 → ErrNotFound (TAC-GAP-005), 5xx → ErrUnavailable; GetBatchTenderACL is TAC-5

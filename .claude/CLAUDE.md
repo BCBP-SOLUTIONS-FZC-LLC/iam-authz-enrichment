@@ -17,7 +17,7 @@ This file provides guidance to Claude Code when working with the **AuthZ Enrichm
 
 **Does NOT own:** JWT issuance/validation (Envoy's `jwt_authn` — identity read only from `MetadataContext`, never headers), MFA enrollment, realm/tenant provisioning, durable schema/database, policy-authoring UI, rate limiting, active session revocation, durable delegation data (`iam-delegation`, ADR-0008), tender-ACL persistence (`iam-tender-acl`, ADR-0007 Wave 3 Phase 4 — this service still performs the TAC-4 *check*).
 
-**Source of truth for:** the Allow/Deny decision and its 6 injected headers on every proxied request.
+**Source of truth for:** the Allow/Deny decision and its 7 injected headers on every proxied request (`x-tenant-id`, `x-user-id`, `x-departments`, `x-tenant-roles`, `x-plan`, `x-feature-flags`, `x-residency-mode`). `x-residency-mode` is always server-computed (`"standard"`|`"strict"`, CD-37 AE-40); `x-feature-flags` includes a server-appended `"read_only"` sentinel for cancelled-grace tenants.
 
 ## Common Commands
 

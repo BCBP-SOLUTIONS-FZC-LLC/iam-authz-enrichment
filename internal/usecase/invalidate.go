@@ -200,11 +200,13 @@ func (inv *Invalidator) HandleTenantOffboarded(ctx context.Context, tenant strin
 	if err := inv.cache.EvictRestrictedByTenant(ctx, tenant); err != nil {
 		inv.log.Warn("best-effort ae:restricted eviction failed on TenantOffboarded",
 			map[string]interface{}{"error": err.Error()})
+		inv.recorder.ObserveEvictionError("tenant_offboarded_restricted")
 	}
 	inv.restricted.ClearByTenant(tenant)
 	if err := inv.cache.EvictRealmsByTenant(ctx, tenant); err != nil {
 		inv.log.Warn("best-effort ae:realm eviction failed on TenantOffboarded",
 			map[string]interface{}{"error": err.Error()})
+		inv.recorder.ObserveEvictionError("tenant_offboarded_realm")
 	}
 	inv.realmMap.DeleteByTenant(tenant)
 	return nil
@@ -244,7 +246,15 @@ type TenderRestrictedPayload struct {
 
 // HandleTenderRestricted flips the restricted-tender fact (L1 + shared
 // Valkey). Not a cache eviction (§5).
+//
+// An empty TenderID means the producer payload is malformed or the field was
+// renamed — writing ae:restricted:{tenant}: (empty key) would be a silent
+// correctness bug, so we return an error and let the platform retry/DLQ
+// (AE-TAC-GAP-001 fix).
 func (inv *Invalidator) HandleTenderRestricted(ctx context.Context, tenant string, p TenderRestrictedPayload) error {
+	if p.TenderID == "" {
+		return fmt.Errorf("TenderRestricted payload missing tender_id: producer schema drift or malformed envelope")
+	}
 	if err := inv.restricted.MarkRestricted(ctx, tenant, p.TenderID); err != nil {
 		return fmt.Errorf("persist restricted tender: %w", err)
 	}
