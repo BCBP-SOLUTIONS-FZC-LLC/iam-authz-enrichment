@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Security (2026-10-22 — injected headers overwrite explicitly, LLD rev 1.43)
+
+- **Allow responses set `append_action: OVERWRITE_IF_EXISTS_OR_ADD` on all seven injected headers** (`x-tenant-id`, `x-user-id`, `x-departments`, `x-tenant-roles`, `x-plan`, `x-feature-flags`, `x-residency-mode`). Envoy's ext_authz already overrides by default (`append` defaults to false for `OkHttpResponse.headers`), but stating the action removes the dependency on that default, whose `append`/`append_action` handling has shifted across Envoy releases. Defence in depth behind the ingress strip-list (HLD §11.1). New test `TestOkResponse_HeadersOverwriteClientCopies` (fails on the previous code).
+
 ### Changed (2026-10-21 — platform-gincommon v2.1.0)
 
 - **`platform-gincommon/v2` v2.0.0 → v2.1.0.** Additive release (RFC 9457 extension members); no new dependencies and no code change here — the new extension API is not adopted. `make metrics-lint` re-run against v2.1.0's registry.
