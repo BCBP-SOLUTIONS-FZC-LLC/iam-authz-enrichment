@@ -20,6 +20,15 @@ import (
 // convention. Keys are sorted so the same Decision always serializes
 // identically — map iteration order is otherwise non-deterministic, which
 // would make two functionally-identical responses byte-unequal.
+//
+// Each header is sent with AppendAction OVERWRITE_IF_EXISTS_OR_ADD, so Envoy
+// replaces any same-named header still on the request instead of adding a
+// second value. Envoy's ext_authz already defaults `append` to false
+// (override) for OkHttpResponse.headers, but the deprecated `append` field
+// and `append_action` have changed semantics across Envoy releases; stating
+// the action makes the overwrite independent of that default. The ingress
+// strip-list (HLD §11.1) removes client copies before ext_authz runs; this
+// is the second layer.
 func okResponse(headers map[string]string) *authv3.CheckResponse {
 	keys := make([]string, 0, len(headers))
 	for k := range headers {
@@ -30,7 +39,8 @@ func okResponse(headers map[string]string) *authv3.CheckResponse {
 	opts := make([]*corev3.HeaderValueOption, 0, len(headers))
 	for _, k := range keys {
 		opts = append(opts, &corev3.HeaderValueOption{
-			Header: &corev3.HeaderValue{Key: k, Value: headers[k]},
+			Header:       &corev3.HeaderValue{Key: k, Value: headers[k]},
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
 		})
 	}
 	return &authv3.CheckResponse{
