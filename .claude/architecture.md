@@ -87,7 +87,7 @@ iam-authz-enrichment/
 
 ```go
 require (
-    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2 v2.0.0
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2 v2.1.0
     github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2    v2.1.0
     github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2  v2.0.2
 )

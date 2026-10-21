@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Changed (2026-10-21 — platform-gincommon v2.1.0)
+
+- **`platform-gincommon/v2` v2.0.0 → v2.1.0.** Additive release (RFC 9457 extension members); no new dependencies and no code change here — the new extension API is not adopted. `make metrics-lint` re-run against v2.1.0's registry.
+
 ### Fixed (2026-10-21 — Go 1.26.10)
 
 - **Go 1.26.10 (GO-2026-6809, `crypto/x509`):** `go.mod`'s `go` directive and the digest-pinned builder image (`golang:1.26.10-alpine@sha256:9ce231b2…f7ca`, `.docker-digests`) bumped from 1.26.9; govulncheck flagged GO-2026-6809 (CVE-2026-111943, HIGH) as reachable and failed the vulnerability check, and Trivy flagged the same CVE in the built binary. `make vuln-check`: no reachable vulnerabilities.
