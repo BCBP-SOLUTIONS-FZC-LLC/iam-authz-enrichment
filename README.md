@@ -3,7 +3,7 @@
 Real-time authorization decisions for the platform: enriches every authenticated request with tenant, role, and permission context via a low-latency, cache-backed policy engine.
 
 **Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment`
-**Module:** Go 1.26.9+ · private module · stateless, 5–20 replicas, HPA on RPS · **no database**
+**Module:** Go 1.26.10+ · private module · stateless, 5–20 replicas, HPA on RPS · **no database**
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full layer model, request-flow/cache/event/failure-handling diagrams, and the threat model.
 
@@ -201,7 +201,7 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 
 | Library | Version | Purpose |
 |---------|---------|---------|
-| `platform-gincommon/v2` | v2.0.0 | zap logger, gRPC observability interceptors (error-sanitizer → panic-recovery → request-id → tracing → metrics → logging; non-status handler errors sanitized to `Internal "internal server error"`, never leaking error text to gRPC clients) + `RegisterKnownMethods`, Gin observability middlewares (`/healthz`/`/readyz`), health handler, `InitTracingWithConfig`, `MetricsHandler` (`/metrics`), Tier 3 metric constructors (`NewCounterVec`/`NewCounter`/`NewHistogramVec`, registry-validated), `NewTracer`/`NewSpanTracer`/`InjectTraceContext` — the only OTel/Prometheus entry points, same as iam-org-membership. **RFC 9457 Problem Details**: `pkg/problem` + `gincommon.AbortWithProblem` are the sole HTTP error boundary for all management-surface errors; `Content-Type: application/problem+json` on all 4xx/5xx responses from `/readyz`, `/asyncapi`, and `docsAuthMiddleware` |
+| `platform-gincommon/v2` | v2.1.0 | zap logger, gRPC observability interceptors (error-sanitizer → panic-recovery → request-id → tracing → metrics → logging; non-status handler errors sanitized to `Internal "internal server error"`, never leaking error text to gRPC clients) + `RegisterKnownMethods`, Gin observability middlewares (`/healthz`/`/readyz`), health handler, `InitTracingWithConfig`, `MetricsHandler` (`/metrics`), Tier 3 metric constructors (`NewCounterVec`/`NewCounter`/`NewHistogramVec`, registry-validated), `NewTracer`/`NewSpanTracer`/`InjectTraceContext` — the only OTel/Prometheus entry points, same as iam-org-membership. **RFC 9457 Problem Details**: `pkg/problem` + `gincommon.AbortWithProblem` are the sole HTTP error boundary for all management-surface errors; `Content-Type: application/problem+json` on all 4xx/5xx responses from `/readyz`, `/asyncapi`, and `docsAuthMiddleware` |
 | `platform-events/v2` | v2.1.0 | SQS consumer loop (`LoadSQS` / `NewSQSConsumerWithClient` / `Envelope[T]`), Glue decoding (`GlueDecodeCodec`), `InitMetrics`, SNS/outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) matching iam-user-profile / iam-org-membership. **No publisher or runner**: this service consumes only (HLD §5.4); `cmd/server` skips `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner`. Dedup is `Envelope.ID` via `skipDuplicate` / `ackUnknown`; store is Valkey `SET NX` (no `processed_events` table) |
 | `platform-pgcommon/v2` | v2.0.2 | DSN/pool config (`ConfigFromEnv`), Zap logger adapter, query tracer (`gincommon.NewSpanTracer`), `pgmetrics.InitWithIdentity` — same wiring as iam-user-profile / iam-org-membership. v2.0.2: database spans now emit `SpanKindClient` per OTel semantic conventions (was `SpanKindInternal`). **No live pool**: this service has no schema (HLD §5.4); `cmd/server` loads `PoolConfig` then skips `NewPool` / migrate / outbox |
 | `go-redis/v9` | v9.23.0 | Valkey/Redis client — the only non-platform library with a significant version; import path `github.com/redis/go-redis/v9` |
@@ -320,7 +320,7 @@ No other service calls this service directly. There is no REST or HTTP business 
 
 ### Prerequisites
 
-- Go 1.26.9+
+- Go 1.26.10+
 - Docker (for `make docker-up` — Valkey + floci SQS, plus floci-ui, a web console for floci)
 - SSH key or `GO_PRIVATE_TOKEN` registered for `github.com/BCBP-SOLUTIONS-FZC-LLC` (for `platform-gincommon`/`platform-events`/`platform-pgcommon`)
 

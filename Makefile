@@ -284,13 +284,16 @@ pin-base-images:
 	@GO_VER=$$(awk '/^go [0-9]/{print $$2}' go.mod) && \
 	 CURRENT_TAG=$$(grep -oE 'golang:[0-9]+\.[0-9]+\.[0-9]+-alpine' Dockerfile | head -1) && \
 	 GOLANG_DIGEST=$$(docker buildx imagetools inspect golang:$$GO_VER-alpine --format '{{.Manifest.Digest}}') && \
+	 DEBIAN_DIGEST=$$(docker buildx imagetools inspect debian:bookworm-slim --format '{{.Manifest.Digest}}') && \
 	 DISTROLESS_DIGEST=$$(docker buildx imagetools inspect gcr.io/distroless/static-debian12:nonroot --format '{{.Manifest.Digest}}') && \
 	 sed -i.bak \
 	   -e "s|FROM $$CURRENT_TAG.*|FROM golang:$$GO_VER-alpine@$$GOLANG_DIGEST AS builder|" \
+	   -e "s|FROM debian:bookworm-slim.*|FROM debian:bookworm-slim@$$DEBIAN_DIGEST AS certs|" \
 	   -e "s|FROM gcr.io/distroless/static-debian12:nonroot.*|FROM gcr.io/distroless/static-debian12:nonroot@$$DISTROLESS_DIGEST|" \
 	   Dockerfile && rm -f Dockerfile.bak && \
 	 echo "golang:$$GO_VER-alpine $$GOLANG_DIGEST" > .docker-digests && \
 	 echo "gcr.io/distroless/static-debian12:nonroot $$DISTROLESS_DIGEST" >> .docker-digests && \
+	 echo "debian:bookworm-slim $$DEBIAN_DIGEST" >> .docker-digests && \
 	 echo "Digests written to .docker-digests — commit both Dockerfile and .docker-digests. Base image tag is derived from go.mod's own 'go' directive ($$GO_VER) so a go.mod bump and this pin can never silently drift apart again."
 
 # -----------------------------
