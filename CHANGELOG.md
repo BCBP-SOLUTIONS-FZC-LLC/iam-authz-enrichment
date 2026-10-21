@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Fixed (2026-10-21 — Go 1.26.10)
+
+- **Go 1.26.10 (GO-2026-6809, `crypto/x509`):** `go.mod`'s `go` directive and the digest-pinned builder image (`golang:1.26.10-alpine@sha256:9ce231b2…f7ca`, `.docker-digests`) bumped from 1.26.9; govulncheck flagged GO-2026-6809 (CVE-2026-111943, HIGH) as reachable and failed the vulnerability check, and Trivy flagged the same CVE in the built binary. `make vuln-check`: no reachable vulnerabilities.
+
 ### Fixed (2026-10-20 — Production readiness audit + observability standard)
 
 - **AE-TAC-GAP-001: `HandleTenderRestricted` now rejects a missing or empty `tender_id`** (`internal/usecase/invalidate.go`). Previously a payload with a renamed or absent `tender_id` field decoded silently to `TenderRestrictedPayload{TenderID: ""}`, which called `MarkRestricted(ctx, tenant, "")` and wrote `ae:restricted:{tenant}:` — an empty-key fact that would effectively mark every tender in the tenant as restricted. The handler now returns an error for empty `TenderID`, causing platform-events to retry and eventually forward the malformed message to the DLQ. Three new tests pin this: `TestTenderHandler_TenderRestricted_ContractFixture` (raw-wire JSON fixture binding the `tender_id` field name — catches schema drift if Tender Service renames it), `TestTenderHandler_TenderRestricted_MissingTenderID_ReturnsError` (schema-drift simulation with `tdr_id`), and `TestInvalidator_TenderRestricted_EmptyTenderID_ReturnsError` (usecase-level guard).

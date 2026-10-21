@@ -1,7 +1,7 @@
 # Pin base images to SHA digests for reproducible, supply-chain-safe builds.
 # Update with: make pin-base-images  (requires docker and network access)
 # Current digests are tracked in .docker-digests; CI enforces they match this file.
-FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS builder
+FROM golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca AS builder
 
 WORKDIR /build
 
