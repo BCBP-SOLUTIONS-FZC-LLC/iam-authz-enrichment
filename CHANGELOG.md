@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Changed (2026-10-22 — deploy: platform namespace names gateway / observability)
+
+- Helm NetworkPolicy ingress selector `envoy-gateway-system` → `gateway` (Envoy Gateway data plane) and metrics-ingress selector `monitoring` → `observability` (Prometheus), matching the platform namespace list (AWS dev environment HLD). `deploy/monitoring/prometheus-adapter-rule.yaml` namespace → `observability`.
+
 ### Security (2026-10-22 — injected headers overwrite explicitly, LLD rev 1.43)
 
 - **Allow responses set `append_action: OVERWRITE_IF_EXISTS_OR_ADD` on all seven injected headers** (`x-tenant-id`, `x-user-id`, `x-departments`, `x-tenant-roles`, `x-plan`, `x-feature-flags`, `x-residency-mode`). Envoy's ext_authz already overrides by default (`append` defaults to false for `OkHttpResponse.headers`), but stating the action removes the dependency on that default, whose `append`/`append_action` handling has shifted across Envoy releases. Defence in depth behind the ingress strip-list (HLD §11.1). New test `TestOkResponse_HeadersOverwriteClientCopies` (fails on the previous code).
