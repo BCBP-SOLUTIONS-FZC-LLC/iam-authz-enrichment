@@ -327,8 +327,8 @@ grpcTLS:
 # the monitoring namespace. Override to false only in environments where the
 # CNI plugin does not support NetworkPolicy.
 #
-# Envoy Gateway: data-plane Envoy proxy pods run in the same namespace as the
-# Gateway resource (not envoy-gateway-system, which is the control plane).
+# Envoy Gateway: the data-plane Envoy proxy pods run in the platform `gateway`
+# namespace (alongside the Gateway resource).
 # Service mesh sidecar (Istio/Linkerd ext_authz): every namespace running a
 # sidecar needs to reach this Service — widen ingressControllerNamespaceSelector
 # accordingly, or use additionalIngressRules for a mesh-wide allow.
@@ -344,7 +344,7 @@ networkPolicy:
   # Namespace label selector for wherever Envoy's ext_authz filter runs.
   # Envoy Gateway:   kubernetes.io/metadata.name: <namespace where Gateway lives>
   envoyNamespaceSelector:
-    kubernetes.io/metadata.name: envoy-gateway-system
+    kubernetes.io/metadata.name: gateway
   # Optional pod label selector — combined with namespaceSelector (logical AND).
   # Envoy Gateway data-plane pods carry:
   #   gateway.envoyproxy.io/owning-gateway-name: <gateway-name>
@@ -355,7 +355,7 @@ networkPolicy:
     enabled: true
     # Namespace where Prometheus runs.
     namespaceSelector:
-      kubernetes.io/metadata.name: monitoring
+      kubernetes.io/metadata.name: observability
     # Pod label selector for the Prometheus pod.
     podSelector:
       app.kubernetes.io/name: prometheus
