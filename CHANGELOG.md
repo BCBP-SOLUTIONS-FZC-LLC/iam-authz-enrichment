@@ -14,6 +14,7 @@ This service has no production deployment yet — pre-1.0, still in active devel
 
 ### Fixed (2026-10-21 — Go 1.26.10)
 
+- **Runtime CA bundle (DLA-4845-1):** distroless static-debian12 (pinned digest already the latest upstream) ships ca-certificates 20250419~deb12u1; deb12u2 removes the distrusted Comodo "AAA Certificate Services" and "emSign ECC Root CA - G3" roots. A new digest-pinned `debian:bookworm-slim` `certs` stage installs deb12u2 and its bundle replaces distroless's `/etc/ssl/certs/ca-certificates.crt` (verified in the built image: 148 certs, both roots absent). The Alpine builder's bundle is not used — it still carries the emSign root. `.trivyignore` gains `DLA-4845-1 exp:2026-11-21` (Trivy still reads distroless's dpkg metadata); `.docker-digests` and `make pin-base-images` cover the new stage. Remove all three once distroless ships deb12u2.
 - **Go 1.26.10 (GO-2026-6809, `crypto/x509`):** `go.mod`'s `go` directive and the digest-pinned builder image (`golang:1.26.10-alpine@sha256:9ce231b2…f7ca`, `.docker-digests`) bumped from 1.26.9; govulncheck flagged GO-2026-6809 (CVE-2026-111943, HIGH) as reachable and failed the vulnerability check, and Trivy flagged the same CVE in the built binary. `make vuln-check`: no reachable vulnerabilities.
 
 ### Fixed (2026-10-20 — Production readiness audit + observability standard)
