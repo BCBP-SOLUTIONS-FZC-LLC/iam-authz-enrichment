@@ -124,3 +124,33 @@ func TestAuthTimeField_NonNumericKind_ReturnsZero(t *testing.T) {
 	fields := map[string]*structpb.Value{"auth_time": structpb.NewBoolValue(true)}
 	assert.EqualValues(t, 0, authTimeField(fields))
 }
+
+// CD-52 (§8.9): Keycloak realm roles are decoded for the operator path.
+func TestDecodeClaims_RealmRoles(t *testing.T) {
+	t.Parallel()
+	req := requestWithClaims(t, map[string]interface{}{
+		"sub": "op", "iss": "https://kc/realms/platform",
+		"realm_access": map[string]interface{}{"roles": []interface{}{"platform_operator", 7.0, "", "offline_access"}},
+	})
+	claims := decodeClaims(req, JWTMetadata{Namespace: testNamespace, PayloadKey: testPayload})
+	assert.Equal(t, []string{"platform_operator", "offline_access"}, claims.Roles, "non-string and empty entries skipped")
+}
+
+func TestDecodeClaims_NoRealmAccess_NoRoles(t *testing.T) {
+	t.Parallel()
+	req := requestWithClaims(t, map[string]interface{}{"sub": "alice", "realm_access": "garbage"})
+	claims := decodeClaims(req, JWTMetadata{Namespace: testNamespace, PayloadKey: testPayload})
+	assert.Empty(t, claims.Roles)
+}
+
+// The operator jwt_authn provider may write under its own payload key.
+func TestDecodeClaims_OperatorPayloadKey(t *testing.T) {
+	t.Parallel()
+	req := requestWithClaims(t, map[string]interface{}{"sub": "op", "iss": "https://kc/realms/platform"})
+
+	claims := decodeClaims(req, JWTMetadata{Namespace: testNamespace, PayloadKey: "tenant-provider", OperatorPayloadKey: testPayload})
+	assert.Equal(t, "op", claims.Subject, "falls back to the operator key when the tenant key is absent")
+
+	none := decodeClaims(req, JWTMetadata{Namespace: testNamespace, PayloadKey: "tenant-provider"})
+	assert.Zero(t, none, "no operator key configured: nothing decoded")
+}

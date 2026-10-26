@@ -61,6 +61,15 @@ type Config struct {
 	JWTMetadataNamespace string
 	JWTPayloadKey        string
 
+	// OperatorRealmIssuer is the platform realm's issuer URL (CD-52, LLD
+	// §8.9): tokens from it take the operator path, allowed only on
+	// /api/v1/operator/* with the platform_operator role. Empty disables the
+	// operator path (operator tokens are then denied as before).
+	// JWTOperatorPayloadKey is that jwt_authn provider's payload key, when
+	// the gateway keeps it separate from JWTPayloadKey. Empty = same key.
+	OperatorRealmIssuer   string
+	JWTOperatorPayloadKey string
+
 	// AeCtxTTL/AeCtxJitter implement the §4.1 "60s ± 6s jitter" key schedule.
 	AeCtxTTL           time.Duration
 	AeCtxJitter        time.Duration
@@ -199,6 +208,9 @@ func Load() (Config, error) {
 		SharedRealmIssuer:    envOr("SHARED_REALM_ISSUER", ""),
 		JWTMetadataNamespace: envOr("JWT_METADATA_NAMESPACE", "envoy.filters.http.jwt_authn"),
 		JWTPayloadKey:        envOr("JWT_PAYLOAD_KEY", "trial"),
+
+		OperatorRealmIssuer:   envOr("OPERATOR_REALM_ISSUER", ""),
+		JWTOperatorPayloadKey: envOr("JWT_OPERATOR_PAYLOAD_KEY", ""),
 
 		TenderACLBaseURL: envOr("TENDER_ACL_BASE_URL", devTenderACLBaseURL),
 
@@ -363,6 +375,18 @@ func Load() (Config, error) {
 			"no tenant-resolution path configured with APP_ENV=%q: set SHARED_REALM_ISSUER (shared trial realm issuer) or REALM_TENANT_MAP_SEED (dedicated-realm JSON seed) — both empty means every request returns DENY_MALFORMED_IDENTITY",
 			cfg.AppEnv,
 		)
+	}
+
+	// OPERATOR_REALM_ISSUER must never also resolve a tenant: if it equalled
+	// the shared trial issuer or a dedicated realm in the seed, the same
+	// token would be both an operator and a tenant user.
+	if cfg.OperatorRealmIssuer != "" {
+		if cfg.OperatorRealmIssuer == cfg.SharedRealmIssuer {
+			return Config{}, fmt.Errorf("OPERATOR_REALM_ISSUER must differ from SHARED_REALM_ISSUER — the platform realm is never a tenant realm")
+		}
+		if _, clash := cfg.RealmTenantMapSeed[cfg.OperatorRealmIssuer]; clash {
+			return Config{}, fmt.Errorf("OPERATOR_REALM_ISSUER is also a dedicated realm in REALM_TENANT_MAP_SEED — the platform realm is never a tenant realm")
+		}
 	}
 
 	// ORG_MEMBERSHIP_BASE_URL left at its local-dev default outside dev is

@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Added (2026-10-28 — operator path, CD-52, LLD rev 1.44)
+
+- **Platform-operator tokens are now authorized** (new LLD §8.9). Every service's `/api/v1/operator/*` routes require `platform_operator` in the trusted role header, but nothing ever injected it: operator tokens come from the platform realm, whose issuer failed tenant resolution (`DENY_MALFORMED_IDENTITY`).
+  - **New `OPERATOR_REALM_ISSUER`.** Tokens from it are allowed only on `/api/v1/operator/*` and only with the `platform_operator` realm role (`realm_access.roles`). They get `x-user-id` = the operator `sub`, `x-tenant-roles: platform_operator`, and `x-tenant-id` = the path tenant or the nil UUID. The other headers are sent empty. No I-8 lookup.
+  - **Denials.** Off the operator prefix, or without the role: `DENY_ROLE_INSUFFICIENT`. A non-UUID subject or tenant segment: `DENY_MALFORMED_IDENTITY`. A tenant token can never obtain `platform_operator`.
+  - **Audit.** Every operator decision is logged as `operator_access`.
+  - **Config.** `config.Load()` rejects an operator issuer that is also a tenant issuer. Empty (the default) disables the path. Optional `JWT_OPERATOR_PAYLOAD_KEY`.
+  - **Still needed outside this repo:** the Keycloak platform realm and the gateway's operator `jwt_authn` provider and route (platform edge).
+
 ### Changed (2026-10-22 — platform-events v2.2.1)
 
 - **`platform-events/v2` v2.1.0 → v2.2.1**: handler-initiated dead-letters are settled once — after a successful `SendToDLQ` (handler ctx) the consumer deletes the message whatever the handler returns; a nil return after a *failed* `SendToDLQ` now leaves the message visible for retry (`platform_messages_failed_total{reason="dead_letter_error"}`) instead of deleting it; a message forwarded to the DLQ whose `DeleteMessage` fails is retried 3× and, if still undeleted, its redelivery to the same replica is deleted (12 h memory) instead of being forwarded again. v2.2.1 is the same code released with the go1.26.10 toolchain. This service never calls `SendToDLQ` itself — it relies on `WithDLQForwarding` after its dead-letter handler, which now also gets the delete retry. No code change.

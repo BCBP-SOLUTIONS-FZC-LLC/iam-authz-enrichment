@@ -21,6 +21,7 @@ var allEnvVars = []string{
 	"ORG_MEMBERSHIP_BASE_URL", "ORG_MEMBERSHIP_TIMEOUT",
 	"TENDER_ACL_BASE_URL", "TENDER_ACL_TIMEOUT",
 	"SHARED_REALM_ISSUER", "JWT_METADATA_NAMESPACE", "JWT_PAYLOAD_KEY",
+	"OPERATOR_REALM_ISSUER", "JWT_OPERATOR_PAYLOAD_KEY",
 	"AE_CTX_TTL", "AE_CTX_JITTER", "AE_TENDER_ACL_TTL", "AE_NEG_TTL", "AE_RESTRICTED_NEG_TTL", "AE_REALM_NEG_TTL",
 	"AE_PROCESSED_EVENT_TTL", "AE_STALE_IF_ERROR_MAX_AGE",
 	"GRPC_KEEPALIVE_TIME", "GRPC_KEEPALIVE_TIMEOUT", "GRPC_REQUEST_TIMEOUT", "GRPC_MAX_CONCURRENT_STREAMS",
@@ -657,4 +658,45 @@ func TestLoad_RealmMapSeedSet_PassesOutsideDev(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Len(t, cfg.RealmTenantMapSeed, 1)
+}
+
+// CD-52 (§8.9): the platform realm must never also resolve a tenant.
+func TestLoad_OperatorRealmIssuer(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "dev")
+	t.Setenv("OPERATOR_REALM_ISSUER", "https://kc/realms/platform")
+	t.Setenv("JWT_OPERATOR_PAYLOAD_KEY", "operator")
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, "https://kc/realms/platform", cfg.OperatorRealmIssuer)
+	assert.Equal(t, "operator", cfg.JWTOperatorPayloadKey)
+}
+
+func TestLoad_OperatorRealmIssuer_DefaultsDisabled(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("APP_ENV", "dev")
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.OperatorRealmIssuer, "empty disables the operator path")
+	assert.Empty(t, cfg.JWTOperatorPayloadKey)
+}
+
+func TestLoad_OperatorRealmIssuer_MustNotBeATenantRealm(t *testing.T) {
+	for name, set := range map[string]func(){
+		"same_as_shared": func() { t.Setenv("SHARED_REALM_ISSUER", "https://kc/realms/platform") },
+		"in_seed":        func() { t.Setenv("REALM_TENANT_MAP_SEED", `{"https://kc/realms/platform":"tenant-a"}`) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("APP_ENV", "dev")
+			t.Setenv("OPERATOR_REALM_ISSUER", "https://kc/realms/platform")
+			set()
+
+			_, err := config.Load()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "OPERATOR_REALM_ISSUER")
+		})
+	}
 }

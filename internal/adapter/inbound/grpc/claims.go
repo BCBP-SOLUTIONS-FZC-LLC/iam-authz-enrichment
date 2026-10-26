@@ -26,6 +26,10 @@ type JWTMetadata struct {
 	// decoded JWT payload — the jwt_authn provider name configured with
 	// payload_in_metadata.
 	PayloadKey string
+	// OperatorPayloadKey is the payload key of the platform-realm (operator)
+	// jwt_authn provider, when the gateway configures it under its own key
+	// (CD-52, §8.9). Read only when PayloadKey is absent. Empty = not used.
+	OperatorPayloadKey string
 }
 
 // decodeClaims extracts usecase.Claims from the verified-JWT dynamic
@@ -45,6 +49,9 @@ func decodeClaims(req *authv3.CheckRequest, cfg JWTMetadata) usecase.Claims {
 		return claims
 	}
 	payload, ok := ns.GetFields()[cfg.PayloadKey]
+	if !ok && cfg.OperatorPayloadKey != "" {
+		payload, ok = ns.GetFields()[cfg.OperatorPayloadKey]
+	}
 	if !ok {
 		return claims
 	}
@@ -57,7 +64,25 @@ func decodeClaims(req *authv3.CheckRequest, cfg JWTMetadata) usecase.Claims {
 	claims.Issuer = stringField(fields, "iss")
 	claims.TenantID = stringField(fields, "tenant_id")
 	claims.AuthTime = authTimeField(fields)
+	claims.Roles = realmRoles(fields)
 	return claims
+}
+
+// realmRoles reads Keycloak's "realm_access": {"roles": [...]}. Non-string
+// entries are skipped; an absent or malformed claim yields no roles.
+func realmRoles(fields map[string]*structpb.Value) []string {
+	access, ok := fields["realm_access"]
+	if !ok {
+		return nil
+	}
+	list := access.GetStructValue().GetFields()["roles"].GetListValue().GetValues()
+	roles := make([]string, 0, len(list))
+	for _, v := range list {
+		if s := v.GetStringValue(); s != "" {
+			roles = append(roles, s)
+		}
+	}
+	return roles
 }
 
 func stringField(fields map[string]*structpb.Value, key string) string {

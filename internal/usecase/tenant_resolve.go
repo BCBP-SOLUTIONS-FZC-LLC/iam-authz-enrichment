@@ -136,6 +136,10 @@ type Claims struct {
 	Issuer   string // "iss"
 	TenantID string // "tenant_id" — shared trial-realm tenants only
 	AuthTime int64  // "auth_time", unix seconds
+	// Roles is Keycloak's "realm_access.roles". Read only on the operator
+	// path (CD-52, §8.9); tenant authorization never uses token roles — it
+	// uses I-8's membership facts.
+	Roles []string
 }
 
 // ResolveTenant implements §2 point 3: resolve tenant_id from the JWT iss

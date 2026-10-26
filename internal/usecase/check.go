@@ -36,6 +36,10 @@ type CheckInput struct {
 // this only holds usecase-level policy knobs.
 type CheckerConfig struct {
 	SharedRealmIssuer string
+	// OperatorIssuer is the platform realm's issuer (CD-52, §8.9). Tokens
+	// from it take the operator path instead of tenant resolution. Empty
+	// disables the operator path.
+	OperatorIssuer string
 }
 
 // Checker orchestrates the full §3.1 precedence chain. It depends only on
@@ -87,6 +91,11 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 	// or header substitutes for it. With none there is nothing to authorize.
 	if in.Claims.Subject == "" {
 		return domain.Denied(domain.DenyMalformedIdentity)
+	}
+	// CD-52 / §8.9: a platform-realm (operator) token never reaches tenant
+	// resolution — it is authorized on the operator path or denied there.
+	if c.isOperatorToken(in.Claims) {
+		return c.checkOperator(in)
 	}
 	// §2 point 3 / §9: tenant resolution. Malformed identity short-circuits
 	// everything — there is no tenant to scope any subsequent call to.
