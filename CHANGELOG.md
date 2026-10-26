@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Docs (2026-10-28 — CD-52 open go-live items, LLD rev 1.45)
+
+- **The remaining CD-52 work is now tracked** so it can't be missed: the platform realm, the gateway operator provider, `OPERATOR_REALM_ISSUER` per environment, an end-to-end check through the gateway, the optional `commercial_trial_manager` staff role, and the target date for Commercial. It's recorded as OP-G1..OP-G6 in new LLD §8.9.1, as unchecked boxes in the `docs/runbook.md` go-live checklist, in §12 and §18.6, and as AE-46, reopened as a **Phase 1 go-live gate**. The LLD status no longer says the go-live checklist is closed.
+
 ### Added (2026-10-28 — operator path, CD-52, LLD rev 1.44)
 
 - **Platform-operator tokens are now authorized** (new LLD §8.9). Every service's `/api/v1/operator/*` routes require `platform_operator` in the trusted role header, but nothing ever injected it: operator tokens come from the platform realm, whose issuer failed tenant resolution (`DENY_MALFORMED_IDENTITY`).
