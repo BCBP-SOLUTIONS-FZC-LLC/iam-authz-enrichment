@@ -66,6 +66,8 @@ go test -tags=e2e ./test/e2e/... -run TestGoldenPath_Allow -v
 
 **Env vars:** every field defaults (`envOr`). Five exceptions — all in `config.Load()`, fatal outside `APP_ENV=dev`: (1) `ORG_MEMBERSHIP_BASE_URL` / (2) `TENDER_ACL_BASE_URL` left at the dev default, (3) `VALKEY_URL` without `rediss://` (Valkey must be TLS in non-dev), (4) both `SHARED_REALM_ISSUER` and `REALM_TENANT_MAP_SEED` empty (no tenant-resolution path — every request silently `DENY_MALFORMED_IDENTITY`), (5) any `*_AUTHZ_QUEUE_URL` left blank (consumer starts idle, looks healthy, never evicts). Also rejects (any env) two of the five queue URLs set to the same value — corrupts watchdog streak tracking. Use `config.ResolveAppEnv()` — never read `APP_ENV` directly.
 
+**Operator path (CD-52, LLD §8.9):** tokens from `OPERATOR_REALM_ISSUER` (the platform realm; empty = off) bypass tenant resolution. They are allowed only on `/api/v1/operator/*` with the `platform_operator` realm role, and get `x-tenant-roles: platform_operator`, `x-user-id` = `sub`, and `x-tenant-id` = the path tenant or the nil UUID. A tenant token can never obtain `platform_operator`. Every operator decision is logged as `operator_access`. `config.Load()` also rejects (any env) an operator issuer equal to a tenant issuer.
+
 ## Architecture
 
 Clean Architecture — dependencies point inward: `domain` ← `usecase` ← `adapter` ← `cmd`. Nothing in `internal/domain` or `internal/usecase` imports an adapter package.

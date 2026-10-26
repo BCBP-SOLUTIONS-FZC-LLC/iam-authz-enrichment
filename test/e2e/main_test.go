@@ -56,6 +56,8 @@ const (
 	e2eMetricsPort = "19098"
 
 	e2eTestIssuer = "https://kc.example.com/realms/e2e-shared-trial"
+	// e2eOperatorIssuer is the platform realm (CD-52, LLD §8.9).
+	e2eOperatorIssuer = "https://kc.example.com/realms/e2e-platform"
 )
 
 var (
@@ -127,6 +129,7 @@ func runMain(m *testing.M) int {
 		"ORG_MEMBERSHIP_TIMEOUT=2s",
 		"TENDER_ACL_TIMEOUT=2s",
 		"SHARED_REALM_ISSUER="+e2eTestIssuer,
+		"OPERATOR_REALM_ISSUER="+e2eOperatorIssuer,
 		"DOCS_ENABLED=false",
 		// Short long-poll and visibility windows, for test isolation only.
 		// Consecutive suite runs share the same queues; a stopped binary's

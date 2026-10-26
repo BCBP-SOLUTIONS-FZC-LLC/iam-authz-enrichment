@@ -255,6 +255,7 @@ func run() error {
 	restricted.BindStore(facts)
 	checker := usecase.NewChecker(cache, orgClient, realmMap, restricted, appLog, recorder, usecase.CheckerConfig{
 		SharedRealmIssuer: cfg.SharedRealmIssuer,
+		OperatorIssuer:    cfg.OperatorRealmIssuer,
 	})
 	invalidator := usecase.NewInvalidator(eventCache, realmMap, restricted, appLog, recorder)
 
@@ -295,8 +296,9 @@ func run() error {
 	}
 	grpcServer := grpc.NewServer(serverOpts...)
 	authv3.RegisterAuthorizationServer(grpcServer, grpcadapter.NewServer(checker, grpcadapter.JWTMetadata{
-		Namespace:  cfg.JWTMetadataNamespace,
-		PayloadKey: cfg.JWTPayloadKey,
+		Namespace:          cfg.JWTMetadataNamespace,
+		PayloadKey:         cfg.JWTPayloadKey,
+		OperatorPayloadKey: cfg.JWTOperatorPayloadKey,
 	}))
 	// Native gRPC health checking (grpc.health.v1.Health) — lets Kubernetes'
 	// grpc: probe type be used as an alternative to the HTTP /healthz
