@@ -41,6 +41,26 @@ explicitly signed off, before production traffic.
       labels, the prometheus-adapter rule installed, and the CloudWatch DLQ
       alarms (`deploy/monitoring/dlq-alarms.tf.example`) applied.
 
+**Operator path — CD-52 (LLD §8.9.1, AE-46). Phase 1 go-live gate:**
+
+Until these are done, `OPERATOR_REALM_ISSUER` stays empty, and no operator route works through the gateway — IAM's or Commercial's.
+
+- [ ] **OP-G1** Keycloak platform realm with the `platform_operator` role, MFA
+      required, short sessions, and operator users provisioned. Note its issuer URL.
+- [ ] **OP-G2** Gateway `jwt_authn` provider for the platform realm, accepted
+      on `/api/v1/operator/*` only (platform edge). If it uses its own payload
+      key, set `JWT_OPERATOR_PAYLOAD_KEY`.
+- [ ] **OP-G3** `OPERATOR_REALM_ISSUER` set in each environment's values, and this
+      service redeployed. Startup fails if it equals a tenant issuer.
+- [ ] **OP-G4** End-to-end check through the gateway: an operator reaches an
+      operator route (`operator_access` in the logs); a tenant admin gets `403` on
+      `/api/v1/operator/*`; an operator gets `403` on a tenant route. Cover IAM's
+      operator routes and Commercial's 10 routes (LLD §8.9.1).
+- [ ] **OP-G5** (only if Product asks, CD-51) `commercial_trial_manager` staff
+      role: injected by the operator path, accepted by Entitlements on the
+      trial-profile route only, and `403` elsewhere.
+- [ ] **OP-G6** Target date for OP-G1..OP-G4 sent to Commercial.
+
 **Dependencies to track:**
 
 - [x] ~~Upgrade `google.golang.org/grpc` to v1.85.0 and remove GO-2026-6443
