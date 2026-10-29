@@ -87,6 +87,46 @@ func TestCheck_SubjectResolution_404_DeniesAndNegativeCaches(t *testing.T) {
 	assert.Contains(t, cache.SortedCalls(), "SetNegative:"+tenant+":"+user)
 }
 
+func TestCheck_SubjectResolution_404_EvictsStaleCtx(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.MembershipContext{Roles: []string{"tenant_admin"}}, domain.CacheStale)
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error) {
+			return domain.MembershipContext{}, domain.TenantContext{}, domain.ErrNotFound
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.False(t, decision.Allow)
+	assert.Equal(t, domain.DenyUnresolvableSubject, decision.Reason)
+	assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:"+tenant+":"+user,
+		"AE-47: a non-member answer must drop the old ae:ctx so stale-if-error can't serve its roles")
+	_, res, err := cache.GetMembershipContext(context.Background(), tenant, user)
+	require.NoError(t, err)
+	assert.Equal(t, domain.CacheMiss, res)
+}
+
+func TestCheck_SubjectResolution_404_EvictCtxFails_StillDenies(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.MembershipContext{Roles: []string{"tenant_admin"}}, domain.CacheStale)
+	cache.EvictCtxErr = errors.New("valkey down")
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error) {
+			return domain.MembershipContext{}, domain.TenantContext{}, domain.ErrNotFound
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.False(t, decision.Allow)
+	assert.Equal(t, domain.DenyUnresolvableSubject, decision.Reason, "a best-effort ae:ctx eviction failure must not change the deny reason")
+}
+
 func TestCheck_NegativeCacheHit_ShortCircuits_NoSiblingCall(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
