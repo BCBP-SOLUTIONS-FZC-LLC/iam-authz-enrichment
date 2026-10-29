@@ -10,6 +10,8 @@ This service has no production deployment yet — pre-1.0, still in active devel
 
 ### Fixed (2026-10-30 — suspended members denied, AE-47, LLD rev 1.46)
 
+- **`golang.org/x/net` v0.61.0 → v0.62.0** for CVE-2026-78661 and CVE-2026-97045 (HTML tokenizer; flagged by the Trivy image scan). No code change.
+
 - **A suspended member no longer passes the gateway.** I-8 returns a suspended member's row with `200`, `status: "suspended"` and their role grants (kept for audit). This service ignored `status`, so it injected those roles and every downstream service let the member in. The org-membership client now treats any `status` but `active`, a missing one included, as `ErrNotFound`: the member is negative-cached for 5 s and denied `DENY_UNRESOLVABLE_SUBJECT`, and their roles are never cached. After a suspension, access ends when the cached `ae:ctx` entry expires (60 s ± 6 s), since O&M emits no event on suspend. New LLD §8.2.1 and AE-47. Tests: client unit test and e2e `TestSuspendedMember_Deny`.
 
 ### Docs (2026-10-28 — CD-52 open go-live items, LLD rev 1.45)
