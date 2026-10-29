@@ -22,7 +22,7 @@ This file provides guidance to Claude Code when working with the **AuthZ Enrichm
 ## Common Commands
 
 ```bash
-make setup           # Copy .env-example → .env; install .githooks/pre-commit (run once)
+make setup           # Copy .env-example → .env; install .githooks/pre-commit + pre-push (run once)
 make tidy            # go mod tidy
 make fmt             # go fmt ./...
 make fmt-check       # Verify gofmt without modifying (mirrors CI)
@@ -31,6 +31,7 @@ make lint            # golangci-lint (via go tool golangci-lint)
 make arch-lint       # enforce .go-arch-lint.yml component boundaries
 make mod-verify      # go mod verify
 make vuln-check      # govulncheck — fails on reachable vulns not in .github/govulncheck-allow.txt
+make trivy           # build image + Trivy scan like CI (CRITICAL/HIGH/UNKNOWN, fixed only, .trivyignore); run by .githooks/pre-push (SKIP_TRIVY=1 to skip)
 make test            # unit tests (no Docker)
 make test-ci         # unit tests with -race + coverage (CI; gated at 100%)
 make test-integration # real Valkey + real SQS (build tag `integration`, requires Docker)
@@ -48,7 +49,7 @@ make events-lint     # enforce all SQS events/outbox/dedup pass through platform
 make image-pin-lint  # Dockerfile golang:<ver>-alpine tag (and .docker-digests) must match go.mod's go directive
 make ci              # tidy + fmt-check + vet + lint + arch-lint + observability/database/events/image-pin lints + metrics-check + test-ci + build (mirrors CI)
 make docker-up / docker-down   # Valkey + floci (SQS) + floci-ui only — app itself usually runs via `make run`
-make install-hooks   # re-sync .githooks/pre-commit → .git/hooks
+make install-hooks   # re-sync .githooks/pre-commit + pre-push → .git/hooks
 make load-test       # manual 500 RPS harness (not in CI)
 make pin-base-images / make clean
 ```
