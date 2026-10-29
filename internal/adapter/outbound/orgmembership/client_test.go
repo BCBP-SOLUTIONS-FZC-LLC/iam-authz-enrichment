@@ -27,6 +27,7 @@ func TestGetMemberships_EmptyArraysNeverNull(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
+			"status": "active",
 			"plan": "pro",
 			"subscription_status": "active",
 			"read_only": false,
@@ -53,6 +54,7 @@ func TestGetMemberships_FullResponse_DecodesCorrectly(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
+			"status": "active",
 			"roles": ["tenant_admin"],
 			"departments": [{"department_id": "eng", "role_level": "approver"}],
 			"plan": "enterprise",
@@ -229,7 +231,7 @@ func TestGetMemberships_PropagatesTraceparent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Get("traceparent")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"plan":"pro","subscription_status":"active","read_only":false,"mfa_freshness_seconds":300}`))
+		_, _ = w.Write([]byte(`{"status":"active","plan":"pro","subscription_status":"active","read_only":false,"mfa_freshness_seconds":300}`))
 	}))
 	defer srv.Close()
 
@@ -266,7 +268,7 @@ func TestGetMemberships_SetsOrgMembershipInternalIdentityHeaders(t *testing.T) {
 		tenantID = r.Header.Get("x-tenant-id")
 		tenantRoles = r.Header.Get("x-tenant-roles")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"plan":"pro","subscription_status":"active","read_only":false,"mfa_freshness_seconds":300}`))
+		_, _ = w.Write([]byte(`{"status":"active","plan":"pro","subscription_status":"active","read_only":false,"mfa_freshness_seconds":300}`))
 	}))
 	defer srv.Close()
 
@@ -633,4 +635,27 @@ func TestGetTenderACL_503ServiceUnavailable_ReturnsErrUnavailable(t *testing.T) 
 
 	assert.ErrorIs(t, err, domain.ErrUnavailable,
 		"TAC-4 503 must map to ErrUnavailable so §7 stale-if-error can activate for a real dependency outage")
+}
+
+// §8.2.1 / Core TM-9: I-8 returns a suspended (or otherwise non-active) row
+// with 200. The client turns anything but "active", a missing status
+// included, into ErrNotFound, so the caller negative-caches and denies it
+// like a 404 and never caches the member's roles.
+func TestGetMemberships_NonActiveStatus_IsNotFound(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"status":"suspended","roles":["tenant_admin"],"plan":"pro","subscription_status":"active"}`,
+		`{"status":"left","roles":[],"plan":"pro","subscription_status":"active"}`,
+		`{"roles":["tenant_admin"],"plan":"pro","subscription_status":"active"}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		client := orgmembership.New(srv.URL, time.Second, srv.URL, time.Second)
+		m, _, err := client.GetMemberships(context.Background(), "tenant-1", "user-1")
+		srv.Close()
+		require.ErrorIs(t, err, domain.ErrNotFound, body)
+		assert.Empty(t, m.Roles, body)
+	}
 }

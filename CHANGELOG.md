@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This service has no production deployment yet — pre-1.0, still in active development.
 
+### Fixed (2026-10-30 — suspended members denied, AE-47, LLD rev 1.46)
+
+- **A suspended member no longer passes the gateway.** I-8 returns a suspended member's row with `200`, `status: "suspended"` and their role grants (kept for audit). This service ignored `status`, so it injected those roles and every downstream service let the member in. The org-membership client now treats any `status` but `active`, a missing one included, as `ErrNotFound`: the member is negative-cached for 5 s and denied `DENY_UNRESOLVABLE_SUBJECT`, and their roles are never cached. After a suspension, access ends when the cached `ae:ctx` entry expires (60 s ± 6 s), since O&M emits no event on suspend. New LLD §8.2.1 and AE-47. Tests: client unit test and e2e `TestSuspendedMember_Deny`.
+
 ### Docs (2026-10-28 — CD-52 open go-live items, LLD rev 1.45)
 
 - **The remaining CD-52 work is now tracked** so it can't be missed: the platform realm, the gateway operator provider, `OPERATOR_REALM_ISSUER` per environment, an end-to-end check through the gateway, the optional `commercial_trial_manager` staff role, and the target date for Commercial. It's recorded as OP-G1..OP-G6 in new LLD §8.9.1, as unchecked boxes in the `docs/runbook.md` go-live checklist, in §12 and §18.6, and as AE-46, reopened as a **Phase 1 go-live gate**. The LLD status no longer says the go-live checklist is closed.
