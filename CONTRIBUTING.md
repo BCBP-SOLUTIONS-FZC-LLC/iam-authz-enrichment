@@ -31,7 +31,10 @@ make test
 ```
 
 `make setup` installs `.githooks/pre-commit`, which runs `make tidy`, `fmt-check`, and `lint`
-before every commit. Re-run `make install-hooks` any time `.githooks/pre-commit` changes.
+before every commit, and `.githooks/pre-push`, which runs `make trivy` (builds the image and
+Trivy-scans it like CI's "Trivy CVE scan" job; needs Docker and `trivy`, a few minutes on a cold
+cache — skip once with `SKIP_TRIVY=1 git push` or `git push --no-verify`). Re-run
+`make install-hooks` any time a file in `.githooks/` changes.
 
 ## Project layout
 

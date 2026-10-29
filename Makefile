@@ -45,18 +45,15 @@ ALL_TEST_TAGS := integration,e2e
 # -----------------------------
 
 .PHONY: setup
-setup:
+setup: install-hooks
 	@test -f .env || cp .env-example .env
-	@mkdir -p .git/hooks
-	@cp .githooks/pre-commit .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
-	@echo "Environment ready (.env); installed .githooks/pre-commit"
+	@echo "Environment ready (.env)"
 
 .PHONY: help
 help:
 	@echo "Available commands:"
-	@echo "  make setup           - copy .env-example to .env if missing; install .githooks/pre-commit"
-	@echo "  make install-hooks   - install local git hooks (.githooks -> .git/hooks)"
+	@echo "  make setup           - copy .env-example to .env if missing; install git hooks"
+	@echo "  make install-hooks   - install local git hooks (.githooks -> .git/hooks); also run by make setup"
 	@echo "  make tidy            - go mod tidy"
 	@echo "  make fmt             - go fmt ./..."
 	@echo "  make vet             - go vet (default build + every test build tag)"
@@ -86,6 +83,7 @@ help:
 	@echo "  make fmt-check       - verify gofmt formatting (no changes applied)"
 	@echo "  make mod-verify      - go mod verify (check module download integrity)"
 	@echo "  make vuln-check      - govulncheck on the whole module (accepted exceptions: .github/govulncheck-allow.txt)"
+	@echo "  make trivy           - build the image and Trivy-scan it like CI (CRITICAL/HIGH/UNKNOWN, fixed only); run by .githooks/pre-push"
 	@echo "  make load-test       - run the test/load harness against a running instance (manual, not part of CI)"
 	@echo "  make pin-base-images - fetch SHA digests and pin Dockerfile base images"
 	@echo "  make clean           - remove build artefacts"
@@ -98,7 +96,8 @@ help:
 install-hooks:
 	@mkdir -p .git/hooks
 	@cp .githooks/pre-commit .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
+	@cp .githooks/pre-push .git/hooks/pre-push
+	@chmod +x .git/hooks/pre-commit .git/hooks/pre-push
 	@echo "Installed git hooks"
 
 # -----------------------------
@@ -355,6 +354,23 @@ mod-verify:
 .PHONY: vuln-check
 vuln-check:
 	bash .github/scripts/vuln-check.sh
+
+# trivy: local mirror of ci.yml's "Trivy CVE scan" gate — build the amd64
+# image, then fail on CRITICAL/HIGH/UNKNOWN CVEs that have a fix (.trivyignore
+# applies automatically). The Dockerfile needs the go_private_token build
+# secret: GO_PRIVATE_TOKEN from the environment, else `gh auth token`.
+TRIVY_IMAGE ?= iam-authz-enrichment-trivy
+GO_PRIVATE_TOKEN ?= $(shell gh auth token 2>/dev/null)
+export GO_PRIVATE_TOKEN
+
+.PHONY: trivy
+trivy:
+	@command -v trivy >/dev/null || { echo "trivy not found (brew install trivy)"; exit 1; }
+	@test -n "$$GO_PRIVATE_TOKEN" || { echo "GO_PRIVATE_TOKEN is empty: export it or run 'gh auth login'"; exit 1; }
+	docker build --platform linux/amd64 \
+	  --secret id=go_private_token,env=GO_PRIVATE_TOKEN \
+	  -t $(TRIVY_IMAGE) .
+	trivy image --severity CRITICAL,HIGH,UNKNOWN --ignore-unfixed --exit-code 1 $(TRIVY_IMAGE)
 
 # -----------------------------
 # LOAD TEST (manual — not part of CI, see test/load)
