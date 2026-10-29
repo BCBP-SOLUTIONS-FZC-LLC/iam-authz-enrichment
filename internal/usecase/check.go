@@ -307,6 +307,17 @@ func (c *Checker) resolveContext(ctx context.Context, tenant, user string) (doma
 			if setErr := c.cache.SetNegative(ctx, tenant, user); setErr != nil {
 				c.log.Warn("failed to write ae:neg", map[string]interface{}{"error": setErr.Error()})
 			}
+			// An authoritative non-member answer (404, or a non-active
+			// status — AE-47) must also drop any earlier ae:ctx envelope:
+			// O&M emits no event on suspend, so without this the stale
+			// envelope (soft TTL + up to AE_STALE_IF_ERROR_MAX_AGE) keeps
+			// the member's old roles and §7 stale-if-error would Allow
+			// them on the next I-8 outage.
+			if ctxResult != domain.CacheMiss {
+				if evictErr := c.cache.EvictMembershipContext(ctx, tenant, user); evictErr != nil {
+					c.log.Warn("failed to evict ae:ctx", map[string]interface{}{"error": evictErr.Error()})
+				}
+			}
 		}
 		return domain.MembershipContext{}, domain.TenantContext{}, domain.DenyUnresolvableSubject, false
 	}

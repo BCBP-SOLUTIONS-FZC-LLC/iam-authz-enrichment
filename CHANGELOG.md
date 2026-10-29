@@ -6,15 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Security (2026-10-30 — Trivy: tzdata DLA-4867-1 suppressed)
+This service has no production deployment yet — pre-1.0, still in active development.
+
+### Security (2026-10-30 — stale `ae:ctx` evicted on non-member deny, AE-47, LLD rev 1.47)
+
+- **A suspended member can no longer get back in during an I-8 outage.** The AE-47 fix below denied the member and wrote `ae:neg`, but left the `ae:ctx` envelope cached before the suspension. Valkey keeps it past its soft TTL for up to `AE_STALE_IF_ERROR_MAX_AGE` (5 min), so once `ae:neg` expired, an I-8 outage let §7 stale-if-error serve it: Allow, with the member's old `x-tenant-roles`. The 404 / non-active deny now also evicts that `ae:ctx` entry; if the eviction fails it is logged and the request is still denied. LLD §8.2, §8.2.1, AE-47. Tests: `TestCheck_SubjectResolution_404_EvictsStaleCtx`, `TestCheck_SubjectResolution_404_EvictCtxFails_StillDenies`.
+
+### Security (2026-10-30 — Trivy: tzdata DLA-4867-1 suppressed; golang.org/x/net v0.62.0)
 
 - **`.trivyignore` suppresses DLA-4867-1** (`tzdata` 2026b → 2026f, Trivy UNKNOWN), with `exp:2026-11-30`. The newest `gcr.io/distroless/static-debian12:nonroot` (`sha256:afa5c872…`) still ships 2026b, and the service never loads a time zone (all timestamps UTC). Same handling as DLA-4854-1. Remove both entries and re-pin once distroless ships tzdata ≥ 2026f.
 
-This service has no production deployment yet — pre-1.0, still in active development.
+- **`golang.org/x/net` v0.61.0 → v0.62.0** for CVE-2026-78661 and CVE-2026-97045 (HTML tokenizer; flagged by the Trivy image scan). No code change.
 
 ### Fixed (2026-10-30 — suspended members denied, AE-47, LLD rev 1.46)
-
-- **`golang.org/x/net` v0.61.0 → v0.62.0** for CVE-2026-78661 and CVE-2026-97045 (HTML tokenizer; flagged by the Trivy image scan). No code change.
 
 - **A suspended member no longer passes the gateway.** I-8 returns a suspended member's row with `200`, `status: "suspended"` and their role grants (kept for audit). This service ignored `status`, so it injected those roles and every downstream service let the member in. The org-membership client now treats any `status` but `active`, a missing one included, as `ErrNotFound`: the member is negative-cached for 5 s and denied `DENY_UNRESOLVABLE_SUBJECT`, and their roles are never cached. After a suspension, access ends when the cached `ae:ctx` entry expires (60 s ± 6 s), since O&M emits no event on suspend. New LLD §8.2.1 and AE-47. Tests: client unit test and e2e `TestSuspendedMember_Deny`.
 
