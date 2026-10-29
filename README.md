@@ -76,7 +76,7 @@ x-tenant-id  x-user-id  x-departments  x-tenant-roles  x-plan  x-feature-flags  
 
 `x-departments` is `department_id:level` pairs, comma-joined. `x-tenant-roles` and `x-feature-flags` are comma-joined lists. `x-residency-mode` is always server-computed (`"standard"` or `"strict"`) — never read from the inbound request (CD-37 / LLD §16 AE-40). `x-feature-flags` includes a server-side `"read_only"` sentinel appended when the tenant's subscription is cancelled-grace.
 
-**On Deny**, `DeniedHttpResponse` carries a `DenyReason` (see [`ARCHITECTURE.md` §Request flow](ARCHITECTURE.md#request-flow) for the full precedence table) as both the gRPC status message and the HTTP body, mapped to 401/403/503.
+**On Deny**, `DeniedHttpResponse` is mapped to 401/403/503 and carries an RFC 9457 `application/problem+json` body: `type` is the platform type for the status (`platform/unauthorized`, `platform/forbidden`, `platform/service-unavailable`) and `errorCode` is the `DenyReason` (see [`ARCHITECTURE.md` §Request flow](ARCHITECTURE.md#request-flow) for the full precedence table; body shape in LLD §17). The bare reason is also the gRPC status message.
 
 ### Envoy configuration sketch
 

@@ -18,7 +18,7 @@ This service has no Go package for another service to import — its "public API
 
 | In scope (SemVer applies) | Out of scope (may change without MAJOR) |
 |---------------------------|------------------------------------------|
-| `internal/domain/decision.go`'s `DenyReason` values and their HTTP-status/gRPC-code mapping (LLD §9) | `internal/*` package structure, exported Go identifiers, file layout — nothing here is imported by another module |
+| `internal/domain/decision.go`'s `DenyReason` values and their HTTP-status/gRPC-code mapping (LLD §9), and the RFC 9457 deny body shape (`type`, `errorCode`, … — LLD §17) | `internal/*` package structure, exported Go identifiers, file layout — nothing here is imported by another module |
 | The six `x-*` injected headers on `Allow` — names and semantics (LLD §5.3) | `cmd/server/main.go` internals, wiring order |
 | `CheckRequest` field usage this service reads: `attributes.metadata_context[<namespace>].<payload key>` (namespace/key configurable via `JWT_METADATA_NAMESPACE`/`JWT_PAYLOAD_KEY`) and `attributes.context_extensions`'s five keys (`policy_action`, `department_id`, `required_department_level`, `assignee_user_id`, `required_access_level`), plus the `/tenders/{id}` URL-path requirement for `tender_id` (LLD §16 AE-22) | Exact log line format/fields, beyond the documented `sub`/`iss`-only redaction rule (LLD §11.4) |
 | Required env var **names and semantics** (LLD §12, `.env-example`) | Env var **defaults** — tunable without a MAJOR bump unless the new default itself breaks a documented invariant (e.g. the fail-fast dev-default checks in `internal/config/config.go`) |
