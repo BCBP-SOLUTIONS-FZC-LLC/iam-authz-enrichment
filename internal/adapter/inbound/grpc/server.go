@@ -8,6 +8,8 @@ import (
 
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
+
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/usecase"
 )
 
@@ -44,5 +46,5 @@ func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	if decision.Allow {
 		return okResponse(decision.Headers), nil
 	}
-	return deniedResponse(decision.Reason), nil
+	return deniedResponse(decision.Reason, req, gincommon.SpanTraceID(ctx)), nil
 }

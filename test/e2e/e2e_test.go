@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -188,6 +189,17 @@ func TestMFAFreshness_FreshAllowsStaleDenies(t *testing.T) {
 	stale := doCheck(t, buildCheckRequest(t, user, tenant, time.Now().Add(-10*time.Minute).Unix(), "POST", "/api/v1/approve", ext))
 	require.Nil(t, stale.GetOkResponse())
 	require.Equal(t, "DENY_MFA_STALE", denyReason(stale))
+
+	// AE-42: the body Envoy returns is an RFC 9457 problem the SDK can map
+	// to a step-up prompt by errorCode.
+	denied := stale.GetDeniedResponse()
+	require.Equal(t, "application/problem+json", denied.GetHeaders()[0].GetHeader().GetValue())
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(denied.GetBody()), &body), denied.GetBody())
+	require.Equal(t, "https://errors.company.com/platform/forbidden", body["type"])
+	require.Equal(t, "DENY_MFA_STALE", body["errorCode"])
+	require.Equal(t, "/api/v1/approve", body["instance"])
+	t.Logf("DENY_MFA_STALE body: %s", denied.GetBody())
 }
 
 // TestTenderACLOverlay_FullFlow proves §3.1 step 4 / §4.2 policy 8 across

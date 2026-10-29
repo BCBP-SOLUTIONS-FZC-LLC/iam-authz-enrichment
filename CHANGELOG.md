@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (2026-10-30 — deny bodies are RFC 9457, AE-42 / CD-31, LLD rev 1.48)
+
+- **Gateway denials are `application/problem+json`** (frontend SDK round-2 ask H). The body was the bare `DENY_*` string. It's now a platform-gincommon `pkg/problem` body:
+  - `type`: the platform type for the status (`https://errors.company.com/platform/unauthorized`, `…/forbidden`, `…/service-unavailable`);
+  - `title` and `status`;
+  - `errorCode`: the `DENY_*` reason;
+  - `detail`: a fixed, caller-safe sentence per reason;
+  - `instance`: the path without the query string;
+  - `traceId` and `timestamp`.
+- The `content-type` header is set on the denied response.
+- Unchanged: the gRPC status message (still the bare reason), the `DenyReason` values and the HTTP statuses (`TestDenyCodes_Pinned`). Nothing is in production, so there is no plain-text mode.
+- Tests: body shape for every reason, trace-id fallbacks, and an e2e check on `DENY_MFA_STALE`. LLD §5/§17 and AE-42 (resolved), README, VERSIONING.
+
 This service has no production deployment yet — pre-1.0, still in active development.
 
 ### Security (2026-10-30 — stale `ae:ctx` evicted on non-member deny, AE-47, LLD rev 1.47)

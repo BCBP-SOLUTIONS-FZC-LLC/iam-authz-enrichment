@@ -2,6 +2,7 @@ package grpc_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -143,7 +144,10 @@ func TestServer_Check_DeniesViaChecker(t *testing.T) {
 	require.NoError(t, err)
 	denied := resp.GetDeniedResponse()
 	require.NotNil(t, denied, "an unresolvable issuer must deny through the checker, not just the pre-checker subject guard")
-	assert.Equal(t, string(domain.DenyMalformedIdentity), denied.GetBody())
+	assert.Equal(t, string(domain.DenyMalformedIdentity), resp.GetStatus().GetMessage())
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(denied.GetBody()), &body))
+	assert.Equal(t, string(domain.DenyMalformedIdentity), body["errorCode"], "RFC 9457 body (AE-42)")
 }
 
 func TestServer_Check_MissingSubject_DeniesMalformedIdentity(t *testing.T) {
