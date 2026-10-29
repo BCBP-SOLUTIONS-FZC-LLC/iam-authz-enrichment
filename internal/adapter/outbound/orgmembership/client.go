@@ -37,6 +37,10 @@ var (
 	ErrUnavailable = domain.ErrUnavailable
 )
 
+// membershipStatusActive is the one tenant_memberships.status that grants
+// anything (Core TM-9).
+const membershipStatusActive = "active"
+
 // Client calls the three sibling internal endpoints: I-8/I-14 against Org &
 // Membership, and I-12 against iam-tender-acl (ADR-0007 Wave 3 Phase 4 —
 // I-12 moved out of Org & Membership when tender_acl_entries was extracted
@@ -108,6 +112,11 @@ type departmentDTO struct {
 // the floor by construction (there's no field to carry it into
 // domain.MembershipContext).
 type membershipsResponse struct {
+	// Status is the caller's tenant_memberships.status. I-8 returns the row
+	// whatever its status (a suspended member gets 200, not 404), so this
+	// service must check it itself: only "active" grants anything (Core
+	// TM-9). See GetMemberships.
+	Status              string          `json:"status"`
 	Roles               []string        `json:"roles"`
 	Departments         []departmentDTO `json:"departments"`
 	Plan                string          `json:"plan"`
@@ -150,8 +159,10 @@ func (r membershipsResponse) TenantContext() domain.TenantContext {
 }
 
 // GetMemberships calls I-8: GET /api/v1/internal/users/:id/memberships.
-// Returns ErrNotFound on a 404 (no active membership — §3.1 step 1), or
-// ErrUnavailable wrapping the underlying cause on any other failure.
+// Returns ErrNotFound on a 404 (no membership — §3.1 step 1) and on a 200
+// whose status is not "active" (§8.2.1: a suspended member is denied
+// exactly like a non-member), or ErrUnavailable wrapping the underlying
+// cause on any other failure.
 //
 // tenant is sent as a query parameter — the documented path
 // (/users/:id/memberships) carries no tenant segment, but every outbound
@@ -164,6 +175,14 @@ func (c *Client) GetMemberships(ctx context.Context, tenant, user string) (domai
 	var resp membershipsResponse
 	if err := c.getJSON(ctx, tenant, u, &resp); err != nil {
 		return domain.MembershipContext{}, domain.TenantContext{}, err
+	}
+	// §8.2.1 / Core TM-9: only an active membership grants roles. Anything
+	// else, including a missing status, is a non-member: never cached as a
+	// positive ae:ctx entry, negative-cached and denied
+	// DENY_UNRESOLVABLE_SUBJECT by the caller, like I-8's 404.
+	if resp.Status != membershipStatusActive {
+		return domain.MembershipContext{}, domain.TenantContext{},
+			fmt.Errorf("%w: I-8 membership status %q is not active", ErrNotFound, resp.Status)
 	}
 	return resp.MembershipContext(), resp.TenantContext(), nil
 }

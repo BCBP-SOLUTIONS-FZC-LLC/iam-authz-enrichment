@@ -23,6 +23,9 @@ type departmentFixture struct {
 }
 
 type membershipFixture struct {
+	// Status is tenant_memberships.status; "" is served as "active" so
+	// fixtures only spell it out to test a non-active member.
+	Status              string              `json:"status"`
 	Roles               []string            `json:"roles"`
 	Departments         []departmentFixture `json:"departments"`
 	Plan                string              `json:"plan"`
@@ -116,6 +119,9 @@ func (m *fakeOrg) route(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
+		}
+		if f.Status == "" {
+			f.Status = "active"
 		}
 		writeJSON(w, f)
 

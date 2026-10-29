@@ -111,6 +111,24 @@ func TestUnresolvableSubject_Deny(t *testing.T) {
 	require.Equal(t, "DENY_UNRESOLVABLE_SUBJECT", denyReason(resp))
 }
 
+// TestSuspendedMember_Deny proves §8.2.1: I-8 answers 200 for a suspended
+// member, with status "suspended" and their (untouched) role grants; this
+// service must still deny them like a non-member, never inject their roles.
+func TestSuspendedMember_Deny(t *testing.T) {
+	tenant, user := id("tenant-e2e-suspended"), "suspended-user"
+	org.setMembership(tenant, user, membershipFixture{
+		Status:             "suspended",
+		Roles:              []string{"tenant_admin"},
+		Plan:               "pro",
+		SubscriptionStatus: "active",
+	})
+
+	resp := doCheck(t, buildCheckRequest(t, user, tenant, 0, "GET", "/api/v1/tenders", nil))
+
+	require.Nil(t, resp.GetOkResponse(), "a suspended member must not be allowed")
+	require.Equal(t, "DENY_UNRESOLVABLE_SUBJECT", denyReason(resp))
+}
+
 // TestReadOnlyTenant_DeniesWrite proves policy 6 — a blanket tenant-level
 // gate that runs before any role/department check (§4.4 step 2).
 func TestReadOnlyTenant_DeniesWrite(t *testing.T) {
