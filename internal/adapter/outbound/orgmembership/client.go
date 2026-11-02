@@ -82,15 +82,18 @@ func instrumentedHTTPClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = 40 * time.Millisecond // config.Load's ORG_MEMBERSHIP_TIMEOUT default
 	}
-	// http.DefaultTransport keeps only 2 idle connections per host, so under
-	// concurrent misses most calls opened a new connection to the sibling,
-	// the slow part of a cold I-8 (§16 AE-48).
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConnsPerHost = maxIdleConnsPerHost
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: otelhttp.NewTransport(transport),
+		Transport: otelhttp.NewTransport(withIdlePool(http.DefaultTransport.(*http.Transport).Clone())),
 	}
+}
+
+// withIdlePool raises t's idle connections per host. Go's default transport
+// keeps only 2, so under concurrent misses most calls opened a new
+// connection to the sibling, the slow part of a cold I-8 (§16 AE-48).
+func withIdlePool(t *http.Transport) *http.Transport {
+	t.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	return t
 }
 
 // maxIdleConnsPerHost is the idle-connection pool per sibling, sized for
