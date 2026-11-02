@@ -1195,23 +1195,22 @@ components:
             data:
               tender_id: "b1c2d3e4-6666-4f7a-8b9c-000000000004"
       x-consumer-schema-dependency:
-        # No published asyncapi.yaml was available for the producer
-        # (Tender Service) in this workspace to verify against. Reflects
-        # only usecase.TenderRestrictedPayload, the shape this service's
-        # own code (HandleTenderRestricted) actually decodes.
+        # Tender Service confirmed event routing and payload shape in the
+        # cross-service compatibility response (2026-11-01). This service decodes
+        # only tender_id from data, which the Tender team confirmed as the wire
+        # field (AE-TND-F1, AE-TND-F6). No Tender Service asyncapi.yaml is held
+        # in this workspace; status is upgraded to verified on the basis of the
+        # explicit written confirmation.
         #
-        # LLD §16 AE-32 (CF-4): this event's existence and its routing to
-        # AuthZ Enrichment ARE confirmed — directly against IAM HLD v1.41
-        # §9.4/§10.3, which catalogs exactly three tender.events types
-        # (TenderRestricted, TenderAccessGranted, TenderSectionApproved)
-        # and assigns only this one here, the other two to Audit Log only.
-        # producer-lifecycle-status stays `unknown` because that flag is
-        # specifically about the PAYLOAD wire-shape below, which still has
-        # no Tender Service asyncapi.yaml to verify against — a narrower,
-        # still-open gap distinct from the event-catalog question CF-4 asked.
+        # LLD §16 AE-32 (CF-4, updated AE-49): the Tender Service catalogs
+        # TenderRestricted, TenderAccessGranted, and TenderDeliverableApproved
+        # on tender.events (Tender HLD v0.8 §9.4/§10.3). TenderSectionApproved
+        # (the former third entry from IAM HLD v1.41) is deprecated in Tender
+        # HLD v0.8 — replaced by TenderDeliverableApproved. Only TenderRestricted
+        # is routed to this service; the other two go to Audit Log only.
         depends-on-shape:
           tender_id: "uuid — the tender being flagged restricted"
-        producer-lifecycle-status: unknown
+        producer-lifecycle-status: verified
 
   schemas:
     EmptyPayload:

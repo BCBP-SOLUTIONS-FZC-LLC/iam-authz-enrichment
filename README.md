@@ -683,7 +683,7 @@ See `docs/runbook.md` for startup-failure troubleshooting.
 Hard invariants — see [`ARCHITECTURE.md` §Threat model](ARCHITECTURE.md#threat-model) for the full STRIDE analysis:
 
 1. **No JWT validation in this service.** Trust only claims Envoy's `jwt_authn` has already validated. No other claim or header is a valid identity/authz input.
-2. **Client-supplied headers can never influence the six output headers.** They're built exclusively from server-side cached/fetched domain data.
+2. **Client-supplied headers can never influence the seven output headers (nor the conditional `x-auth-time`).** They're built exclusively from server-side cached/fetched domain data.
 3. **`mfa_freshness_seconds` is never cached** — a tenant tightening its MFA window takes effect immediately, not after up to 60s.
 4. **Every Valkey key and outbound call is tenant-scoped by construction** — there's no separate access-control layer, since there's no database.
 5. **Log redaction:** only `sub`/`iss` are ever logged, in structured JSON. `auth_time` and every other claim: never, by construction.
@@ -720,7 +720,7 @@ Pushing a `v*` tag triggers `.github/workflows/release.yml` — validate → bui
 
 | Version bump | When |
 |---|---|
-| **MAJOR** | Breaking change to the runtime contract — `DenyReason` values, the six injected headers, `CheckRequest` field usage, required env vars, `values.yaml` shape |
+| **MAJOR** | Breaking change to the runtime contract — `DenyReason` values, the seven injected headers (plus conditional `x-auth-time`), `CheckRequest` field usage, required env vars, `values.yaml` shape |
 | **MINOR** | New backward-compatible capability |
 | **PATCH** | Bug fix, performance improvement, documentation correction |
 
