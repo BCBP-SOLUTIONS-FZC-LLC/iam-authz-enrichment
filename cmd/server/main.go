@@ -243,7 +243,10 @@ func run() error {
 	// 5. Org & Membership + iam-tender-acl client (I-12/GetTenderACL moved to
 	// the latter in ADR-0007 Wave 3 Phase 4 — see orgmembership.New's doc
 	// comment).
-	orgClient := orgmembership.New(cfg.OrgMembershipBaseURL, cfg.OrgMembershipTimeout, cfg.TenderACLBaseURL, cfg.TenderACLTimeout)
+	// The client's timeout is only a ceiling: Checker sets each I-8/I-14
+	// call's own deadline (ORG_MEMBERSHIP_TIMEOUT, or _COLD_TIMEOUT on a
+	// miss with no stale entry).
+	orgClient := orgmembership.New(cfg.OrgMembershipBaseURL, cfg.OrgMembershipColdTimeout, cfg.TenderACLBaseURL, cfg.TenderACLTimeout)
 
 	// 6. In-process policy state + usecase layer.
 	realmMap := usecase.NewRealmMap(cfg.RealmTenantMapSeed, cfg.RealmNegativeTTL)
@@ -256,6 +259,8 @@ func run() error {
 	checker := usecase.NewChecker(cache, orgClient, realmMap, restricted, appLog, recorder, usecase.CheckerConfig{
 		SharedRealmIssuer: cfg.SharedRealmIssuer,
 		OperatorIssuer:    cfg.OperatorRealmIssuer,
+		I8Timeout:         cfg.OrgMembershipTimeout,
+		I8ColdTimeout:     cfg.OrgMembershipColdTimeout,
 	})
 	invalidator := usecase.NewInvalidator(eventCache, realmMap, restricted, appLog, recorder)
 
