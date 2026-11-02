@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (2026-11-01 — a cold cache miss no longer denies 503, AE-48, LLD rev 1.49)
+
+- **A user's first request no longer fails `DENY_SERVICE_UNAVAILABLE` when Org & Membership is a little slow** (frontend SDK integrated-deployment report, Issue 12). With no stale `ae:ctx` to serve, an I-8 call slower than 40ms (a new connection, an empty O&M cache) was a certain deny.
+  - That call now waits up to the new `ORG_MEMBERSHIP_COLD_TIMEOUT` (default `120ms`). Startup fails if it is below `ORG_MEMBERSHIP_TIMEOUT`.
+  - A miss with a stale entry keeps 40ms and stale-if-error. I-14 keeps 40ms.
+  - Cold and warm calls coalesce separately, so a cold caller never inherits the shorter deadline.
+- The Org & Membership and Tender ACL clients keep 64 idle connections per host (Go's default is 2), so concurrent misses reuse connections.
+- Tests: the cold, stale-available and I-14 deadlines, and the config default and validation. LLD §9.2, §12, §16 AE-48; README; Helm values; `.env-example`.
+
 ### Changed (2026-10-30 — deny bodies are RFC 9457, AE-42 / CD-31, LLD rev 1.48)
 
 - **Gateway denials are `application/problem+json`** (frontend SDK round-2 ask H). The body was the bare `DENY_*` string. It's now a platform-gincommon `pkg/problem` body:

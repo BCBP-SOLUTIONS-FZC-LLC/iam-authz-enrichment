@@ -96,6 +96,10 @@ env:
   # 40ms covers Org & Membership's own I-8 p99 targets (15ms cache hit, 30ms
   # miss) plus the mesh hop — LLD §16 AE-37. Shorter fails healthy calls.
   ORG_MEMBERSHIP_TIMEOUT: "40ms"
+  # I-8 on a cache miss with no stale entry (LLD §9.2, §16 AE-48): a timeout
+  # there is a certain 503 deny, so the call may wait for a cold sibling.
+  # Never below ORG_MEMBERSHIP_TIMEOUT; keep well inside GRPC_REQUEST_TIMEOUT.
+  ORG_MEMBERSHIP_COLD_TIMEOUT: "120ms"
 
   # iam-tender-acl sibling service — TAC-4 (formerly I-12), repointed here
   # from Org & Membership per ADR-0007 Wave 3 Phase 4. Same IAM convention

@@ -18,7 +18,7 @@ import (
 var allEnvVars = []string{
 	"APP_NAME", "APP_ENV", "ENVIRONMENT", "APP_PORT", "METRICS_PORT", "GRPC_PORT",
 	"VALKEY_URL", "VALKEY_DIAL_TIMEOUT", "VALKEY_READ_TIMEOUT", "VALKEY_WRITE_TIMEOUT", "VALKEY_EVENT_TIMEOUT",
-	"ORG_MEMBERSHIP_BASE_URL", "ORG_MEMBERSHIP_TIMEOUT",
+	"ORG_MEMBERSHIP_BASE_URL", "ORG_MEMBERSHIP_TIMEOUT", "ORG_MEMBERSHIP_COLD_TIMEOUT",
 	"TENDER_ACL_BASE_URL", "TENDER_ACL_TIMEOUT",
 	"SHARED_REALM_ISSUER", "JWT_METADATA_NAMESPACE", "JWT_PAYLOAD_KEY",
 	"OPERATOR_REALM_ISSUER", "JWT_OPERATOR_PAYLOAD_KEY",
@@ -61,6 +61,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 500*time.Millisecond, cfg.ValkeyEventTimeout)
 	assert.Equal(t, "http://localhost:8081", cfg.OrgMembershipBaseURL)
 	assert.Equal(t, 40*time.Millisecond, cfg.OrgMembershipTimeout)
+	assert.Equal(t, 120*time.Millisecond, cfg.OrgMembershipColdTimeout)
 	assert.Equal(t, "http://localhost:8086", cfg.TenderACLBaseURL)
 	assert.Equal(t, 30*time.Millisecond, cfg.TenderACLTimeout)
 	assert.Equal(t, "", cfg.SharedRealmIssuer)
@@ -114,6 +115,7 @@ func TestLoad_CustomValues(t *testing.T) {
 	t.Setenv("VALKEY_WRITE_TIMEOUT", "7ms")
 	t.Setenv("ORG_MEMBERSHIP_BASE_URL", "http://org:8081")
 	t.Setenv("ORG_MEMBERSHIP_TIMEOUT", "8ms")
+	t.Setenv("ORG_MEMBERSHIP_COLD_TIMEOUT", "90ms")
 	t.Setenv("TENDER_ACL_BASE_URL", "http://tender-acl:8086")
 	t.Setenv("TENDER_ACL_TIMEOUT", "12ms")
 	t.Setenv("SHARED_REALM_ISSUER", "https://issuer/shared")
@@ -165,6 +167,7 @@ func TestLoad_CustomValues(t *testing.T) {
 	assert.Equal(t, 7*time.Millisecond, cfg.ValkeyWriteTimeout)
 	assert.Equal(t, "http://org:8081", cfg.OrgMembershipBaseURL)
 	assert.Equal(t, 8*time.Millisecond, cfg.OrgMembershipTimeout)
+	assert.Equal(t, 90*time.Millisecond, cfg.OrgMembershipColdTimeout)
 	assert.Equal(t, "http://tender-acl:8086", cfg.TenderACLBaseURL)
 	assert.Equal(t, 12*time.Millisecond, cfg.TenderACLTimeout)
 	assert.Equal(t, "https://issuer/shared", cfg.SharedRealmIssuer)
@@ -230,7 +233,7 @@ func TestLoad_StaleIfErrorMaxAge_BelowCapPassesThrough(t *testing.T) {
 func TestLoad_InvalidDuration_EachField(t *testing.T) {
 	fields := []string{
 		"VALKEY_DIAL_TIMEOUT", "VALKEY_READ_TIMEOUT", "VALKEY_WRITE_TIMEOUT", "VALKEY_EVENT_TIMEOUT",
-		"ORG_MEMBERSHIP_TIMEOUT", "TENDER_ACL_TIMEOUT", "AE_CTX_TTL", "AE_CTX_JITTER", "AE_TENDER_ACL_TTL",
+		"ORG_MEMBERSHIP_TIMEOUT", "ORG_MEMBERSHIP_COLD_TIMEOUT", "TENDER_ACL_TIMEOUT", "AE_CTX_TTL", "AE_CTX_JITTER", "AE_TENDER_ACL_TTL",
 		"AE_NEG_TTL", "AE_RESTRICTED_NEG_TTL", "AE_REALM_NEG_TTL", "AE_PROCESSED_EVENT_TTL", "AE_STALE_IF_ERROR_MAX_AGE",
 		"GRPC_KEEPALIVE_TIME", "GRPC_KEEPALIVE_TIMEOUT", "GRPC_REQUEST_TIMEOUT",
 	}
@@ -699,4 +702,20 @@ func TestLoad_OperatorRealmIssuer_MustNotBeATenantRealm(t *testing.T) {
 			assert.Contains(t, err.Error(), "OPERATOR_REALM_ISSUER")
 		})
 	}
+}
+
+// AE-48: the cold-miss timeout follows a larger ORG_MEMBERSHIP_TIMEOUT by
+// default and may never be set below it.
+func TestLoad_OrgMembershipColdTimeout(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("ORG_MEMBERSHIP_TIMEOUT", "2s")
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, 2*time.Second, cfg.OrgMembershipColdTimeout, "default is max(120ms, ORG_MEMBERSHIP_TIMEOUT)")
+
+	t.Setenv("ORG_MEMBERSHIP_TIMEOUT", "40ms")
+	t.Setenv("ORG_MEMBERSHIP_COLD_TIMEOUT", "30ms")
+	_, err = config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ORG_MEMBERSHIP_COLD_TIMEOUT")
 }
