@@ -58,6 +58,7 @@ type FakeCache struct {
 	EvictCtxErr                error
 	EvictTenantErr             error
 	EvictNegErr                error
+	EvictTenderACLEntryErr     error
 	EvictTenderACLErr          error
 	RealmErr                   error
 	RestrictedErr              error
@@ -214,6 +215,17 @@ func (f *FakeCache) SetTenderACL(_ context.Context, tenant, tender, user string,
 		return f.SetTenderACLErr
 	}
 	f.tender[tenderKey(tenant, tender, user)] = v
+	return nil
+}
+
+func (f *FakeCache) EvictTenderACL(_ context.Context, tenant, tender, user string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("EvictTenderACL:" + tenderKey(tenant, tender, user))
+	if f.EvictTenderACLEntryErr != nil {
+		return f.EvictTenderACLEntryErr
+	}
+	delete(f.tender, tenderKey(tenant, tender, user))
 	return nil
 }
 

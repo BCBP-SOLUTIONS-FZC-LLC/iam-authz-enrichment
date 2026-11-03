@@ -244,6 +244,35 @@ type TenderRestrictedPayload struct {
 	TenderID string `json:"tender_id"`
 }
 
+// TenderAccessGrantedPayload is tender-authz-q's decoded payload for
+// TenderAccessGranted (§16 AE-TND-G1): the user and tender whose ACL entry
+// must be evicted immediately so the next request fetches fresh data from
+// iam-tender-acl instead of serving a stale Deny for up to 15 s.
+type TenderAccessGrantedPayload struct {
+	UserID   string `json:"user_id"`
+	TenderID string `json:"tender_id"`
+}
+
+// HandleTenderAccessGranted evicts ae:tender_acl:{tenant}:{tender_id}:{user_id}
+// immediately on receipt of TenderAccessGranted (§16 AE-TND-G1). Unlike the
+// best-effort SCAN used for MembershipRevoked/UserDeleted, all three key
+// components are known here, so this is a targeted single-key DEL. The error
+// is returned (not swallowed) so the platform retries if Valkey is temporarily
+// unreachable — leaving the error unhandled would keep the user denied until
+// the 15 s TTL expires.
+func (inv *Invalidator) HandleTenderAccessGranted(ctx context.Context, tenant string, p TenderAccessGrantedPayload) error {
+	if p.UserID == "" {
+		return fmt.Errorf("TenderAccessGranted payload missing user_id: producer schema drift or malformed envelope")
+	}
+	if p.TenderID == "" {
+		return fmt.Errorf("TenderAccessGranted payload missing tender_id: producer schema drift or malformed envelope")
+	}
+	if err := inv.cache.EvictTenderACL(ctx, tenant, p.TenderID, p.UserID); err != nil {
+		return fmt.Errorf("evict ae:tender_acl: %w", err)
+	}
+	return nil
+}
+
 // HandleTenderRestricted flips the restricted-tender fact (L1 + shared
 // Valkey). Not a cache eviction (§5).
 //

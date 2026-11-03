@@ -437,16 +437,21 @@ channels:
 
   tender-authz-q:
     address: tender-authz-q
-    title: Tender restriction events (AuthZ Enrichment consumer)
+    title: Tender restriction and access-grant events (AuthZ Enrichment consumer)
     description: >-
-      One event type. Flips an in-process fact (not a cache eviction) that
-      the §3.1 step-4 tender-ACL overlay reads to decide whether a
-      tender-scoped request needs the overlay check at all.
+      Two event types. TenderRestricted flips an in-process fact (not a cache
+      eviction) that the §3.1 step-4 tender-ACL overlay reads to decide whether
+      a tender-scoped request needs the overlay check at all.
+      TenderAccessGranted immediately evicts the ae:tender_acl cache entry for
+      the granted (tenant, tender, user) triple so the newly-granted user is
+      not denied for up to 15 s (§16 AE-TND-G1).
     servers:
       - $ref: "#/servers/tenderAuthZQueue"
     messages:
       TenderRestricted:
         $ref: "#/components/messages/TenderRestricted"
+      TenderAccessGranted:
+        $ref: "#/components/messages/TenderAccessGranted"
     bindings:
       sqs:
         queue:
@@ -541,16 +546,21 @@ operations:
     action: receive
     channel:
       $ref: "#/channels/tender-authz-q"
-    title: Receive tender restriction events
-    summary: Flip the in-process restricted-tender fact the tender-ACL overlay reads.
+    title: Receive tender restriction and access-grant events
+    summary: Flip the restricted-tender fact and evict stale ae:tender_acl entries on grant.
     description: >-
-      Receives TenderRestricted and marks (tenant, tender) restricted in
-      an in-process set — not a Valkey write. The §3.1 step-4 tender-ACL
-      overlay only calls out to the Tender ACL Service (TAC-4) for a tender
-      this set marks restricted; every other tender-scoped request skips
-      the overlay entirely.
+      Receives two event types from tender-authz-q. TenderRestricted marks
+      (tenant, tender) restricted in an in-process set — not a Valkey write.
+      The §3.1 step-4 tender-ACL overlay only calls out to the Tender ACL
+      Service (TAC-4) for a tender this set marks restricted; every other
+      tender-scoped request skips the overlay entirely.
+      TenderAccessGranted immediately evicts the single ae:tender_acl entry
+      for the granted (tenant, tender, user) triple (§16 AE-TND-G1) so the
+      next Check call fetches fresh data from iam-tender-acl instead of
+      serving a stale Deny for up to 15 s.
     messages:
       - $ref: "#/channels/tender-authz-q/messages/TenderRestricted"
+      - $ref: "#/channels/tender-authz-q/messages/TenderAccessGranted"
 
 components:
   tags:
@@ -1212,6 +1222,41 @@ components:
           tender_id: "uuid — the tender being flagged restricted"
         producer-lifecycle-status: verified
 
+    TenderAccessGranted:
+      name: TenderAccessGranted
+      title: Tender Access Granted
+      summary: >-
+        A Tender ACL grant was minted by TAC-2; the cached Deny decision for
+        this (tenant, tender, user) triple must be evicted immediately.
+      tags:
+        - $ref: "#/components/tags/consumed"
+      contentType: application/json
+      payload:
+        $ref: "#/components/schemas/TenderAccessGrantedPayload"
+      examples:
+        - name: TenderAccessGrantedExample
+          summary: A typical TenderAccessGranted event envelope.
+          payload:
+            id: "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d5d"
+            type: "TenderAccessGranted"
+            tenant_id: "a0f2a3c4-1111-4a2b-9c3d-000000000000"
+            time: "2026-11-03T10:00:00Z"
+            data:
+              user_id: "c3d4e5f6-9999-4a2b-8c3d-000000000001"
+              tender_id: "b1c2d3e4-6666-4f7a-8b9c-000000000004"
+      x-consumer-schema-dependency:
+        # Tender Service will route TenderAccessGranted to tender-authz-q once
+        # C1/TND-Q2 is shipped (Tender team 2026-11-02 confirmation, §16
+        # AE-TND-G1). This service decodes user_id and tender_id from data to
+        # construct the exact ae:tender_acl eviction key. No Tender Service
+        # asyncapi.yaml is held in this workspace; status is pending until
+        # the event flows in production.
+        depends-on-shape:
+          user_id: "uuid — the user whose ACL grant was minted"
+          tender_id: "uuid — the tender for which access was granted"
+        producer-lifecycle-status: pending
+        blocker: "C1/TND-Q2 — Tender Service must implement TAC-2/3 outbox publishing"
+
   schemas:
     EmptyPayload:
       type: object
@@ -1462,3 +1507,23 @@ components:
             The tender being flagged restricted. Recorded in this service's
             in-process RestrictedTenderSet, keyed by (tenant, tender_id)
             using the envelope's own tenant_id.
+
+    TenderAccessGrantedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - user_id
+        - tender_id
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: >-
+            The user whose ACL grant was minted by TAC-2. Used with tender_id
+            to construct the exact ae:tender_acl eviction key (§16 AE-TND-G1).
+        tender_id:
+          type: string
+          format: uuid
+          description: >-
+            The tender for which access was granted. Combined with user_id and
+            the envelope's tenant_id to evict ae:tender_acl:{tenant}:{tender_id}:{user_id}.

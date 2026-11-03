@@ -36,11 +36,12 @@ func TestParseAsyncSpec_InvalidYAML_ReturnsError(t *testing.T) {
 
 // TestLoadAsyncSpec_RealEmbeddedSpec exercises the actual embedded
 // api/asyncapi.yaml (via loadAsyncSpec, which sync.Once-wraps this same
-// parse) end to end — this service is receive-only, so all 21 event types
+// parse) end to end — this service is receive-only, so all 22 event types
 // must come back tagged consumed, and there must be zero published messages.
 // tenant-authz-q grew from 2 → 8 types: +TenantSettingChanged (CD-37),
 // +TenantSuspended/TenantReactivatedOperator/TenantOffboarded/TrialExpired/
 // TrialReactivated (AE-RP-GAP-002..006).
+// tender-authz-q grew from 1 → 2 types: +TenderAccessGranted (AE-TND-G1).
 func TestLoadAsyncSpec_RealEmbeddedSpec_AllMessagesConsumed(t *testing.T) {
 	spec, err := loadAsyncSpec()
 	require.NoError(t, err)
@@ -48,10 +49,11 @@ func TestLoadAsyncSpec_RealEmbeddedSpec_AllMessagesConsumed(t *testing.T) {
 
 	pub, con := splitMessagesByDirection(spec.Comps.Messages)
 	assert.Empty(t, pub, "this service publishes zero events")
-	assert.Len(t, con, 21)
+	assert.Len(t, con, 22)
 	assert.Contains(t, con, "MembershipRevoked")
 	assert.Contains(t, con, "UserDeleted")
 	assert.Contains(t, con, "TenderRestricted")
+	assert.Contains(t, con, "TenderAccessGranted")
 	assert.Contains(t, con, "TenantSuspended")
 	assert.Contains(t, con, "TenantReactivatedOperator")
 	assert.Contains(t, con, "TenantOffboarded")

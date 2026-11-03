@@ -24,6 +24,9 @@ type Cache interface {
 
 	GetTenderACL(ctx context.Context, tenant, tender, user string) (domain.TenderACL, bool, error)
 	SetTenderACL(ctx context.Context, tenant, tender, user string, v domain.TenderACL) error
+	// EvictTenderACL deletes the single ae:tender_acl:{tenant}:{tender}:{user}
+	// entry when all three key components are known (TenderAccessGranted, §16 AE-TND-G1).
+	EvictTenderACL(ctx context.Context, tenant, tender, user string) error
 	EvictTenderACLForUser(ctx context.Context, tenant, user string) error
 
 	GetNegative(ctx context.Context, tenant, user string) (bool, error)

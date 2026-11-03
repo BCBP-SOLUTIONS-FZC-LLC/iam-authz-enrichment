@@ -135,18 +135,28 @@ func NewTenantConsumer(queueURL string, deps Deps, opts ...events.ConsumerOption
 	return buildConsumer(queueURL, deps, tenantHandler(deps), opts...)
 }
 
-// tenderHandler implements tender-authz-q (§5): TenderRestricted — flips an
-// in-memory fact, not a cache eviction.
+// tenderHandler implements tender-authz-q (§5):
+//   - TenderRestricted — flips an in-memory fact, not a cache eviction.
+//   - TenderAccessGranted — targeted eviction of ae:tender_acl:{tenant}:{tender}:{user}
+//     so a newly-granted user is not denied for up to 15 s (§16 AE-TND-G1).
 func tenderHandler(deps Deps) events.Handler {
 	return func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
-		if env.Type != "TenderRestricted" {
+		switch env.Type {
+		case "TenderRestricted":
+			var p usecase.TenderRestrictedPayload
+			if err := json.Unmarshal(env.Payload, &p); err != nil {
+				return fmt.Errorf("decode %s payload: %w", env.Type, err)
+			}
+			return deps.Invalidator.HandleTenderRestricted(ctx, env.TenantID, p)
+		case "TenderAccessGranted":
+			var p usecase.TenderAccessGrantedPayload
+			if err := json.Unmarshal(env.Payload, &p); err != nil {
+				return fmt.Errorf("decode %s payload: %w", env.Type, err)
+			}
+			return deps.Invalidator.HandleTenderAccessGranted(ctx, env.TenantID, p)
+		default:
 			return ackUnknown(deps.Log, env)
 		}
-		var p usecase.TenderRestrictedPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return fmt.Errorf("decode %s payload: %w", env.Type, err)
-		}
-		return deps.Invalidator.HandleTenderRestricted(ctx, env.TenantID, p)
 	}
 }
 
