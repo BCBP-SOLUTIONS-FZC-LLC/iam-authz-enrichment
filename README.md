@@ -642,6 +642,7 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `AE_PROCESSED_EVENT_TTL` | `192h` (8 days) | PE-1: must be strictly > 7-day SQS message lifetime to guarantee redelivered messages are still recognized as processed |
 | `AE_STALE_IF_ERROR_MAX_AGE` | `5m` | Hard-capped at 5m regardless of configured value (§7) |
 | `ORG_MEMBERSHIP_BASE_URL` / `_TIMEOUT` | `http://localhost:8081` / `40ms` | I-8/I-14. Covers Org & Membership's own I-8 p99 targets (15ms cache hit, 30ms miss) plus the mesh hop — a shorter timeout fails healthy calls (LLD §16 AE-37) |
+| `ORG_MEMBERSHIP_COLD_TIMEOUT` | `120ms` (at least `ORG_MEMBERSHIP_TIMEOUT`) | I-8 on a cache miss with no stale entry to serve: a timeout there is a certain `DENY_SERVICE_UNAVAILABLE`, so the call may wait for a cold sibling (new connection, empty cache). Startup fails if it is below `ORG_MEMBERSHIP_TIMEOUT` (LLD §16 AE-48) |
 | `GRPC_REQUEST_TIMEOUT` | `250ms` | Server-side cap on each `Check` (`grpccommon.TimeoutUnaryInterceptor`); Envoy's own shorter `grpc-timeout` wins. Must be positive |
 | `GOMEMLIMIT` | _(unset)_ (Helm: `230MiB`) | Go runtime soft heap limit, ~90% of the container memory limit |
 | `TENDER_ACL_BASE_URL` / `TENDER_ACL_TIMEOUT` | `http://localhost:8086` / `30ms` | TAC-4 (formerly I-12) against iam-tender-acl, ADR-0007 Wave 3 Phase 4 — sized against that service's own 5ms-hit/20ms-miss SLO, not reused from `ORG_MEMBERSHIP_TIMEOUT` |

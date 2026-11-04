@@ -56,9 +56,10 @@ type Client struct {
 	tenderACLHTTP    *http.Client
 }
 
-// New builds a Client. timeout is applied to every Org & Membership call
-// (I-8/I-14) — per §6, an aggressive timeout that leaves headroom inside the
-// 15ms p99 budget even on a cache miss. tenderACLTimeout applies only to
+// New builds a Client. timeout is the ceiling on every Org & Membership call
+// (I-8/I-14); usecase.Checker gives each call its own, usually shorter,
+// deadline (§9.2: 40ms, or the cold-miss timeout when no stale entry can
+// answer a failure). tenderACLTimeout applies only to
 // GetTenderACL (I-12), sized against iam-tender-acl's own TAC-4 SLO
 // (5ms cache-hit/20ms cache-miss) rather than reused from timeout, since the
 // two downstream services no longer share a latency profile.
@@ -83,9 +84,21 @@ func instrumentedHTTPClient(timeout time.Duration) *http.Client {
 	}
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: otelhttp.NewTransport(http.DefaultTransport),
+		Transport: otelhttp.NewTransport(withIdlePool(http.DefaultTransport.(*http.Transport).Clone())),
 	}
 }
+
+// withIdlePool raises t's idle connections per host. Go's default transport
+// keeps only 2, so under concurrent misses most calls opened a new
+// connection to the sibling, the slow part of a cold I-8 (§16 AE-48).
+func withIdlePool(t *http.Transport) *http.Transport {
+	t.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	return t
+}
+
+// maxIdleConnsPerHost is the idle-connection pool per sibling, sized for
+// HPA-scaled concurrent cache misses.
+const maxIdleConnsPerHost = 64
 
 // departmentDTO/membershipsResponse mirror I-8's wire shape. The level
 // field is "role_level" on the wire, not "level" — verified against

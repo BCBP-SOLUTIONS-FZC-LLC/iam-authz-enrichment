@@ -1064,3 +1064,82 @@ func TestDenyCodes_Pinned(t *testing.T) {
 		})
 	}
 }
+
+// AE-48: a miss with no stale entry gets the longer cold deadline, so a
+// slow (cold) sibling answers instead of a certain DENY_SERVICE_UNAVAILABLE.
+func TestCheck_I8Deadline_ColdMissWaitsForSlowSibling(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache() // a true miss: nothing stale to serve
+	org := &fixtures.FakeOrgMembershipClient{GetMembershipsFunc: slowSibling(60 * time.Millisecond)}
+	checker := newDeadlineChecker(cache, org)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims(), Request: policy.RequestFacts{Method: "GET"}})
+
+	assert.True(t, decision.Allow, "a 60ms I-8 must answer under the 500ms cold deadline, not time out at 20ms")
+}
+
+// AE-48: with a stale entry to fall back on, I-8 keeps the short deadline
+// and §7 row 2 serves the stale entry rather than waiting.
+func TestCheck_I8Deadline_StaleAvailableKeepsShortDeadline(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.MembershipContext{Roles: []string{"stale-role"}}, domain.CacheStale)
+	cache.SeedTenantContext(tenant, domain.TenantContext{Plan: "stale-plan", FeatureFlags: []string{}}, domain.CacheStale)
+	org := &fixtures.FakeOrgMembershipClient{GetMembershipsFunc: slowSibling(time.Second)}
+	checker := newDeadlineChecker(cache, org)
+
+	start := time.Now()
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims(), Request: policy.RequestFacts{Method: "GET"}})
+
+	require.True(t, decision.Allow)
+	assert.Equal(t, "stale-role", decision.Headers[domain.HeaderTenantRoles])
+	assert.Less(t, time.Since(start), 400*time.Millisecond, "the warm deadline (20ms), not the cold one (500ms), must bound the call")
+}
+
+// AE-48: I-14 keeps the short deadline; its failure is a scoped deny either way.
+func TestCheck_I14Deadline_IsTheShortOne(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
+	var remaining time.Duration
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMFAFreshnessFunc: func(ctx context.Context, tenant string) (time.Duration, error) {
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok, "I-14 must carry a deadline")
+			remaining = time.Until(deadline)
+			return 5 * time.Minute, nil
+		},
+	}
+	checker := newDeadlineChecker(cache, org)
+
+	checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  usecase.Claims{Subject: user, Issuer: dedicatedIssuer, AuthTime: time.Now().Unix()},
+		Request: policy.RequestFacts{Method: "POST", RequiredDepartmentLevel: policy.LevelApprover},
+	})
+
+	assert.Positive(t, remaining)
+	assert.LessOrEqual(t, remaining, 20*time.Millisecond)
+}
+
+func newDeadlineChecker(cache usecase.Cache, org usecase.OrgMembershipClient) *usecase.Checker {
+	realmMap := usecase.NewRealmMap(map[string]string{dedicatedIssuer: tenant}, 5*time.Second)
+	return usecase.NewChecker(cache, org, realmMap, usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{}, usecase.NoopRecorder{}, usecase.CheckerConfig{
+		SharedRealmIssuer: sharedRealmIssuer,
+		I8Timeout:         20 * time.Millisecond,
+		I8ColdTimeout:     500 * time.Millisecond,
+	})
+}
+
+// slowSibling answers I-8 after delay, or fails as the HTTP client would
+// once the call's deadline passes.
+func slowSibling(delay time.Duration) func(context.Context, string, string) (domain.MembershipContext, domain.TenantContext, error) {
+	return func(ctx context.Context, _, _ string) (domain.MembershipContext, domain.TenantContext, error) {
+		select {
+		case <-time.After(delay):
+			return domain.NewMembershipContext(), domain.NewTenantContext(), nil
+		case <-ctx.Done():
+			return domain.MembershipContext{}, domain.TenantContext{}, domain.ErrUnavailable
+		}
+	}
+}

@@ -41,6 +41,12 @@ type Config struct {
 	// even when the sibling meets its SLO — and a failed call here is a deny
 	// or a stale answer, not a slow one.
 	OrgMembershipTimeout time.Duration
+	// OrgMembershipColdTimeout bounds an I-8 call on a cache miss with no
+	// stale entry to fall back on (§9.2). There a timeout is a certain
+	// DENY_SERVICE_UNAVAILABLE, so the call may wait for a cold sibling (new
+	// connection, empty cache) instead. Default max(120ms, the timeout
+	// above), and never below it; keep it well inside GRPC_REQUEST_TIMEOUT.
+	OrgMembershipColdTimeout time.Duration
 
 	// TenderACLBaseURL/TenderACLTimeout back I-12 (GetTenderACL) and TAC-5
 	// (GetBatchTenderACL) only, since ADR-0007 Wave 3 Phase 4 repoints those
@@ -248,6 +254,13 @@ func Load() (Config, error) {
 	}
 	if cfg.OrgMembershipTimeout, err = envDuration("ORG_MEMBERSHIP_TIMEOUT", 40*time.Millisecond); err != nil {
 		return Config{}, err
+	}
+	if cfg.OrgMembershipColdTimeout, err = envDuration("ORG_MEMBERSHIP_COLD_TIMEOUT", max(120*time.Millisecond, cfg.OrgMembershipTimeout)); err != nil {
+		return Config{}, err
+	}
+	if cfg.OrgMembershipColdTimeout < cfg.OrgMembershipTimeout {
+		return Config{}, fmt.Errorf("ORG_MEMBERSHIP_COLD_TIMEOUT (%s) must not be below ORG_MEMBERSHIP_TIMEOUT (%s)",
+			cfg.OrgMembershipColdTimeout, cfg.OrgMembershipTimeout)
 	}
 	if cfg.TenderACLTimeout, err = envDuration("TENDER_ACL_TIMEOUT", 30*time.Millisecond); err != nil {
 		return Config{}, err

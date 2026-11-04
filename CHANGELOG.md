@@ -6,9 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Changed (2026-11-04 — TND-Q4 confirmed: `override_workflow_assignee` policy widened, AE-50, LLD rev 1.50)
+### Fixed (2026-11-01 — a cold cache miss no longer denies 503, AE-48, LLD rev 1.49)
 
-- **`tenant_admin` and `tenant_owner` are now admitted to the `override_workflow_assignee` policy (§4.2 policy 2).** The HLD seed stated "only if they have `tender_admin` role." The Tender open-items review (TND-Q4, 2026-11-04) confirmed that `tenant_admin` and `tenant_owner` must also be admitted — `tenant_admin` holds tenant-wide administrative authority; `tenant_owner` inherits all `tenant_admin` permissions. The policy predicate (`EvaluateBase` in `internal/domain/policy/policy.go`) and the action comment (`ActionOverrideWorkflowAssignee` in `internal/domain/policy/types.go`) were already correct in code; this entry records the LLD/doc catch-up only. No behavior change, no cache-key change, no header change. LLD §4.2 policy 2, revision history AE-50.
+- **A user's first request no longer fails `DENY_SERVICE_UNAVAILABLE` when Org & Membership is a little slow** (frontend SDK integrated-deployment report, Issue 12). With no stale `ae:ctx` to serve, an I-8 call slower than 40ms (a new connection, an empty O&M cache) was a certain deny.
+  - That call now waits up to the new `ORG_MEMBERSHIP_COLD_TIMEOUT` (default `120ms`). Startup fails if it is below `ORG_MEMBERSHIP_TIMEOUT`.
+  - A miss with a stale entry keeps 40ms and stale-if-error. I-14 keeps 40ms.
+  - Cold and warm calls coalesce separately, so a cold caller never inherits the shorter deadline.
+- The Org & Membership and Tender ACL clients keep 64 idle connections per host (Go's default is 2), so concurrent misses reuse connections.
+- Tests: the cold, stale-available and I-14 deadlines, and the config default and validation. LLD §9.2, §12, §16 AE-48; README; Helm values; `.env-example`.
 
 ### Changed (2026-10-30 — deny bodies are RFC 9457, AE-42 / CD-31, LLD rev 1.48)
 

@@ -7,8 +7,9 @@
 # A timezone-database refresh, not a security flaw (Trivy: UNKNOWN; the CI gate
 # fails on UNKNOWN). Not exploitable here: the service never loads a zone (no
 # time.LoadLocation, no time/tzdata, no time.Local use; all timestamps are UTC).
-# Blocked upstream: on 2026-10-04 the newest :nonroot digest (sha256:afa5c872…,
-# pinned in the Dockerfile) still ships tzdata 2026b. Remove this entry and
+# Blocked upstream: on 2026-10-04, and again on 2026-11-02, the newest :nonroot
+# digest (sha256:afa5c872…, pinned in the Dockerfile) still ships tzdata 2026b.
+# Expiry aligned with DLA-4854-1/DLA-4867-1 below. Remove this entry and
 # re-pin (`make pin-base-images`) once distroless ships 2026c.
 DLA-4792-1 exp:2026-11-30
 

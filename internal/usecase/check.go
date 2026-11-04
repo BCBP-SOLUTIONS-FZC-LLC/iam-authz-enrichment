@@ -31,11 +31,19 @@ type CheckInput struct {
 	Request policy.RequestFacts
 }
 
-// CheckerConfig configures a Checker's tunables. TTLs/timeouts themselves
-// live in the outbound adapters (valkey.Config, orgmembership timeout) —
-// this only holds usecase-level policy knobs.
+// CheckerConfig configures a Checker's tunables. TTLs and the Valkey
+// timeouts live in the outbound adapters (valkey.Config); the Org &
+// Membership deadlines live here because which one applies is a usecase
+// decision (§9.2).
 type CheckerConfig struct {
 	SharedRealmIssuer string
+	// I8Timeout bounds I-8 when a stale entry can answer a failure, and
+	// every I-14 call (ORG_MEMBERSHIP_TIMEOUT).
+	I8Timeout time.Duration
+	// I8ColdTimeout bounds I-8 when nothing can (ORG_MEMBERSHIP_COLD_TIMEOUT):
+	// a timeout there is a certain deny, so a slow answer is better.
+	// Zero leaves the call bounded by the caller's context and the client.
+	I8ColdTimeout time.Duration
 	// OperatorIssuer is the platform realm's issuer (CD-52, §8.9). Tokens
 	// from it take the operator path instead of tenant resolution. Empty
 	// disables the operator path.
@@ -286,18 +294,25 @@ func (c *Checker) resolveContext(ctx context.Context, tenant, user string) (doma
 
 	staleAvailable := valkeyReachable && ctxResult != domain.CacheMiss && tenantResult != domain.CacheMiss
 
-	key := tenant + ":" + user
+	// With no stale entry a failed I-8 is a certain deny, so the call gets
+	// the longer cold deadline. Cold and warm callers coalesce separately:
+	// a cold caller must not inherit a warm call's shorter deadline.
+	key, i8Timeout := tenant+":"+user, c.cfg.I8Timeout
+	if !staleAvailable {
+		key, i8Timeout = key+":cold", c.cfg.I8ColdTimeout
+	}
 	// The shared call must not inherit any one caller's cancellation:
 	// singleflight hands every coalesced caller the first caller's result, so
 	// if Envoy's deadline cancelled that first request, every other request
 	// waiting on the same (tenant, user) would fail too — healthy requests
 	// denied as DENY_SERVICE_UNAVAILABLE. WithoutCancel keeps the trace and
-	// values; the call stays bounded by the org-membership client's own
-	// timeout (ORG_MEMBERSHIP_TIMEOUT). Each caller still honours its own
-	// deadline for everything after this point.
+	// values; the call stays bounded by i8Timeout. Each caller still
+	// honours its own deadline for everything after this point.
 	sharedCtx := context.WithoutCancel(ctx)
 	v, err, shared := c.sf.Do(key, func() (any, error) {
-		i8Ctx, i8Span := tracer.Start(sharedCtx, "authz.i8_call")
+		i8Ctx, cancel := withTimeout(sharedCtx, i8Timeout)
+		defer cancel()
+		i8Ctx, i8Span := tracer.Start(i8Ctx, "authz.i8_call")
 		defer i8Span.End()
 		i8Start := c.now()
 		m, t, sfErr := c.org.GetMemberships(i8Ctx, tenant, user)
@@ -393,7 +408,9 @@ func (c *Checker) resolveTenderACL(ctx context.Context, tenant, tenderID, user s
 // request must be denied (stale MFA or an unreachable freshness call — see
 // the comment below on why a call failure also denies rather than allowing).
 func (c *Checker) checkMFAFreshness(ctx context.Context, tenant string, claims Claims) bool {
-	mfaCtx, mfaSpan := tracer.Start(ctx, "authz.mfa_freshness_call")
+	mfaCtx, cancel := withTimeout(ctx, c.cfg.I8Timeout)
+	defer cancel()
+	mfaCtx, mfaSpan := tracer.Start(mfaCtx, "authz.mfa_freshness_call")
 	mfaStart := c.now()
 	window, err := c.org.GetMFAFreshness(mfaCtx, tenant)
 	c.metrics.ObserveI14Latency(c.now().Sub(mfaStart))
@@ -419,4 +436,12 @@ func (c *Checker) checkMFAFreshness(ctx context.Context, tenant string, claims C
 		return true
 	}
 	return c.now().Sub(authTime) > window
+}
+
+// withTimeout is context.WithTimeout, except that d <= 0 adds no deadline.
+func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
 }
