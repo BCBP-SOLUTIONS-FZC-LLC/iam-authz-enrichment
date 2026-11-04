@@ -70,7 +70,7 @@ func (c *Checker) operatorDecision(claims Claims, path string) domain.Decision {
 	if !ok {
 		return domain.Denied(domain.DenyMalformedIdentity)
 	}
-	return domain.Allowed(map[string]string{
+	headers := map[string]string{
 		domain.HeaderTenantID:      tenant,
 		domain.HeaderUserID:        claims.Subject,
 		domain.HeaderTenantRoles:   domain.PlatformOperatorRole,
@@ -78,7 +78,13 @@ func (c *Checker) operatorDecision(claims Claims, path string) domain.Decision {
 		domain.HeaderPlan:          "",
 		domain.HeaderFeatureFlags:  "",
 		domain.HeaderResidencyMode: "",
-	})
+	}
+	// Same as buildHeaders: inject x-auth-time via the shared formatAuthTime
+	// helper so both paths always emit the same format (§16 AE-49, AE-TND-F1).
+	if v := formatAuthTime(claims.AuthTime); v != "" {
+		headers[domain.HeaderAuthTime] = v
+	}
+	return domain.Allowed(headers)
 }
 
 // operatorTenantFromPath returns the tenant an operator route acts on: the

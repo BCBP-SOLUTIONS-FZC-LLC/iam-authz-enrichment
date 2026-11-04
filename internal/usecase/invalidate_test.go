@@ -78,7 +78,7 @@ func TestInvalidator_MembershipRevoked_EvictNegError_Propagates(t *testing.T) {
 func TestInvalidator_MembershipRevoked_TenderACLEvictionFails_BestEffortDoesNotPropagate(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
-	cache.EvictTenderACLErr = errors.New("valkey down")
+	cache.EvictTACLScanErr = errors.New("valkey down")
 	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 
 	err := inv.HandleMembershipRevoked(context.Background(), "tenant-1", usecase.MembershipEventPayload{UserID: "alice"})
@@ -214,7 +214,7 @@ func TestInvalidator_UserDeleted_EvictCtxError_ShortCircuitsBeforeTenderACL(t *t
 func TestInvalidator_UserDeleted_TenderACLEvictionFails_BestEffortDoesNotPropagate(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
-	cache.EvictTenderACLErr = errors.New("valkey down")
+	cache.EvictTACLScanErr = errors.New("valkey down")
 	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 
 	err := inv.HandleUserDeleted(context.Background(), "tenant-1", usecase.UserEventPayload{UserID: "alice"})
@@ -297,6 +297,18 @@ func TestInvalidator_TenderRestricted_FlipsInMemoryFact_NoEviction(t *testing.T)
 // writing ae:restricted:{tenant}: (empty-key corruption) when the producer
 // renames or omits tender_id. Must return an error so the platform retries
 // and DLQs the message rather than silently corrupting state (AE-TAC-GAP-001).
+func TestInvalidator_TenderRestricted_EmptyTenantID_ReturnsError(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), restricted, fixtures.NoopLogger{})
+
+	err := inv.HandleTenderRestricted(context.Background(), "", usecase.TenderRestrictedPayload{TenderID: "tender-9"})
+
+	require.Error(t, err, "empty tenant must be rejected to prevent writing ae:restricted::tender-9 (never matched by real-tenant IsRestricted)")
+	assert.Empty(t, cache.SortedCalls(), "no cache writes must occur on validation failure")
+}
+
 func TestInvalidator_TenderRestricted_EmptyTenderID_ReturnsError(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -478,6 +490,28 @@ func TestInvalidator_TenderRestricted_StoreError(t *testing.T) {
 // evict the exact ae:tender_acl entry for the (tenant, tender, user) triple so
 // that a newly-granted user is not denied for up to 15 s.
 
+func TestInvalidator_TenderAccessGranted_LogsSuccessForOperabilityVerification(t *testing.T) {
+	t.Parallel()
+	// Verifies that HandleTenderAccessGranted emits a "tender_acl_evicted" Info
+	// log on success. Ops use this log line to confirm C1/TND-Q2 is live and
+	// events are flowing (runbook.md §"Dependencies to track").
+	cache := fixtures.NewFakeCache()
+	log := &fixtures.InfoCapturingLogger{}
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), log)
+
+	err := inv.HandleTenderAccessGranted(context.Background(), "tenant-1", usecase.TenderAccessGrantedPayload{
+		UserID:   "alice",
+		TenderID: "tender-9",
+	})
+
+	require.NoError(t, err)
+	logs := log.InfoLogs()
+	require.Len(t, logs, 1, "exactly one Info log on success (ops use 'tender_acl_evicted' to confirm C1/TND-Q2 is live)")
+	assert.Equal(t, "tenant-1", logs[0]["tenant"])
+	assert.Equal(t, "tender-9", logs[0]["tender_id"])
+	assert.Equal(t, "alice", logs[0]["user_id"])
+}
+
 func TestInvalidator_TenderAccessGranted_EvictsExactKey(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
@@ -521,10 +555,24 @@ func TestInvalidator_TenderAccessGranted_EmptyTenderID_ReturnsError(t *testing.T
 	assert.Empty(t, cache.SortedCalls(), "no cache writes must occur on validation failure")
 }
 
+func TestInvalidator_TenderAccessGranted_EmptyTenantID_ReturnsError(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+
+	err := inv.HandleTenderAccessGranted(context.Background(), "", usecase.TenderAccessGrantedPayload{
+		UserID:   "alice",
+		TenderID: "tender-9",
+	})
+
+	require.Error(t, err, "empty tenant must be rejected to prevent a silent no-op DEL that leaves the stale deny intact (AE-TND-G1)")
+	assert.Empty(t, cache.SortedCalls(), "no cache writes must occur on validation failure")
+}
+
 func TestInvalidator_TenderAccessGranted_EvictError_Propagates(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
-	cache.EvictTenderACLEntryErr = errors.New("valkey down")
+	cache.EvictTACLSingleErr = errors.New("valkey down")
 	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 
 	err := inv.HandleTenderAccessGranted(context.Background(), "tenant-1", usecase.TenderAccessGrantedPayload{
@@ -539,7 +587,7 @@ func TestNewInvalidator_WithRecorder_UsesIt(t *testing.T) {
 	t.Parallel()
 	// Exercises the len(recorder)>0 && recorder[0]!=nil branch in NewInvalidator.
 	cache := fixtures.NewFakeCache()
-	cache.EvictTenderACLErr = errors.New("scan failed")
+	cache.EvictTACLScanErr = errors.New("scan failed")
 	rec := usecase.NoopRecorder{}
 	inv := usecase.NewInvalidator(
 		cache,

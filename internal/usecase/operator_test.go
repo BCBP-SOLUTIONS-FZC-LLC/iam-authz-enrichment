@@ -167,6 +167,52 @@ func TestOperator_TenantTokenOnOperatorRoute_NeverGetsOperatorRole(t *testing.T)
 	}
 }
 
+// AE-TND-F1 / §16 AE-49: operator tokens must inject x-auth-time the same way
+// tenant tokens do so downstream services (e.g. Tender Service reading
+// mfa_verified_at) receive a consistent header on both paths.
+
+func TestOperator_AuthTime_NonZero_HeaderInjected(t *testing.T) {
+	t.Parallel()
+	checker := newOperatorChecker(&fixtures.FakeOrgMembershipClient{}, fixtures.NoopLogger{}, operatorIssuer)
+
+	const authTime int64 = 1699000000
+	in := usecase.CheckInput{
+		Claims: usecase.Claims{
+			Subject:  operatorSub,
+			Issuer:   operatorIssuer,
+			Roles:    []string{domain.PlatformOperatorRole},
+			AuthTime: authTime,
+		},
+		Request: policy.RequestFacts{Method: "GET", Path: "/api/v1/operator/tenants/" + targetTenant + "/entitlements"},
+	}
+	d := checker.Check(context.Background(), in)
+
+	require.True(t, d.Allow)
+	want := time.Unix(authTime, 0).UTC().Format(time.RFC3339)
+	assert.Equal(t, want, d.Headers[domain.HeaderAuthTime],
+		"x-auth-time must be injected as RFC 3339 UTC for operator tokens with non-zero auth_time (AE-TND-F1)")
+}
+
+func TestOperator_AuthTime_Zero_HeaderAbsent(t *testing.T) {
+	t.Parallel()
+	checker := newOperatorChecker(&fixtures.FakeOrgMembershipClient{}, fixtures.NoopLogger{}, operatorIssuer)
+
+	in := usecase.CheckInput{
+		Claims: usecase.Claims{
+			Subject:  operatorSub,
+			Issuer:   operatorIssuer,
+			Roles:    []string{domain.PlatformOperatorRole},
+			AuthTime: 0,
+		},
+		Request: policy.RequestFacts{Method: "GET", Path: "/api/v1/operator/tenants/" + targetTenant + "/entitlements"},
+	}
+	d := checker.Check(context.Background(), in)
+
+	require.True(t, d.Allow)
+	_, hasAuthTime := d.Headers[domain.HeaderAuthTime]
+	assert.False(t, hasAuthTime, "x-auth-time must be absent when auth_time is zero")
+}
+
 func TestOperator_PathDisabled_OperatorTokenDeniedAsBefore(t *testing.T) {
 	t.Parallel()
 	checker := newOperatorChecker(&fixtures.FakeOrgMembershipClient{}, fixtures.NoopLogger{}, "")

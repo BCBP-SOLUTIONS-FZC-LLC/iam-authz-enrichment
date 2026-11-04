@@ -51,7 +51,10 @@ Until these are done, `OPERATOR_REALM_ISSUER` stays empty, and no operator route
       on `/api/v1/operator/*` only (platform edge). If it uses its own payload
       key, set `JWT_OPERATOR_PAYLOAD_KEY`.
 - [ ] **OP-G3** `OPERATOR_REALM_ISSUER` set in each environment's values, and this
-      service redeployed. Startup fails if it equals a tenant issuer.
+      service redeployed. Startup fails if it equals a tenant issuer. **To
+      confirm it took effect:** grep startup logs for
+      `"msg":"operator path enabled"` — this line is emitted on every pod
+      start when the issuer is non-empty, with the issuer URL as a field.
 - [ ] **OP-G4** End-to-end check through the gateway: an operator reaches an
       operator route (`operator_access` in the logs); a tenant admin gets `403` on
       `/api/v1/operator/*`; an operator gets `403` on a tenant route. Cover IAM's
@@ -67,6 +70,16 @@ Until these are done, `OPERATOR_REALM_ISSUER` stays empty, and no operator route
       from `.github/govulncheck-allow.txt`.~~ **Done at v1.40** — GO-2026-6443
       is no longer reachable from this service's code paths; allowlist entry
       was removed and `govulncheck ./...` reports zero reachable vulnerabilities.
+- [ ] **C1/TND-Q2 — Tender Service must implement TAC-2/3 outbox publishing for
+      `TenderAccessGranted` on `tender.events` SNS.** Until this ships, no
+      `TenderAccessGranted` messages arrive on `tender-authz-q`. The
+      `HandleTenderAccessGranted` handler is fully implemented and degrades
+      gracefully via `default: ackUnknown` until messages flow. Impact: a user
+      granted access to a restricted tender remains denied for up to 15 s (the
+      `ae:tender_acl` TTL) instead of being unblocked immediately (§16
+      AE-TND-G1). **To confirm when active:** grep the structured log stream for
+      `"msg":"tender_acl_evicted"` — this line is emitted on every successful
+      targeted eviction and will appear only after Tender Service ships C1/TND-Q2.
 - [ ] Load-test the target cluster (`make load-test`): the 50ms p99 alert and
       the 15ms budget were validated on loopback only.
 

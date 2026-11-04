@@ -34,19 +34,29 @@ func TestEvaluateBase_EditTenderSection(t *testing.T) {
 
 func TestEvaluateBase_OverrideWorkflowAssignee(t *testing.T) {
 	t.Parallel()
-	withRole := domain.NewMembershipContext()
-	withRole.Roles = []string{"tender_admin"}
-	without := domain.NewMembershipContext()
-	without.Roles = []string{"tenant_owner"} // a real role, just not the required one
-
-	assert.True(t, policy.EvaluateBase(policy.Input{
-		Membership: withRole,
-		Request:    policy.RequestFacts{Action: policy.ActionOverrideWorkflowAssignee},
-	}))
-	assert.False(t, policy.EvaluateBase(policy.Input{
-		Membership: without,
-		Request:    policy.RequestFacts{Action: policy.ActionOverrideWorkflowAssignee},
-	}))
+	cases := []struct {
+		name  string
+		roles []string
+		want  bool
+	}{
+		{"tender_admin allowed", []string{"tender_admin"}, true},
+		{"tenant_admin allowed (AE-50)", []string{"tenant_admin"}, true},
+		{"tenant_owner allowed (AE-50)", []string{"tenant_owner"}, true},
+		{"reviewer insufficient", []string{"reviewer"}, false},
+		{"no roles insufficient", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			m := domain.NewMembershipContext()
+			m.Roles = c.roles
+			got := policy.EvaluateBase(policy.Input{
+				Membership: m,
+				Request:    policy.RequestFacts{Action: policy.ActionOverrideWorkflowAssignee},
+			})
+			assert.Equal(t, c.want, got)
+		})
+	}
 }
 
 func TestEvaluateBase_ManageDepartmentMemberships(t *testing.T) {

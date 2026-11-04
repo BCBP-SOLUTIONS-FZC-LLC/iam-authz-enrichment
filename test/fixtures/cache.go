@@ -58,8 +58,8 @@ type FakeCache struct {
 	EvictCtxErr                error
 	EvictTenantErr             error
 	EvictNegErr                error
-	EvictTenderACLEntryErr     error
-	EvictTenderACLErr          error
+	EvictTACLSingleErr         error // gates EvictTenderACL (targeted single-key DEL, AE-TND-G1)
+	EvictTACLScanErr           error // gates EvictTenderACLForUser (SCAN-based, MembershipRevoked/UserDeleted)
 	RealmErr                   error
 	RestrictedErr              error
 	SetRealmErr                error
@@ -222,8 +222,8 @@ func (f *FakeCache) EvictTenderACL(_ context.Context, tenant, tender, user strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("EvictTenderACL:" + tenderKey(tenant, tender, user))
-	if f.EvictTenderACLEntryErr != nil {
-		return f.EvictTenderACLEntryErr
+	if f.EvictTACLSingleErr != nil {
+		return f.EvictTACLSingleErr
 	}
 	delete(f.tender, tenderKey(tenant, tender, user))
 	return nil
@@ -233,8 +233,8 @@ func (f *FakeCache) EvictTenderACLForUser(_ context.Context, tenant, user string
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("EvictTenderACLForUser:" + ctxKey(tenant, user))
-	if f.EvictTenderACLErr != nil {
-		return f.EvictTenderACLErr
+	if f.EvictTACLScanErr != nil {
+		return f.EvictTACLScanErr
 	}
 	for k := range f.tender {
 		parts := strings.Split(k, ":")

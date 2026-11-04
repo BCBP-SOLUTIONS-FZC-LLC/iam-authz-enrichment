@@ -7,7 +7,7 @@ info:
     Event contract for `iam-authz-enrichment`, the platform's Envoy
     `ext_authz` v3 Policy Decision Point (PDP).
 
-    This service is **receive-only** on the event bus: it consumes 21 event
+    This service is **receive-only** on the event bus: it consumes 22 event
     types across five independent SQS queues and publishes **zero**
     events — it has no state changes of its own to announce
     (`internal/adapter/inbound/consumer`'s own package doc: "This service
@@ -24,7 +24,7 @@ info:
       user-authz-q          User Profile (iam-user-profile)                3
       billing-authz-q       Billing Service                                3
       tenant-authz-q        Realm Provisioner + Tenant Owner (CD-37)       8
-      tender-authz-q        Tender Service                                  1
+      tender-authz-q        Tender Service                                  2
 
     This service owns none of these schemas — every message definition below
     is consumer-side documentation of an upstream contract, kept in sync
@@ -428,6 +428,7 @@ channels:
               type:
                 - TenantConverted
                 - TenantRealmReady
+                - TenantSettingChanged
                 - TenantSuspended
                 - TenantReactivated
                 - TenantOffboarded

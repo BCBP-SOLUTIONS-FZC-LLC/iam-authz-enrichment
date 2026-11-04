@@ -261,6 +261,9 @@ type TenderAccessGrantedPayload struct {
 // unreachable — leaving the error unhandled would keep the user denied until
 // the 15 s TTL expires.
 func (inv *Invalidator) HandleTenderAccessGranted(ctx context.Context, tenant string, p TenderAccessGrantedPayload) error {
+	if tenant == "" {
+		return fmt.Errorf("TenderAccessGranted envelope missing tenant_id: producer schema drift or malformed envelope")
+	}
 	if p.UserID == "" {
 		return fmt.Errorf("TenderAccessGranted payload missing user_id: producer schema drift or malformed envelope")
 	}
@@ -268,19 +271,39 @@ func (inv *Invalidator) HandleTenderAccessGranted(ctx context.Context, tenant st
 		return fmt.Errorf("TenderAccessGranted payload missing tender_id: producer schema drift or malformed envelope")
 	}
 	if err := inv.cache.EvictTenderACL(ctx, tenant, p.TenderID, p.UserID); err != nil {
+		// No ObserveEvictionError here: unlike the best-effort handlers
+		// (MembershipRevoked, UserDeleted, TenantOffboarded) that swallow the
+		// error and can only increment once per delivery, this handler returns
+		// the error so the platform retries up to maxReceiveCount times. Firing
+		// the counter on each attempt would make the label count retries rather
+		// than missed evictions — inconsistent with every other label. The
+		// returned error is observable through the consumer platform logs and
+		// the DLQ depth alarm.
+		inv.log.Warn("evict ae:tender_acl failed on TenderAccessGranted", map[string]interface{}{
+			"error": err.Error(), "tenant": tenant, "tender_id": p.TenderID, "user_id": p.UserID,
+		})
 		return fmt.Errorf("evict ae:tender_acl: %w", err)
 	}
+	// Structured signal ops can grep for to confirm C1/TND-Q2 is live and
+	// events are flowing (§16 AE-TND-G1). The runbook's C1/TND-Q2 verification
+	// step references this log line.
+	inv.log.Info("tender_acl_evicted", map[string]interface{}{
+		"tenant": tenant, "tender_id": p.TenderID, "user_id": p.UserID,
+	})
 	return nil
 }
 
 // HandleTenderRestricted flips the restricted-tender fact (L1 + shared
 // Valkey). Not a cache eviction (§5).
 //
-// An empty TenderID means the producer payload is malformed or the field was
-// renamed — writing ae:restricted:{tenant}: (empty key) would be a silent
-// correctness bug, so we return an error and let the platform retry/DLQ
-// (AE-TAC-GAP-001 fix).
+// An empty TenantID or TenderID means the producer payload is malformed or
+// the field was renamed — writing ae:restricted:: would be a silent
+// correctness bug (the key would never match a real-tenant IsRestricted
+// lookup), so we return an error and let the platform retry/DLQ.
 func (inv *Invalidator) HandleTenderRestricted(ctx context.Context, tenant string, p TenderRestrictedPayload) error {
+	if tenant == "" {
+		return fmt.Errorf("TenderRestricted envelope missing tenant_id: producer schema drift or malformed envelope")
+	}
 	if p.TenderID == "" {
 		return fmt.Errorf("TenderRestricted payload missing tender_id: producer schema drift or malformed envelope")
 	}
