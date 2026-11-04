@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security (2026-11-04 — x-auth-time header-injection vector closed; TenantSettingChanged SNS filter restored)
+
+- **`x-auth-time` passthrough vector closed.** `okResponse` now populates `HeadersToRemove: ["x-auth-time"]` for requests where the JWT carries no `auth_time` claim. Without this, Envoy would pass a client-supplied `x-auth-time` through to the upstream unmodified — OVERWRITE only fires for headers present in the response map. Three-layer defence documented in `response.go`. Spoofing regression test updated to cover the new header.
+- **`TenantSettingChanged` restored to `tenant-authz-q` SNS filter policy.** The event was present in the channel definition and has a handler (`HandleTenantSettingChanged` → `EvictTenantContext`, CD-37/AE-40) but was absent from the `asyncapi.yaml` SNS `filterPolicy` block. Infrastructure provisioned from that document would never deliver the event, breaking residency-mode eviction.
+
+### Added (2026-11-04 — TenderAccessGranted targeted eviction handler, AE-TND-G1)
+
+- **A newly-granted user is unblocked within milliseconds, not 15 s.** New `HandleTenderAccessGranted` evicts the exact `ae:tender_acl:{tenant}:{tender}:{user}` cache entry immediately on receipt of a `TenderAccessGranted` event from `tender-authz-q`. Without it, the user stays denied until the 15 s TTL expires. Handler is fully implemented and idle until Tender Service ships C1/TND-Q2. Activation: grep for `"tender_acl_evicted"` in the log stream.
+- **`x-auth-time` header injected on the Allow path (AE-49, AE-TND-F1).** `buildHeaders` and `operatorDecision` now emit `x-auth-time` as an RFC 3339 UTC string when the JWT carries a non-zero `auth_time` claim. Tender Service reads this header to populate `mfa_verified_at` in approval evidence and `TenderDeliverableApproved` events (Tender HLD v0.8 §11.3/§13.5). Header is conditional — omitted entirely when `auth_time` is absent or zero (and explicitly stripped via `HeadersToRemove`). `formatAuthTime` helper shared between both code paths to prevent silent format drift. Tests: `TestCheck_Allow_AuthTime_NonZero_HeaderInjected`, `TestCheck_Allow_AuthTime_Zero_HeaderAbsent`, `TestOperator_AuthTime_NonZero_HeaderInjected`, `TestOperator_AuthTime_Zero_HeaderAbsent`.
+
+### Changed (2026-11-04 — TND-Q4 confirmed: `override_workflow_assignee` policy widened, AE-50, LLD rev 1.50)
+
+- **`tenant_admin` and `tenant_owner` are now admitted to the `override_workflow_assignee` policy (§4.2 policy 2).** The HLD seed stated "only if they have `tender_admin` role." The Tender open-items review (TND-Q4, 2026-11-04) confirmed that `tenant_admin` and `tenant_owner` must also be admitted — `tenant_admin` holds tenant-wide administrative authority; `tenant_owner` inherits all `tenant_admin` permissions. The policy predicate (`EvaluateBase` in `internal/domain/policy/policy.go`) and the action comment (`ActionOverrideWorkflowAssignee` in `internal/domain/policy/types.go`) were already correct in code; this entry records the LLD/doc catch-up only. No behavior change, no cache-key change, no header change. LLD §4.2 policy 2, revision history AE-50.
+
 ### Fixed (2026-11-01 — a cold cache miss no longer denies 503, AE-48, LLD rev 1.49)
 
 - **A user's first request no longer fails `DENY_SERVICE_UNAVAILABLE` when Org & Membership is a little slow** (frontend SDK integrated-deployment report, Issue 12). With no stale `ae:ctx` to serve, an I-8 call slower than 40ms (a new connection, an empty O&M cache) was a certain deny.
