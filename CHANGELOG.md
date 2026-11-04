@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (2026-11-04 — TND-Q4 confirmed: `override_workflow_assignee` policy widened, AE-50, LLD rev 1.50)
+
+- **`tenant_admin` and `tenant_owner` are now admitted to the `override_workflow_assignee` policy (§4.2 policy 2).** The HLD seed stated "only if they have `tender_admin` role." The Tender open-items review (TND-Q4, 2026-11-04) confirmed that `tenant_admin` and `tenant_owner` must also be admitted — `tenant_admin` holds tenant-wide administrative authority; `tenant_owner` inherits all `tenant_admin` permissions. The policy predicate (`EvaluateBase` in `internal/domain/policy/policy.go`) and the action comment (`ActionOverrideWorkflowAssignee` in `internal/domain/policy/types.go`) were already correct in code; this entry records the LLD/doc catch-up only. No behavior change, no cache-key change, no header change. LLD §4.2 policy 2, revision history AE-50.
+
 ### Changed (2026-10-30 — deny bodies are RFC 9457, AE-42 / CD-31, LLD rev 1.48)
 
 - **Gateway denials are `application/problem+json`** (frontend SDK round-2 ask H). The body was the bare `DENY_*` string. It's now a platform-gincommon `pkg/problem` body:
