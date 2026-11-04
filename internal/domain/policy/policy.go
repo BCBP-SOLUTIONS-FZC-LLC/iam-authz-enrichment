@@ -61,7 +61,9 @@ func EvaluateBase(in Input) bool {
 	case ActionEditTenderSection:
 		return in.Request.AssigneeUserID != "" && in.Request.AssigneeUserID == in.Subject
 	case ActionOverrideWorkflowAssignee:
-		return hasRole(in.Membership.Roles, "tender_admin")
+		return hasRole(in.Membership.Roles, "tender_admin") ||
+			hasRole(in.Membership.Roles, "tenant_admin") ||
+			hasRole(in.Membership.Roles, "tenant_owner")
 	case ActionManageDepartmentMemberships:
 		return hasRole(in.Membership.Roles, "tenant_admin") || hasRole(in.Membership.Roles, "tenant_owner")
 	case ActionGeneric:

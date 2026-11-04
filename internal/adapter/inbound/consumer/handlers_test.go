@@ -394,6 +394,89 @@ func TestTenderHandler_TenderRestricted_MissingTenderID_ReturnsError(t *testing.
 	assert.Error(t, err, "renamed/missing tender_id must return an error, not write ae:restricted:tenant-abc:")
 }
 
+// TenderAccessGranted handler tests — §16 AE-TND-G1.
+
+func TestTenderHandler_TenderAccessGranted_EvictsACLEntry(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), restricted, fixtures.NoopLogger{})
+	handler := tenderHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
+
+	err := handler(context.Background(), envelope(t, "TenderAccessGranted", "tenant-1",
+		map[string]string{"user_id": "alice", "tender_id": "tender-9"}))
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"EvictTenderACL:tenant-1:tender-9:alice"}, cache.SortedCalls(),
+		"TenderAccessGranted must evict exactly the one ae:tender_acl entry for the granted triple")
+	assert.False(t, restricted.IsRestricted(context.Background(), "tenant-1", "tender-9"),
+		"TenderAccessGranted must not touch the restricted set")
+}
+
+// TestTenderHandler_TenderAccessGranted_ContractFixture pins the wire payload
+// shape this service expects from Tender Service (§16 AE-TND-G1). Unknown
+// fields must be ignored (open-schema contract). If Tender Service renames
+// user_id or tender_id this test will catch schema drift before it silently
+// evicts the wrong key.
+func TestTenderHandler_TenderAccessGranted_ContractFixture(t *testing.T) {
+	t.Parallel()
+	const rawPayload = `{"user_id":"018f4c3e-a1b2-7000-9d3e-000000000001","tender_id":"018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d99","future_field":"ignored"}`
+
+	cache := fixtures.NewFakeCache()
+	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
+	handler := tenderHandler(Deps{Cache: cache, Log: fixtures.NoopLogger{}, Invalidator: inv})
+
+	env := events.Envelope[json.RawMessage]{
+		ID:       "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d00",
+		Type:     "TenderAccessGranted",
+		TenantID: "tenant-abc",
+		Payload:  json.RawMessage(rawPayload),
+	}
+
+	require.NoError(t, handler(context.Background(), env))
+	assert.Equal(t,
+		[]string{"EvictTenderACL:tenant-abc:018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d99:018f4c3e-a1b2-7000-9d3e-000000000001"},
+		cache.SortedCalls(),
+		"user_id and tender_id must be extracted from the raw wire payload and used to evict the exact cache key")
+}
+
+func TestTenderHandler_TenderAccessGranted_MissingUserID_ReturnsError(t *testing.T) {
+	t.Parallel()
+	const rawPayload = `{"usr_id":"018f4c3e-a1b2-7000-9d3e-000000000001","tender_id":"tender-9"}` // renamed field
+
+	handler := tenderHandler(testDeps(fixtures.NewFakeCache()))
+	env := events.Envelope[json.RawMessage]{
+		ID: "evt-drift", Type: "TenderAccessGranted", TenantID: "tenant-abc",
+		Payload: json.RawMessage(rawPayload),
+	}
+
+	err := handler(context.Background(), env)
+	assert.Error(t, err, "renamed/missing user_id must return an error so the message retries and eventually DLQs")
+}
+
+func TestTenderHandler_TenderAccessGranted_MissingTenderID_ReturnsError(t *testing.T) {
+	t.Parallel()
+	const rawPayload = `{"user_id":"018f4c3e-a1b2-7000-9d3e-000000000001","tdr_id":"tender-9"}` // renamed field
+
+	handler := tenderHandler(testDeps(fixtures.NewFakeCache()))
+	env := events.Envelope[json.RawMessage]{
+		ID: "evt-drift", Type: "TenderAccessGranted", TenantID: "tenant-abc",
+		Payload: json.RawMessage(rawPayload),
+	}
+
+	err := handler(context.Background(), env)
+	assert.Error(t, err, "renamed/missing tender_id must return an error so the message retries and eventually DLQs")
+}
+
+func TestTenderHandler_TenderAccessGranted_DecodeError(t *testing.T) {
+	t.Parallel()
+	handler := tenderHandler(testDeps(fixtures.NewFakeCache()))
+
+	err := handler(context.Background(), badPayloadEnvelope("TenderAccessGranted"))
+
+	assert.Error(t, err)
+}
+
 func TestDedupingHandler_RetriesAfterHandlerFailure(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()

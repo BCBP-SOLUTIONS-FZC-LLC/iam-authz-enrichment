@@ -184,10 +184,10 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 		tenantCtx.ResidencyMode = "strict"
 	}
 
-	return domain.Allowed(buildHeaders(tenant, subject, membership, tenantCtx))
+	return domain.Allowed(buildHeaders(tenant, subject, membership, tenantCtx, in.Claims.AuthTime))
 }
 
-func buildHeaders(tenant, subject string, m domain.MembershipContext, t domain.TenantContext) map[string]string {
+func buildHeaders(tenant, subject string, m domain.MembershipContext, t domain.TenantContext, authTime int64) map[string]string {
 	departments := make([]string, 0, len(m.Departments))
 	for _, d := range m.Departments {
 		departments = append(departments, d.DepartmentID+":"+d.Level)
@@ -207,7 +207,7 @@ func buildHeaders(tenant, subject string, m domain.MembershipContext, t domain.T
 	} else {
 		featureFlagsHeader = strings.Join(t.FeatureFlags, ",")
 	}
-	return map[string]string{
+	headers := map[string]string{
 		domain.HeaderTenantID:     tenant,
 		domain.HeaderUserID:       subject,
 		domain.HeaderDepartments:  strings.Join(departments, ","),
@@ -219,6 +219,25 @@ func buildHeaders(tenant, subject string, m domain.MembershipContext, t domain.T
 		// normalised ResidencyMode to "standard" or "strict".
 		domain.HeaderResidencyMode: t.ResidencyMode,
 	}
+	// x-auth-time is injected only when auth_time is non-zero (§16 AE-49).
+	// Tender Service reads this as RFC 3339 UTC to populate mfa_verified_at in
+	// approval evidence entries and TenderDeliverableApproved events (AE-TND-F1).
+	if v := formatAuthTime(authTime); v != "" {
+		headers[domain.HeaderAuthTime] = v
+	}
+	return headers
+}
+
+// formatAuthTime converts a Unix auth_time claim to the RFC 3339 UTC string
+// injected as x-auth-time (§16 AE-49). Returns "" when authTime is zero
+// (claim absent or JWT carrying literal epoch zero), which callers use as the
+// "do not inject" sentinel. Shared by buildHeaders (tenant path) and
+// operatorDecision (operator path) so both always emit the same format.
+func formatAuthTime(authTime int64) string {
+	if authTime == 0 {
+		return ""
+	}
+	return time.Unix(authTime, 0).UTC().Format(time.RFC3339)
 }
 
 // sfResult is the value coalesced across concurrent singleflight callers.

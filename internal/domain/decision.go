@@ -34,9 +34,11 @@ func (r DenyReason) HTTPStatus() int {
 	}
 }
 
-// InjectedHeaders are the seven trust-boundary headers this service injects on
-// Allow. Every downstream service trusts these implicitly (mTLS-enforced
-// mesh) — no other header on the inbound CheckRequest may influence them.
+// InjectedHeaders are the trust-boundary headers this service injects on Allow.
+// The seven permanent headers are always present. HeaderAuthTime is additionally
+// injected when the JWT includes a non-zero auth_time claim (LLD §16 AE-49).
+// Every downstream service trusts these implicitly (mTLS-enforced mesh) — no
+// other header on the inbound CheckRequest may influence them.
 const (
 	HeaderTenantID     = "x-tenant-id"
 	HeaderUserID       = "x-user-id"
@@ -49,6 +51,11 @@ const (
 	// read from the inbound request (ingress strips it; AuthZ overwrites). Consumed
 	// by LLM services and forwarded to the Model Gateway. On Allow path only.
 	HeaderResidencyMode = "x-residency-mode"
+	// HeaderAuthTime carries the JWT auth_time claim as an RFC 3339 UTC string
+	// (e.g. "2026-10-29T14:32:00Z"). Injected only when auth_time is non-zero;
+	// omitted entirely when the claim is absent or zero. Used by Tender Service
+	// to populate mfa_verified_at in approval evidence (LLD §16 AE-49, AE-TND-F1).
+	HeaderAuthTime = "x-auth-time"
 )
 
 // CacheResult reports what state a jittered-TTL cache lookup found. It lives
@@ -67,16 +74,16 @@ const (
 	CacheStale
 )
 
-// Decision is the outcome of policy evaluation. On Allow, Headers holds
-// exactly the six InjectedHeaders values. On Deny, Reason is set and Headers
-// is empty.
+// Decision is the outcome of policy evaluation. On Allow, Headers holds the
+// seven permanent injected headers plus x-auth-time when the JWT auth_time
+// claim is non-zero. On Deny, Reason is set and Headers is empty.
 type Decision struct {
 	Allow   bool
 	Reason  DenyReason
 	Headers map[string]string
 }
 
-// Allowed builds an Allow decision with the six trust-boundary headers.
+// Allowed builds an Allow decision with the injected trust-boundary headers.
 func Allowed(headers map[string]string) Decision {
 	return Decision{Allow: true, Headers: headers}
 }

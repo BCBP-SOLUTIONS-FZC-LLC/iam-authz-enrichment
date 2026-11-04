@@ -45,6 +45,54 @@ func TestOkResponse_HeadersSortedDeterministically(t *testing.T) {
 // replaces a same-named request header rather than being appended next to a
 // client-supplied value (HLD §11.1, AE-SEC-1): the action is explicit, and the
 // deprecated `append` flag is never set (it would take precedence over it).
+// TestOkResponse_ConditionalHeader_Absent_InHeadersToRemove pins the
+// HeadersToRemove defence for conditional headers (§16 AE-49): when
+// x-auth-time is absent from the decision map (JWT auth_time == 0), okResponse
+// must place it in HeadersToRemove so Envoy strips any client-supplied copy
+// rather than passing it through to the upstream. This is distinct from the
+// OVERWRITE_IF_EXISTS_OR_ADD mechanism, which only fires for headers that ARE
+// present in the response.
+func TestOkResponse_ConditionalHeader_Absent_InHeadersToRemove(t *testing.T) {
+	t.Parallel()
+	// Pass only the seven permanent headers — x-auth-time is intentionally absent
+	// (models a JWT with no auth_time claim, i.e. authTime == 0).
+	resp := okResponse(map[string]string{
+		domain.HeaderTenantID:      "t1",
+		domain.HeaderUserID:        "u1",
+		domain.HeaderDepartments:   "eng:reviewer",
+		domain.HeaderTenantRoles:   "tenant_admin",
+		domain.HeaderPlan:          "pro",
+		domain.HeaderFeatureFlags:  "",
+		domain.HeaderResidencyMode: "standard",
+	})
+
+	ok := resp.GetOkResponse()
+	assert.Len(t, ok.GetHeaders(), 7, "permanent headers only — x-auth-time absent from decision")
+	assert.Equal(t, []string{domain.HeaderAuthTime}, ok.GetHeadersToRemove(),
+		"x-auth-time must be in HeadersToRemove when absent from decision so Envoy strips any client-supplied copy")
+}
+
+// TestOkResponse_ConditionalHeader_Present_NotInHeadersToRemove verifies the
+// inverse: when x-auth-time IS in the decision (auth_time != 0), it appears in
+// Headers with OVERWRITE action and NOT in HeadersToRemove.
+func TestOkResponse_ConditionalHeader_Present_NotInHeadersToRemove(t *testing.T) {
+	t.Parallel()
+	resp := okResponse(map[string]string{
+		domain.HeaderTenantID: "t1",
+		domain.HeaderAuthTime: "2023-11-03T14:13:20Z",
+	})
+
+	ok := resp.GetOkResponse()
+	assert.Len(t, ok.GetHeaders(), 2)
+	assert.Empty(t, ok.GetHeadersToRemove(),
+		"x-auth-time must NOT be in HeadersToRemove when it is present in the decision")
+	found := map[string]string{}
+	for _, h := range ok.GetHeaders() {
+		found[h.GetHeader().GetKey()] = h.GetHeader().GetValue()
+	}
+	assert.Equal(t, "2023-11-03T14:13:20Z", found[domain.HeaderAuthTime])
+}
+
 func TestOkResponse_HeadersOverwriteClientCopies(t *testing.T) {
 	t.Parallel()
 	resp := okResponse(map[string]string{domain.HeaderPlan: "pro", domain.HeaderTenantRoles: "member"})

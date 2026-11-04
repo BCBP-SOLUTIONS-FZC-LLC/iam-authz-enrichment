@@ -13,7 +13,7 @@ This file provides guidance to Claude Code when working with the **AuthZ Enrichm
 **Key responsibilities:**
 - Evaluate the §3.1 precedence chain (first-failing-check-wins): subject resolution → read-only gate → base role/department policy → tender-ACL overlay → MFA-freshness gate.
 - Cache membership/tenant/tender-ACL context in Valkey with jittered TTLs, serving both the fresh-read and §7 stale-if-error paths from one envelope.
-- Consume 5 SQS queues (membership/user/billing/tenant/tender) — 21 event types total — to evict stale cache entries. Idempotent via `ae:processed:{event_id}`, no publishing. Glue-encoded envelopes decoded by `events.GlueDecodeCodec`. `MembershipRevoked` gets wider eviction (also clears `ae:tender_acl` per user — LLD §16 AE-20). `tenant-authz-q` handles 8 types: TenantConverted, TenantRealmReady, TenantSettingChanged (CD-37), TenantSuspended, TenantReactivated (operator), TenantOffboarded, TrialExpired, TrialReactivated.
+- Consume 5 SQS queues (membership/user/billing/tenant/tender) — 22 event types total — to evict stale cache entries. Idempotent via `ae:processed:{event_id}`, no publishing. Glue-encoded envelopes decoded by `events.GlueDecodeCodec`. `MembershipRevoked` gets wider eviction (also clears `ae:tender_acl` per user — LLD §16 AE-20). `tenant-authz-q` handles 8 types: TenantConverted, TenantRealmReady, TenantSettingChanged (CD-37), TenantSuspended, TenantReactivated (operator), TenantOffboarded, TrialExpired, TrialReactivated.
 
 **Does NOT own:** JWT issuance/validation (Envoy's `jwt_authn` — identity read only from `MetadataContext`, never headers), MFA enrollment, realm/tenant provisioning, durable schema/database, policy-authoring UI, rate limiting, active session revocation, durable delegation data (`iam-delegation`, ADR-0008), tender-ACL persistence (`iam-tender-acl`, ADR-0007 Wave 3 Phase 4 — this service still performs the TAC-4 *check*).
 
@@ -86,7 +86,7 @@ See `.claude/architecture.md` for the full directory tree, shared library detail
 - **`ARCHITECTURE.md`** — layer model, package-dependency graph, request-flow/cache-strategy/event-flow/failure-handling diagrams, key invariants, STRIDE threat model.
 - **`CONTRIBUTING.md`** — branch naming, PR checklist, commit style, step-by-step guides for extending each layer.
 - **`VERSIONING.md`** — SemVer rules for the runtime contract (DenyReason/headers/env vars/values.yaml), image tag scheme, maintainer release checklist.
-- **`api/asyncapi.yaml`** — 5-queue/15-event-type consumer contract. Served at `GET /asyncapi` and `GET /asyncapi.yaml` (DocsConfig-gated).
+- **`api/asyncapi.yaml`** — 5-queue/22-event-type consumer contract. Served at `GET /asyncapi` and `GET /asyncapi.yaml` (DocsConfig-gated).
 - **`.github/SECURITY.md`** — vulnerability reporting scope (identity source, header injection, MFA caching, tenant scoping, fail-closed, log redaction).
 - **`docs/observability/`** — Platform Observability Standard: README, metric-registry.md (generated), migration.md, runbooks.md.
 - **`docs/runbook.md`** — per-alert triage and common startup failure modes.

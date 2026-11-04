@@ -16,23 +16,29 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
 )
 
-// okResponse builds an Allow CheckResponse carrying exactly the six
-// InjectedHeaders values from headers — nothing else. Headers is always
-// server-computed (domain.Decision.Headers, built from cached
-// membership/tenant facts, never from the inbound request) — this is what
-// makes the §8.2 header-spoofing invariant hold structurally, not just by
-// convention. Keys are sorted so the same Decision always serializes
-// identically — map iteration order is otherwise non-deterministic, which
-// would make two functionally-identical responses byte-unequal.
+// okResponse builds an Allow CheckResponse carrying the server-computed
+// headers — nothing else. Headers is always server-computed
+// (domain.Decision.Headers, built from cached membership/tenant facts, never
+// from the inbound request) — this is what makes the §8.2 header-spoofing
+// invariant hold structurally, not just by convention. Keys are sorted so the
+// same Decision always serializes identically — map iteration order is
+// otherwise non-deterministic, which would make two functionally-identical
+// responses byte-unequal.
 //
-// Each header is sent with AppendAction OVERWRITE_IF_EXISTS_OR_ADD, so Envoy
-// replaces any same-named header still on the request instead of adding a
-// second value. Envoy's ext_authz already defaults `append` to false
-// (override) for OkHttpResponse.headers, but the deprecated `append` field
-// and `append_action` have changed semantics across Envoy releases; stating
-// the action makes the overwrite independent of that default. The ingress
-// strip-list (HLD §11.1) removes client copies before ext_authz runs; this
-// is the second layer.
+// Three-layer defence against client header injection (HLD §11.1, AE-SEC-1):
+//
+//  1. Ingress strip-list removes client copies before ext_authz sees the request.
+//  2. OVERWRITE_IF_EXISTS_OR_ADD (below) overwrites any same-named header still
+//     present for the seven permanent headers that are always in the response.
+//     Envoy's ext_authz defaults `append` to false (overwrite) for
+//     OkHttpResponse.headers, but the deprecated `append` field and
+//     `append_action` have changed semantics across Envoy releases; stating the
+//     action makes the overwrite independent of that default.
+//  3. HeadersToRemove (below) explicitly strips conditional headers absent from
+//     this decision (currently only x-auth-time / §16 AE-49). OVERWRITE does
+//     not fire for headers absent from the response map, so without this layer
+//     a client-supplied x-auth-time would pass through to the upstream on any
+//     request whose JWT carries no auth_time claim.
 func okResponse(headers map[string]string) *authv3.CheckResponse {
 	keys := make([]string, 0, len(headers))
 	for k := range headers {
@@ -47,10 +53,23 @@ func okResponse(headers map[string]string) *authv3.CheckResponse {
 			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
 		})
 	}
+
+	// Conditional headers not present in this decision must be explicitly
+	// removed so a client-supplied value cannot pass through to the upstream.
+	var toRemove []string
+	for _, h := range []string{domain.HeaderAuthTime} {
+		if _, present := headers[h]; !present {
+			toRemove = append(toRemove, h)
+		}
+	}
+
 	return &authv3.CheckResponse{
 		Status: &rpcstatus.Status{Code: int32(codes.OK)},
 		HttpResponse: &authv3.CheckResponse_OkResponse{
-			OkResponse: &authv3.OkHttpResponse{Headers: opts},
+			OkResponse: &authv3.OkHttpResponse{
+				Headers:         opts,
+				HeadersToRemove: toRemove,
+			},
 		},
 	}
 }

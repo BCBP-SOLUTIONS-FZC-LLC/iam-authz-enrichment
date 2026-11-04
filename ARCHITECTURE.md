@@ -520,7 +520,7 @@ graph LR
 | Invariant | Where enforced |
 |-----------|----------------|
 | No JWT validation in this service — trust only Envoy-`jwt_authn`-validated claims (`sub`, `iss`, `tenant_id`, `auth_time`) | `internal/adapter/inbound/grpc/claims.go` reads only `Attributes.MetadataContext`, never `Attributes.Request.Http.Headers` |
-| Client-supplied headers that shadow the six output headers are structurally impossible to leak through | `okResponse` builds headers exclusively from `Decision.Headers`, itself built only from cached/fetched domain data — see the header-spoofing regression test in `internal/adapter/inbound/grpc/server_test.go` |
+| Client-supplied headers that shadow the seven output headers (or the conditional `x-auth-time`) are structurally impossible to leak through | `okResponse` builds headers exclusively from `Decision.Headers`, itself built only from cached/fetched domain data — see the header-spoofing regression test in `internal/adapter/inbound/grpc/server_test.go` |
 | `mfa_freshness_seconds` is never cached | No field for it exists on `MembershipContext`/`TenantContext` (compile-time proof) + `internal/domain/mfa_never_cached_test.go` + `internal/usecase/check_test.go` |
 | Every Valkey key and outbound call is tenant-scoped by construction | Key-builder functions in `internal/adapter/outbound/valkey/keys.go` take `tenant` as a mandatory parameter; there is no unscoped key constructor |
 | Only `sub`/`iss` are ever logged, never `auth_time` or other claims | No log call anywhere in this codebase receives those fields as an argument |

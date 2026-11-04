@@ -262,6 +262,15 @@ func run() error {
 		I8Timeout:         cfg.OrgMembershipTimeout,
 		I8ColdTimeout:     cfg.OrgMembershipColdTimeout,
 	})
+	// Log operator-path state at startup so ops can confirm OP-G3 took effect
+	// without having to trigger an operator request and grep for operator_access.
+	if cfg.OperatorRealmIssuer != "" {
+		appLog.Info("operator path enabled — platform_operator tokens accepted", map[string]interface{}{
+			"issuer": cfg.OperatorRealmIssuer,
+		})
+	} else {
+		appLog.Info("operator path disabled — OPERATOR_REALM_ISSUER not set (CD-52 OP-G3 pending)", nil)
+	}
 	invalidator := usecase.NewInvalidator(eventCache, realmMap, restricted, appLog, recorder)
 
 	// 7. gRPC server (primary inbound adapter): panic-recovery -> request-id

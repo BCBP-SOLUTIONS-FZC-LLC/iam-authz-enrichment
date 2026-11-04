@@ -984,6 +984,56 @@ func TestCheck_Allow_DedicatedWorkflowQueue_InFeatureFlags(t *testing.T) {
 	assert.Contains(t, flags, "sso_enabled", "other flags must also be present")
 }
 
+// ─── AE-TND-F1: x-auth-time header (LLD §16 AE-49) ──────────────────────────
+
+func TestCheck_Allow_AuthTime_NonZero_HeaderInjected(t *testing.T) {
+	t.Parallel()
+	// When the JWT contains a non-zero auth_time claim, x-auth-time must be
+	// injected as an RFC 3339 UTC string so Tender Service can populate
+	// mfa_verified_at in approval evidence and TenderDeliverableApproved events.
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.TenantContext{
+		Plan:          "pro",
+		FeatureFlags:  []string{},
+		ResidencyMode: "standard",
+	}, domain.CacheFresh)
+	checker := newTestChecker(cache, &fixtures.FakeOrgMembershipClient{}, nil)
+
+	authTime := time.Date(2026, 10, 29, 14, 32, 0, 0, time.UTC)
+	decision := checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  usecase.Claims{Subject: user, Issuer: dedicatedIssuer, AuthTime: authTime.Unix()},
+		Request: policy.RequestFacts{Method: "GET"},
+	})
+
+	require.True(t, decision.Allow)
+	assert.Equal(t, "2026-10-29T14:32:00Z", decision.Headers[domain.HeaderAuthTime],
+		"x-auth-time must be RFC 3339 UTC when JWT auth_time is non-zero")
+}
+
+func TestCheck_Allow_AuthTime_Zero_HeaderAbsent(t *testing.T) {
+	t.Parallel()
+	// When auth_time is zero (claim absent or epoch), x-auth-time must be omitted
+	// entirely — not set to the empty string or "1970-01-01T00:00:00Z".
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.TenantContext{
+		Plan:          "pro",
+		FeatureFlags:  []string{},
+		ResidencyMode: "standard",
+	}, domain.CacheFresh)
+	checker := newTestChecker(cache, &fixtures.FakeOrgMembershipClient{}, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  usecase.Claims{Subject: user, Issuer: dedicatedIssuer, AuthTime: 0},
+		Request: policy.RequestFacts{Method: "GET"},
+	})
+
+	require.True(t, decision.Allow)
+	_, hasAuthTime := decision.Headers[domain.HeaderAuthTime]
+	assert.False(t, hasAuthTime, "x-auth-time must be absent from Allow headers when auth_time is zero")
+}
+
 // ─── CD-31: deny-code stability (LLD §16 AE-42) ──────────────────────────────
 
 // Pin the exact wire strings for every DenyReason. A future RFC 9457 migration

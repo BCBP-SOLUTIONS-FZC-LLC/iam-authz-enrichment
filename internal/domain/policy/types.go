@@ -26,7 +26,7 @@ const (
 	// ActionEditTenderSection: user must be the current ticket assignee for
 	// the tender section's workflow node.
 	ActionEditTenderSection Action = "edit_tender_section"
-	// ActionOverrideWorkflowAssignee: user must hold tender_admin in the tenant.
+	// ActionOverrideWorkflowAssignee: user must hold tender_admin, tenant_admin, or tenant_owner (TND-Q4, confirmed 2026-11-04).
 	ActionOverrideWorkflowAssignee Action = "override_workflow_assignee"
 	// ActionManageDepartmentMemberships: user must hold tenant_admin or
 	// tenant_owner in the tenant.

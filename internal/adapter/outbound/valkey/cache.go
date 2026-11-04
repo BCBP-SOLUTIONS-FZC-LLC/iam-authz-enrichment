@@ -191,6 +191,13 @@ func (c *Cache) SetTenderACL(ctx context.Context, tenant, tender, user string, v
 	return c.client.Set(ctx, tenderACLKey(tenant, tender, user), b, c.tenderACLTTL).Err()
 }
 
+// EvictTenderACL deletes the single ae:tender_acl:{tenant}:{tender}:{user}
+// entry when all three key components are known (TenderAccessGranted — §16
+// AE-TND-G1). A plain DEL, not SCAN — fast and non-blocking.
+func (c *Cache) EvictTenderACL(ctx context.Context, tenant, tender, user string) error {
+	return c.client.Del(ctx, tenderACLKey(tenant, tender, user)).Err()
+}
+
 // EvictTenderACLForUser best-effort-deletes every ae:tender_acl entry for
 // (tenant, user) across all tenders (§5 UserDeleted). SCAN, not KEYS, to
 // avoid blocking Valkey — this is explicitly a best-effort path, so a partial

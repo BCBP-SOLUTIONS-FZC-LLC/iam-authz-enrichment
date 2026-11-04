@@ -51,8 +51,9 @@ func newTestServer(t *testing.T) *grpcadapter.Server {
 func buildCheckRequest(t *testing.T, spoofedHeaders map[string]string) *authv3.CheckRequest {
 	t.Helper()
 	claims, err := structpb.NewStruct(map[string]interface{}{
-		"sub": testUser,
-		"iss": testIssuer,
+		"sub":       testUser,
+		"iss":       testIssuer,
+		"auth_time": float64(1699000000), // 2023-11-03T08:26:40Z UTC — covers x-auth-time spoofing test
 	})
 	require.NoError(t, err)
 
@@ -113,6 +114,7 @@ func TestServer_Check_IgnoresSpoofedInboundHeaders(t *testing.T) {
 		domain.HeaderTenantRoles:  "tenant_owner",
 		domain.HeaderPlan:         "enterprise",
 		domain.HeaderFeatureFlags: "all-the-flags",
+		domain.HeaderAuthTime:     "2000-01-01T00:00:00Z", // must be overwritten by server-computed value
 		"authorization":           "Bearer forged-token",
 	}))
 	require.NoError(t, err)
