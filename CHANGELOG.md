@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security (2026-11-04 — x-auth-time header-injection vector closed; TenantSettingChanged SNS filter restored)
 
+- **Go 1.26.10 → 1.26.11** (CVE-2026-97054, `net/http`: HTTP/1 `MaxBytesReader` limit handling), flagged by the pre-push / CI Trivy scan of the image: `go` directive and the digest-pinned builder image bumped (same as iam-org-membership).
 - **`x-auth-time` passthrough vector closed.** `okResponse` now populates `HeadersToRemove: ["x-auth-time"]` for requests where the JWT carries no `auth_time` claim. Without this, Envoy would pass a client-supplied `x-auth-time` through to the upstream unmodified — OVERWRITE only fires for headers present in the response map. Three-layer defence documented in `response.go`. Spoofing regression test updated to cover the new header.
 - **`TenantSettingChanged` restored to `tenant-authz-q` SNS filter policy.** The event was present in the channel definition and has a handler (`HandleTenantSettingChanged` → `EvictTenantContext`, CD-37/AE-40) but was absent from the `asyncapi.yaml` SNS `filterPolicy` block. Infrastructure provisioned from that document would never deliver the event, breaking residency-mode eviction.
 
