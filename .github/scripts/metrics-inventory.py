@@ -29,7 +29,7 @@ NOT_EMITTED = {
     "platform_messages_published_total": "consume-only (HLD §5.4)",
     "platform_outbox_pending_events": "no outbox runner",
     "platform_outbox_leased_events": "no outbox runner",
-    "platform_outbox_oldest_pending_age": "no outbox runner",
+    "platform_outbox_oldest_pending_age_seconds": "no outbox runner",
     "platform_outbox_ordering_blocked_events": "no outbox runner",
     "platform_outbox_publish_attempts_total": "no outbox runner",
     "platform_duplicate_messages_total": "dedup is Valkey `SET NX`, not platform-events' inbox (LLD AE-6)",

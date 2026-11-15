@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed (2026-11-04 — TND-Q4 confirmed: `override_workflow_assignee` policy widened, AE-50, LLD rev 1.50)
 
+- **platform-events v2.2.1 → v2.3.0, platform-gincommon → v2.6.0** (governance decision PA-D34): the outbox oldest-pending-age gauge is now `platform_outbox_oldest_pending_age_seconds`. v2.3.0 emits it alongside the deprecated `platform_outbox_oldest_pending_age` (same value) until the sunset (not before 2026-12-15); gincommon v2.6.0's registry has the new entry and flags the old name as deprecated. `docs/observability/metric-registry.md` regenerated (`make metrics-inventory`).
 - **`tenant_admin` and `tenant_owner` are now admitted to the `override_workflow_assignee` policy (§4.2 policy 2).** The HLD seed stated "only if they have `tender_admin` role." The Tender open-items review (TND-Q4, 2026-11-04) confirmed that `tenant_admin` and `tenant_owner` must also be admitted — `tenant_admin` holds tenant-wide administrative authority; `tenant_owner` inherits all `tenant_admin` permissions. The policy predicate (`EvaluateBase` in `internal/domain/policy/policy.go`) and the action comment (`ActionOverrideWorkflowAssignee` in `internal/domain/policy/types.go`) were already correct in code; this entry records the LLD/doc catch-up only. No behavior change, no cache-key change, no header change. LLD §4.2 policy 2, revision history AE-50.
 
 ### Fixed (2026-11-01 — a cold cache miss no longer denies 503, AE-48, LLD rev 1.49)
