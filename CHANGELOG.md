@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Tests (2026-11-19 — OP-G4 coverage for Commercial Billing's operator routes, Billing BL-OQ-9)
+
+- **No code change.** The operator path admits the whole `/api/v1/operator/` prefix, so Billing's routes B-O6..B-O15 need no route list here. New tests pin the behaviour for all 15 Billing operator routes (B-O1..B-O15):
+  - unit: `TestOperator_BillingRoutes_AllowedWithRole` (allowed with `platform_operator`; `x-tenant-id` is the path tenant, or the nil UUID for `/billing/*` routes), `TestOperator_BillingRoutes_DeniedWithoutRole` (`DENY_ROLE_INSUFFICIENT`), `TestOperator_BillingTenantRoutes_MalformedTenantDenied` (`DENY_MALFORMED_IDENTITY`);
+  - e2e (real binary over gRPC): `TestOperator_BillingRoutes`, one subtest per route, allow and deny.
+- LLD v1.50: §8.9.1 OP-G4 lists Billing B-O1..B-O15. The gateway half of OP-G4 still waits on OP-G2 (platform edge) and OP-G3.
+
 ### Security (2026-11-04 — x-auth-time header-injection vector closed; TenantSettingChanged SNS filter restored)
 
 - **Go 1.26.10 → 1.26.11** (CVE-2026-97054, `net/http`: HTTP/1 `MaxBytesReader` limit handling), flagged by the pre-push / CI Trivy scan of the image: `go` directive and the digest-pinned builder image bumped (same as iam-org-membership).
