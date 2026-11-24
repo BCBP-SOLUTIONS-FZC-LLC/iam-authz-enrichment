@@ -39,7 +39,8 @@ Envoy's own `envoy.service.auth.v3.Authorization/Check` proto (from `go-control-
 
 | Version | Status | Image tag | Notes |
 |---------|--------|-----------|-------|
-| `v0.1.0` | **Current** | `ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment:v0.1.0` | Pre-production — no live deployment yet (CHANGELOG's `[0.1.0]` entry), so no support window has started |
+| `v0.2.0` | **Current** | `ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment:v0.2.0` | Pre-production — no live deployment yet, so no support window has started. First release with `api/deny-codes.json` (AE-51) |
+| `v0.1.0` | Superseded | `ghcr.io/bcbp-solutions-fzc-llc/iam-authz-enrichment:v0.1.0` | Pre-production — never deployed |
 | `< v0.1.0` | — | — | No tagged releases before `v0.1.0` |
 
 This service has no formal support-window policy yet, since nothing is running in production against a tagged release. Once a `v1.0.0` ships to a real environment, this section will define how long a superseded major line receives security-only fixes (expect the same platform convention `platform-events` uses: security fixes only, for a period the platform team sets, typically ~6 months after the next major).

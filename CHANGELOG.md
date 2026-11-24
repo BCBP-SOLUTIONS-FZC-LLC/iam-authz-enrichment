@@ -5,6 +5,8 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-11-24
 ### Added (2026-11-24 — `DENY_MEMBER_SUSPENDED` and `api/deny-codes.json`, AE-51, LLD rev 1.51; web-shell asks AZ-2, AZ-3)
 - **New deny reason `DENY_MEMBER_SUSPENDED` (403)** for an I-8 membership with `status: "suspended"`. It was `DENY_UNRESOLVABLE_SUBJECT`, the same code as a non-member, so the frontend could not show A8's "access paused" text. Other non-active statuses are unchanged. The suspended case still evicts the stale `ae:ctx` and writes `ae:neg`; `ae:neg` now holds the deny reason (a pre-upgrade `"1"` reads as `DENY_UNRESOLVABLE_SUBJECT`, so no cache flush is needed on rollout). **Contract:** suspended members now get a different code than before, which VERSIONING.md would class as breaking for a client that branches on `DENY_UNRESOLVABLE_SUBJECT`. It ships as a MINOR bump only because the service is pre-`v1.0.0` (SemVer §4, VERSIONING.md "Pre-v1.0.0"); after `v1` the same change would be MAJOR. Clients should treat both codes as "no access" (web-shell already does; AZ-2).
 - **`api/deny-codes.json`**: every `DENY_*` code with its status, RFC 9457 `type`/`title`/`detail`, `retryable` (the code's usual cause clears on an unchanged retry — only the 503), `action` (`step_up` / `retry_with_backoff` / `none`) and `meaning` (every cause, including the outage cases of `DENY_MFA_STALE` and `DENY_TENDER_ACL_INSUFFICIENT`), for frontend repos to pin by release tag. The binary does not serve it. `TestDenyCodesJSON_MatchesDenyReasons` checks it against `domain.DenyReasons()` and the bodies `deniedResponse` builds.
