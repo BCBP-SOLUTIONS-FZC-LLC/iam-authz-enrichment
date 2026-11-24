@@ -239,6 +239,15 @@ func run() error {
 	// request path keeps cache's single-digit-ms timeouts.
 	eventCache := cache.WithTimeouts(cfg.ValkeyEventTimeout, cfg.ValkeyEventTimeout, cfg.ValkeyEventTimeout)
 	facts := factStore{Cache: cache, writes: eventCache}
+	// Write-guard scripts (LLD §16 AE-51). Not fatal: Valkey may simply be
+	// down at startup, and the request path still works without the cache.
+	// But a Valkey that refuses Lua (ACL without @scripting, a proxy that
+	// blocks EVAL) silently disables every guarded cache write, so say so
+	// loudly here; iam_authz_enrichment_cache_guard_errors_total and
+	// AuthzEnrichmentCacheGuardErrors then show it at runtime.
+	if err := eventCache.LoadScripts(context.Background()); err != nil {
+		appLog.Error("failed to load Valkey write-guard scripts — ae:ctx/ae:tenant/ae:neg/ae:tender_acl will not be cached if Valkey refuses Lua", map[string]interface{}{"error": err.Error()})
+	}
 
 	// 5. Org & Membership + iam-tender-acl client (I-12/GetTenderACL moved to
 	// the latter in ADR-0007 Wave 3 Phase 4 — see orgmembership.New's doc

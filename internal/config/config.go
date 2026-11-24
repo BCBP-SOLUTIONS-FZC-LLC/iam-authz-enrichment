@@ -268,14 +268,26 @@ func Load() (Config, error) {
 	if cfg.AeCtxTTL, err = envDuration("AE_CTX_TTL", 60*time.Second); err != nil {
 		return Config{}, err
 	}
+	// Cache TTLs must be positive (§16 AE-51): the guarded cache writes send
+	// them as a millisecond PX floored at 1ms, so 0 would mean a 1ms entry —
+	// caching silently off — where it once meant "never expires".
+	if cfg.AeCtxTTL <= 0 {
+		return Config{}, fmt.Errorf("AE_CTX_TTL must be positive, got %s", cfg.AeCtxTTL)
+	}
 	if cfg.AeCtxJitter, err = envDuration("AE_CTX_JITTER", 6*time.Second); err != nil {
 		return Config{}, err
 	}
 	if cfg.TenderACLTTL, err = envDuration("AE_TENDER_ACL_TTL", 15*time.Second); err != nil {
 		return Config{}, err
 	}
+	if cfg.TenderACLTTL <= 0 {
+		return Config{}, fmt.Errorf("AE_TENDER_ACL_TTL must be positive, got %s", cfg.TenderACLTTL)
+	}
 	if cfg.NegativeCacheTTL, err = envDuration("AE_NEG_TTL", 5*time.Second); err != nil {
 		return Config{}, err
+	}
+	if cfg.NegativeCacheTTL <= 0 {
+		return Config{}, fmt.Errorf("AE_NEG_TTL must be positive, got %s", cfg.NegativeCacheTTL)
 	}
 	if cfg.RestrictedNegativeTTL, err = envDuration("AE_RESTRICTED_NEG_TTL", 5*time.Second); err != nil {
 		return Config{}, err
@@ -293,6 +305,9 @@ func Load() (Config, error) {
 	}
 	if cfg.StaleIfErrorMaxAge, err = envDuration("AE_STALE_IF_ERROR_MAX_AGE", staleIfErrorHardCap); err != nil {
 		return Config{}, err
+	}
+	if cfg.StaleIfErrorMaxAge < 0 {
+		return Config{}, fmt.Errorf("AE_STALE_IF_ERROR_MAX_AGE must not be negative, got %s", cfg.StaleIfErrorMaxAge)
 	}
 	if cfg.StaleIfErrorMaxAge > staleIfErrorHardCap {
 		cfg.StaleIfErrorMaxAge = staleIfErrorHardCap

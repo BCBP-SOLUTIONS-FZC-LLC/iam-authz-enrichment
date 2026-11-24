@@ -54,7 +54,9 @@ func TestValkey_MembershipContext_RoundTrip_ThenExpires(t *testing.T) {
 	assert.Equal(t, domain.CacheMiss, result)
 
 	want := domain.MembershipContext{Roles: []string{"tenant_admin"}, Departments: []domain.Department{}}
-	require.NoError(t, cache.SetMembershipContext(ctx, tenant, user, want))
+	gen, err := cache.GetSubjectGen(ctx, tenant, user)
+	require.NoError(t, err)
+	require.NoError(t, cache.SetMembershipContext(ctx, tenant, user, want, gen))
 
 	got, result, err := cache.GetMembershipContext(ctx, tenant, user)
 	require.NoError(t, err)
@@ -78,17 +80,19 @@ func TestValkey_NegativeCache_ExpiresIndependently(t *testing.T) {
 
 	hit, err := cache.GetNegative(ctx, tenant, user)
 	require.NoError(t, err)
-	assert.False(t, hit)
+	assert.Empty(t, hit)
 
-	require.NoError(t, cache.SetNegative(ctx, tenant, user))
+	gen, err := cache.GetSubjectGen(ctx, tenant, user) // the deferred EvictNegative of an earlier run leaves a token
+	require.NoError(t, err)
+	require.NoError(t, cache.SetNegative(ctx, tenant, user, domain.DenyMemberSuspended, gen))
 	hit, err = cache.GetNegative(ctx, tenant, user)
 	require.NoError(t, err)
-	assert.True(t, hit)
+	assert.Equal(t, domain.DenyMemberSuspended, hit)
 
 	time.Sleep(200 * time.Millisecond) // past the 150ms negative TTL
 	hit, err = cache.GetNegative(ctx, tenant, user)
 	require.NoError(t, err)
-	assert.False(t, hit, "the negative sentinel must actually expire off Valkey, not just logically")
+	assert.Empty(t, hit, "the negative sentinel must actually expire off Valkey, not just logically")
 }
 
 func TestValkey_EvictTenderACLForUser_ScansAcrossTenders(t *testing.T) {
@@ -96,11 +100,15 @@ func TestValkey_EvictTenderACLForUser_ScansAcrossTenders(t *testing.T) {
 	cache := newTestCache(t)
 	tenant, user := "it-tenant-3", "it-user-3"
 
+	gen, err := cache.GetSubjectGen(ctx, tenant, user)
+	require.NoError(t, err)
+	otherGen, err := cache.GetSubjectGen(ctx, tenant, "other-user")
+	require.NoError(t, err)
 	for _, tender := range []string{"tender-a", "tender-b"} {
-		require.NoError(t, cache.SetTenderACL(ctx, tenant, tender, user, domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelView)}))
+		require.NoError(t, cache.SetTenderACL(ctx, tenant, tender, user, domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelView)}, gen))
 	}
 	// A different user's grant on the same tenant/tender must survive.
-	require.NoError(t, cache.SetTenderACL(ctx, tenant, "tender-a", "other-user", domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelView)}))
+	require.NoError(t, cache.SetTenderACL(ctx, tenant, "tender-a", "other-user", domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelView)}, otherGen))
 
 	require.NoError(t, cache.EvictTenderACLForUser(ctx, tenant, user))
 

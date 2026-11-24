@@ -241,10 +241,22 @@ func formatAuthTime(authTime int64) string {
 }
 
 // sfResult is the value coalesced across concurrent singleflight callers.
+// gen / tgen are the (tenant,user) and tenant write-guard tokens read before
+// the I-8 call (genOK / tgenOK false when they could not be read). They are
+// part of the singleflight key, so every coalesced caller read the same
+// tokens (§16 AE-51).
 type sfResult struct {
 	membership domain.MembershipContext
 	tenant     domain.TenantContext
+	gen        string
+	genOK      bool
+	tgen       string
+	tgenOK     bool
 }
+
+// errValkeyUnreachable stands in for a write-guard token that was never read
+// because Valkey already failed a read on this request.
+var errValkeyUnreachable = errors.New("valkey unreachable: write-guard token not read")
 
 // resolveContext implements §3.1 step 1 together with the read-through
 // cache (§4) and the §7 failure-handling matrix. resolved=false means the
@@ -282,25 +294,67 @@ func (c *Checker) resolveContext(ctx context.Context, tenant, user string) (doma
 	}
 	c.metrics.ObserveCacheHit(false)
 
+	// On a miss, read ae:neg and both write-guard tokens (§16 AE-51)
+	// together: the tokens are only needed before the I-8 call, so a fresh
+	// hit above never pays for them, and running them beside ae:neg adds no
+	// round trip. Once a token exists each read is a plain GET.
+	gen, genErr := "", errValkeyUnreachable
+	tgen, tgenErr := "", errValkeyUnreachable
 	if valkeyReachable {
-		neg, negErr := c.cache.GetNegative(ctx, tenant, user)
+		var (
+			neg    domain.DenyReason
+			negErr error
+			nwg    sync.WaitGroup
+		)
+		nwg.Add(3)
+		go func() {
+			defer nwg.Done()
+			neg, negErr = c.cache.GetNegative(ctx, tenant, user)
+		}()
+		go func() {
+			defer nwg.Done()
+			gen, genErr = c.cache.GetSubjectGen(ctx, tenant, user)
+		}()
+		go func() {
+			defer nwg.Done()
+			tgen, tgenErr = c.cache.GetTenantGen(ctx, tenant)
+		}()
+		nwg.Wait()
+		// A token that cannot be read means the matching cache write is
+		// skipped (it could not be guarded) — say so, or the extra I-8
+		// load that follows has no explanation.
+		if genErr != nil {
+			c.metrics.ObserveCacheGuardError("gen_read")
+			c.log.Warn("failed to read ae:gen; ae:ctx and ae:neg will not be cached",
+				map[string]interface{}{"tenant": tenant, "error": genErr.Error()})
+		}
+		if tgenErr != nil {
+			c.metrics.ObserveCacheGuardError("gen_read")
+			c.log.Warn("failed to read ae:tgen; ae:tenant will not be cached",
+				map[string]interface{}{"tenant": tenant, "error": tgenErr.Error()})
+		}
 		if negErr == nil {
-			c.metrics.ObserveNegativeCacheHit(neg)
-			if neg {
-				return domain.MembershipContext{}, domain.TenantContext{}, domain.DenyUnresolvableSubject, false
+			c.metrics.ObserveNegativeCacheHit(neg != "")
+			if neg != "" {
+				return domain.MembershipContext{}, domain.TenantContext{}, neg, false
 			}
 		}
 	}
-
 	staleAvailable := valkeyReachable && ctxResult != domain.CacheMiss && tenantResult != domain.CacheMiss
 
 	// With no stale entry a failed I-8 is a certain deny, so the call gets
 	// the longer cold deadline. Cold and warm callers coalesce separately:
 	// a cold caller must not inherit a warm call's shorter deadline.
+	//
+	// The write-guard tokens are part of the key (§16 AE-51): a caller that
+	// read a newer token than an in-flight call's leader started after an
+	// eviction the shared answer may predate, so it must not be handed that
+	// answer — it starts (or joins) a call of its own.
 	key, i8Timeout := tenant+":"+user, c.cfg.I8Timeout
 	if !staleAvailable {
 		key, i8Timeout = key+":cold", c.cfg.I8ColdTimeout
 	}
+	key += "|" + gen + "|" + tgen
 	// The shared call must not inherit any one caller's cancellation:
 	// singleflight hands every coalesced caller the first caller's result, so
 	// if Envoy's deadline cancelled that first request, every other request
@@ -317,7 +371,13 @@ func (c *Checker) resolveContext(ctx context.Context, tenant, user string) (doma
 		i8Start := c.now()
 		m, t, sfErr := c.org.GetMemberships(i8Ctx, tenant, user)
 		c.metrics.ObserveI8Latency(c.now().Sub(i8Start))
-		return sfResult{membership: m, tenant: t}, sfErr
+		// The tokens are this closure's captures; every coalesced caller
+		// read the same ones (they are in the key).
+		return sfResult{
+			membership: m, tenant: t,
+			gen: gen, genOK: genErr == nil,
+			tgen: tgen, tgenOK: tgenErr == nil,
+		}, sfErr
 	})
 	if shared {
 		c.metrics.ObserveSingleflightCoalesced()
@@ -326,34 +386,63 @@ func (c *Checker) resolveContext(ctx context.Context, tenant, user string) (doma
 	if err == nil {
 		res := v.(sfResult)
 		if valkeyReachable {
-			if setErr := c.cache.SetMembershipContext(ctx, tenant, user, res.membership); setErr != nil {
-				c.log.Warn("failed to write ae:ctx", map[string]interface{}{"error": setErr.Error()})
+			// Guarded write: skipped if a membership event evicted ae:ctx
+			// while I-8 was answering, so revoked roles are not written back.
+			// With no readable token the write cannot be guarded, so the
+			// roles are not cached and the next request rebuilds.
+			if res.genOK {
+				if setErr := c.cache.SetMembershipContext(ctx, tenant, user, res.membership, res.gen); setErr != nil {
+					c.metrics.ObserveCacheGuardError("guarded_write")
+					c.log.Warn("failed to write ae:ctx", map[string]interface{}{"error": setErr.Error()})
+				}
 			}
-			if setErr := c.cache.SetTenantContext(ctx, tenant, res.tenant); setErr != nil {
-				c.log.Warn("failed to write ae:tenant", map[string]interface{}{"error": setErr.Error()})
+			// Same guard for the tenant slice: a tenant event (a cancellation
+			// turning on read_only, say) that evicted ae:tenant while I-8 was
+			// answering is not undone.
+			if res.tgenOK {
+				if setErr := c.cache.SetTenantContext(ctx, tenant, res.tenant, res.tgen); setErr != nil {
+					c.metrics.ObserveCacheGuardError("guarded_write")
+					c.log.Warn("failed to write ae:tenant", map[string]interface{}{"error": setErr.Error()})
+				}
 			}
 		}
 		return res.membership, res.tenant, "", true
 	}
 
-	if errors.Is(err, domain.ErrNotFound) {
-		if valkeyReachable {
-			if setErr := c.cache.SetNegative(ctx, tenant, user); setErr != nil {
+	// ErrMemberSuspended is checked on its own too, so an adapter that
+	// forgets to join it with ErrNotFound still lands here, never in the §7
+	// outage path below (which could serve a stale ae:ctx and Allow).
+	if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrMemberSuspended) {
+		// §16 AE-51: a suspended member gets their own reason, so the
+		// frontend can tell "access paused" from "not a member". It is
+		// negative-cached as such, so the next 5s of requests agree.
+		reason := domain.DenyUnresolvableSubject
+		if errors.Is(err, domain.ErrMemberSuspended) {
+			reason = domain.DenyMemberSuspended
+		}
+		res := v.(sfResult)
+		if valkeyReachable && res.genOK {
+			if setErr := c.cache.SetNegative(ctx, tenant, user, reason, res.gen); setErr != nil {
+				c.metrics.ObserveCacheGuardError("guarded_write")
 				c.log.Warn("failed to write ae:neg", map[string]interface{}{"error": setErr.Error()})
 			}
-			// An authoritative non-member answer (404, or a non-active
-			// status — AE-47) must also drop any earlier ae:ctx envelope:
-			// O&M emits no event on suspend, so without this the stale
-			// envelope (soft TTL + up to AE_STALE_IF_ERROR_MAX_AGE) keeps
-			// the member's old roles and §7 stale-if-error would Allow
-			// them on the next I-8 outage.
-			if ctxResult != domain.CacheMiss {
-				if evictErr := c.cache.EvictMembershipContext(ctx, tenant, user); evictErr != nil {
-					c.log.Warn("failed to evict ae:ctx", map[string]interface{}{"error": evictErr.Error()})
-				}
+		}
+		// An authoritative non-member answer (404, or a non-active status —
+		// AE-47) must also drop any earlier ae:ctx envelope: O&M emits no
+		// event on suspend, so without this the stale envelope (soft TTL +
+		// up to AE_STALE_IF_ERROR_MAX_AGE) keeps the member's old roles and
+		// §7 stale-if-error would Allow them on the next I-8 outage. This
+		// runs whenever an entry was seen, even if the ae:tenant read failed
+		// (AE-51). An entry that cannot be decoded is deleted by the cache
+		// itself and reads as a miss. If the ae:ctx read itself failed
+		// (a timeout), no blind DEL is sent: under a retrying non-member it
+		// would cost a write per request against an already slow Valkey.
+		if ctxResult != domain.CacheMiss {
+			if evictErr := c.cache.EvictMembershipContext(ctx, tenant, user); evictErr != nil {
+				c.log.Warn("failed to evict ae:ctx", map[string]interface{}{"error": evictErr.Error()})
 			}
 		}
-		return domain.MembershipContext{}, domain.TenantContext{}, domain.DenyUnresolvableSubject, false
+		return domain.MembershipContext{}, domain.TenantContext{}, reason, false
 	}
 
 	// Sibling unreachable (§7). ErrNotFound handled above; anything else —
@@ -390,6 +479,15 @@ func (c *Checker) resolveTenderACL(ctx context.Context, tenant, tenderID, user s
 	if acl, hit, err := c.cache.GetTenderACL(ctx, tenant, tenderID, user); err == nil && hit {
 		return acl, nil
 	}
+	// §16 AE-51: read the write-guard token before TAC-4 answers, so a
+	// tender-access event that evicts during the call is not undone. Only on
+	// a miss, where the TAC-4 round trip dominates anyway.
+	gen, genErr := c.cache.GetSubjectGen(ctx, tenant, user)
+	if genErr != nil {
+		c.metrics.ObserveCacheGuardError("gen_read")
+		c.log.Warn("failed to read ae:gen; ae:tender_acl will not be cached",
+			map[string]interface{}{"tenant": tenant, "error": genErr.Error()})
+	}
 	i12Ctx, i12Span := tracer.Start(ctx, "authz.i12_call")
 	i12Start := c.now()
 	acl, err := c.org.GetTenderACL(i12Ctx, tenant, tenderID, user)
@@ -398,8 +496,11 @@ func (c *Checker) resolveTenderACL(ctx context.Context, tenant, tenderID, user s
 	if err != nil {
 		return domain.TenderACL{}, fmt.Errorf("tender acl rebuild: %w", err)
 	}
-	if setErr := c.cache.SetTenderACL(ctx, tenant, tenderID, user, acl); setErr != nil {
-		c.log.Warn("failed to write ae:tender_acl", map[string]interface{}{"error": setErr.Error()})
+	if genErr == nil {
+		if setErr := c.cache.SetTenderACL(ctx, tenant, tenderID, user, acl, gen); setErr != nil {
+			c.metrics.ObserveCacheGuardError("guarded_write")
+			c.log.Warn("failed to write ae:tender_acl", map[string]interface{}{"error": setErr.Error()})
+		}
 	}
 	return acl, nil
 }

@@ -125,3 +125,48 @@ func TestOperator_Denials(t *testing.T) {
 		})
 	}
 }
+
+// OP-G4 coverage for Commercial Billing's operator routes B-O1..B-O15 (Billing
+// LLD §5.3, BL-OQ-9), through the real binary. No route list exists in this
+// service: the whole /api/v1/operator/ prefix is admitted, so this pins that
+// each Billing path is allowed with the right x-tenant-id.
+func TestOperator_BillingRoutes(t *testing.T) {
+	const runID = "0193a8f0-1c2d-7e3f-9a4b-5c6d7e8f9a0b"
+	routes := []struct {
+		id, method, path string
+		tenantInPath     bool
+	}{
+		{"B-O1", "POST", "/api/v1/operator/tenants/" + e2eOperatorTenant + "/conversions", true},
+		{"B-O2", "POST", "/api/v1/operator/tenants/" + e2eOperatorTenant + "/adjustments", true},
+		{"B-O3", "POST", "/api/v1/operator/tenants/" + e2eOperatorTenant + "/refunds", true},
+		{"B-O4", "GET", "/api/v1/operator/tenants/" + e2eOperatorTenant + "/invoices", true},
+		{"B-O5", "POST", "/api/v1/operator/billing/reconciliation-runs", false},
+		{"B-O6", "GET", "/api/v1/operator/billing/reconciliation-runs/" + runID, false},
+		{"B-O7", "GET", "/api/v1/operator/tenants/" + e2eOperatorTenant + "/subscription", true},
+		{"B-O8", "POST", "/api/v1/operator/tenants/" + e2eOperatorTenant + "/conversion-reversals", true},
+		{"B-O9", "POST", "/api/v1/operator/tenants/" + e2eOperatorTenant + "/conversion-sagas/" + runID + "/actions", true},
+		{"B-O10", "PUT", "/api/v1/operator/tenants/" + e2eOperatorTenant + "/collection-pause", true},
+		{"B-O11", "POST", "/api/v1/operator/billing/plan-prices", false},
+		{"B-O12", "POST", "/api/v1/operator/billing/token-packs", false},
+		{"B-O13", "POST", "/api/v1/operator/billing/webhook-events/stripe/evt_1QabcDEF/replay", false},
+		{"B-O14", "POST", "/api/v1/operator/billing/provider-certifications", false},
+		{"B-O15", "POST", "/api/v1/operator/billing/provider-certifications/" + runID + "/revoke", false},
+	}
+	for _, r := range routes {
+		t.Run(r.id, func(t *testing.T) {
+			resp := doCheck(t, buildOperatorRequest(t, r.method, r.path, "platform_operator"))
+			require.NotNil(t, resp.GetOkResponse(), "expected Allow, got %q", denyReason(resp))
+			want := "00000000-0000-0000-0000-000000000000"
+			if r.tenantInPath {
+				want = e2eOperatorTenant
+			}
+			h := headerMap(resp)
+			require.Equal(t, want, h["x-tenant-id"])
+			require.Equal(t, "platform_operator", h["x-tenant-roles"])
+
+			denied := doCheck(t, buildOperatorRequest(t, r.method, r.path))
+			require.Nil(t, denied.GetOkResponse())
+			require.Equal(t, "DENY_ROLE_INSUFFICIENT", denyReason(denied))
+		})
+	}
+}

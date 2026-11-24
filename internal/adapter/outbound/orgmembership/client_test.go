@@ -3,6 +3,7 @@ package orgmembership_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -643,11 +644,18 @@ func TestGetTenderACL_503ServiceUnavailable_ReturnsErrUnavailable(t *testing.T) 
 // like a 404 and never caches the member's roles.
 func TestGetMemberships_NonActiveStatus_IsNotFound(t *testing.T) {
 	t.Parallel()
-	for _, body := range []string{
-		`{"status":"suspended","roles":["tenant_admin"],"plan":"pro","subscription_status":"active"}`,
-		`{"status":"left","roles":[],"plan":"pro","subscription_status":"active"}`,
-		`{"roles":["tenant_admin"],"plan":"pro","subscription_status":"active"}`,
+	for _, tc := range []struct {
+		body          string
+		wantSuspended bool
+	}{
+		{`{"status":"suspended","roles":["tenant_admin"],"plan":"pro","subscription_status":"active"}`, true},
+		{`{"status":"Suspended","roles":[],"plan":"pro","subscription_status":"active"}`, false},
+		{`{"status":"ACTIVE","roles":["tenant_admin"],"plan":"pro","subscription_status":"active"}`, false},
+		{`{"status":"left","roles":[],"plan":"pro","subscription_status":"active"}`, false},
+		{`{"status":"left","roles":[],"plan":"pro","subscription_status":"suspended"}`, false},
+		{`{"roles":["tenant_admin"],"plan":"pro","subscription_status":"active"}`, false},
 	} {
+		body := tc.body
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(body))
@@ -656,6 +664,8 @@ func TestGetMemberships_NonActiveStatus_IsNotFound(t *testing.T) {
 		m, _, err := client.GetMemberships(context.Background(), "tenant-1", "user-1")
 		srv.Close()
 		require.ErrorIs(t, err, domain.ErrNotFound, body)
+		assert.Equal(t, tc.wantSuspended, errors.Is(err, domain.ErrMemberSuspended),
+			"only status suspended carries ErrMemberSuspended (AE-51): %s", body)
 		assert.Empty(t, m.Roles, body)
 	}
 }

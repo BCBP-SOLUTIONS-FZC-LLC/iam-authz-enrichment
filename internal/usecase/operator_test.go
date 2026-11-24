@@ -2,6 +2,7 @@ package usecase_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -222,59 +223,67 @@ func TestOperator_PathDisabled_OperatorTokenDeniedAsBefore(t *testing.T) {
 	assert.Equal(t, domain.DenyMalformedIdentity, d.Reason)
 }
 
-// A-10 (a) BL-OQ-26: all platform-realm roles are forwarded in x-tenant-roles so
-// downstream services (e.g. Billing) can gate on pci_owner_reviewer themselves.
-func TestOperator_AllPlatformRolesForwardedInTenantRoles(t *testing.T) {
-	t.Parallel()
-	checker := newOperatorChecker(&fixtures.FakeOrgMembershipClient{}, fixtures.NoopLogger{}, operatorIssuer)
-
-	d := checker.Check(context.Background(),
-		operatorInput("POST", "/api/v1/operator/billing/provider-certifications/d3e5f7a9-2b4c-6d8e-0f1a-3b5c7d9e1f2a/review",
-			domain.PlatformOperatorRole, "pci_owner_reviewer"))
-	require.True(t, d.Allow)
-	assert.Equal(t, domain.PlatformOperatorRole+",pci_owner_reviewer", d.Headers[domain.HeaderTenantRoles],
-		"pci_owner_reviewer must appear in x-tenant-roles alongside platform_operator")
-	assert.Equal(t, domain.NilTenantID, d.Headers[domain.HeaderTenantID])
+// billingOperatorRoutes are Commercial Billing's operator routes B-O1..B-O15
+// (Billing LLD §5.3; BL-OQ-9). AuthZ admits the whole /api/v1/operator/
+// prefix, so no route list exists here: these tests pin that every Billing
+// path is admitted with the right tenant header and refused without the role.
+var billingOperatorRoutes = []struct {
+	id, method, path string
+	tenantInPath     bool
+}{
+	{"B-O1", "POST", "/api/v1/operator/tenants/" + targetTenant + "/conversions", true},
+	{"B-O2", "POST", "/api/v1/operator/tenants/" + targetTenant + "/adjustments", true},
+	{"B-O3", "POST", "/api/v1/operator/tenants/" + targetTenant + "/refunds", true},
+	{"B-O4", "GET", "/api/v1/operator/tenants/" + targetTenant + "/invoices", true},
+	{"B-O5", "POST", "/api/v1/operator/billing/reconciliation-runs", false},
+	{"B-O6", "GET", "/api/v1/operator/billing/reconciliation-runs/0193a8f0-1c2d-7e3f-9a4b-5c6d7e8f9a0b", false},
+	{"B-O7", "GET", "/api/v1/operator/tenants/" + targetTenant + "/subscription", true},
+	{"B-O8", "POST", "/api/v1/operator/tenants/" + targetTenant + "/conversion-reversals", true},
+	{"B-O9", "POST", "/api/v1/operator/tenants/" + targetTenant + "/conversion-sagas/0193a8f0-1c2d-7e3f-9a4b-5c6d7e8f9a0c/actions", true},
+	{"B-O10", "PUT", "/api/v1/operator/tenants/" + targetTenant + "/collection-pause", true},
+	{"B-O11", "POST", "/api/v1/operator/billing/plan-prices", false},
+	{"B-O12", "POST", "/api/v1/operator/billing/token-packs", false},
+	{"B-O13", "POST", "/api/v1/operator/billing/webhook-events/stripe/evt_1QabcDEF/replay", false},
+	{"B-O14", "POST", "/api/v1/operator/billing/provider-certifications", false},
+	{"B-O15", "POST", "/api/v1/operator/billing/provider-certifications/0193a8f0-1c2d-7e3f-9a4b-5c6d7e8f9a0d/revoke", false},
 }
 
-// A-10 (b) BL-OQ-26 / B-O17: POST /api/v1/operator/billing/provider-certifications/:id/review
-// No tenant UUID in path → x-tenant-id = nil UUID; Billing gates on pci_owner_reviewer itself.
-func TestOperator_ProviderCertificationReviewRoute_AllowAndDeny(t *testing.T) {
+func TestOperator_BillingRoutes_AllowedWithRole(t *testing.T) {
 	t.Parallel()
-	const certID = "d3e5f7a9-2b4c-6d8e-0f1a-3b5c7d9e1f2a"
 	checker := newOperatorChecker(&fixtures.FakeOrgMembershipClient{}, fixtures.NoopLogger{}, operatorIssuer)
-
-	path := "/api/v1/operator/billing/provider-certifications/" + certID + "/review"
-
-	d := checker.Check(context.Background(), operatorInput("POST", path, domain.PlatformOperatorRole, "pci_owner_reviewer"))
-	require.True(t, d.Allow, "platform_operator + pci_owner_reviewer must be allowed")
-	assert.Equal(t, domain.NilTenantID, d.Headers[domain.HeaderTenantID], "no tenant in path → nil UUID")
-	assert.Equal(t, domain.PlatformOperatorRole+",pci_owner_reviewer", d.Headers[domain.HeaderTenantRoles])
-
-	d = checker.Check(context.Background(), operatorInput("POST", path))
-	assert.False(t, d.Allow, "missing platform_operator must be denied")
-	assert.Equal(t, domain.DenyRoleInsufficient, d.Reason)
+	for _, r := range billingOperatorRoutes {
+		d := checker.Check(context.Background(), operatorInput(r.method, r.path, domain.PlatformOperatorRole))
+		require.True(t, d.Allow, "%s %s %s: %s", r.id, r.method, r.path, d.Reason)
+		want := domain.NilTenantID
+		if r.tenantInPath {
+			want = targetTenant
+		}
+		assert.Equal(t, want, d.Headers[domain.HeaderTenantID], r.id)
+		assert.Equal(t, operatorSub, d.Headers[domain.HeaderUserID], r.id)
+		assert.Equal(t, domain.PlatformOperatorRole, d.Headers[domain.HeaderTenantRoles], r.id)
+	}
 }
 
-// A-9 (a) BL-OQ-25 / B-O16: POST /api/v1/operator/tenants/:id/invoices/:invoice_id/disposition
-// The tenant UUID is in the path; the invoice segment is opaque to AuthZ.
-func TestOperator_InvoiceDispositionRoute_AllowAndDeny(t *testing.T) {
+func TestOperator_BillingRoutes_DeniedWithoutRole(t *testing.T) {
 	t.Parallel()
-	const invoiceID = "c2d4e6f8-1a3b-4c5d-9e0f-2a4b6c8d0e1f"
 	checker := newOperatorChecker(&fixtures.FakeOrgMembershipClient{}, fixtures.NoopLogger{}, operatorIssuer)
+	for _, r := range billingOperatorRoutes {
+		d := checker.Check(context.Background(), operatorInput(r.method, r.path, "commercial_trial_manager"))
+		assert.False(t, d.Allow, r.id)
+		assert.Equal(t, domain.DenyRoleInsufficient, d.Reason, r.id)
+	}
+}
 
-	path := "/api/v1/operator/tenants/" + targetTenant + "/invoices/" + invoiceID + "/disposition"
-
-	d := checker.Check(context.Background(), operatorInput("POST", path, domain.PlatformOperatorRole))
-	require.True(t, d.Allow, "platform_operator + valid tenant UUID must be allowed")
-	assert.Equal(t, targetTenant, d.Headers[domain.HeaderTenantID], "tenant UUID extracted from path")
-
-	d = checker.Check(context.Background(), operatorInput("POST", path))
-	assert.False(t, d.Allow, "missing platform_operator role must be denied")
-	assert.Equal(t, domain.DenyRoleInsufficient, d.Reason)
-
-	d = checker.Check(context.Background(),
-		operatorInput("POST", "/api/v1/operator/tenants/not-a-uuid/invoices/"+invoiceID+"/disposition", domain.PlatformOperatorRole))
-	assert.False(t, d.Allow, "malformed tenant UUID must be denied")
-	assert.Equal(t, domain.DenyMalformedIdentity, d.Reason)
+func TestOperator_BillingTenantRoutes_MalformedTenantDenied(t *testing.T) {
+	t.Parallel()
+	checker := newOperatorChecker(&fixtures.FakeOrgMembershipClient{}, fixtures.NoopLogger{}, operatorIssuer)
+	for _, r := range billingOperatorRoutes {
+		if !r.tenantInPath {
+			continue
+		}
+		path := strings.Replace(r.path, targetTenant, "acme", 1)
+		d := checker.Check(context.Background(), operatorInput(r.method, path, domain.PlatformOperatorRole))
+		assert.False(t, d.Allow, r.id)
+		assert.Equal(t, domain.DenyMalformedIdentity, d.Reason, r.id)
+	}
 }

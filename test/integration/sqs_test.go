@@ -86,7 +86,9 @@ func TestSQS_MembershipConsumer_EndToEnd(t *testing.T) {
 
 	cache := newTestCache(t)
 	tenant, user := "it-sqs-tenant-1", "it-sqs-user-1"
-	require.NoError(t, cache.SetMembershipContext(context.Background(), tenant, user, domain.MembershipContext{Roles: []string{"x"}}))
+	gen, err := cache.GetSubjectGen(context.Background(), tenant, user)
+	require.NoError(t, err)
+	require.NoError(t, cache.SetMembershipContext(context.Background(), tenant, user, domain.MembershipContext{Roles: []string{"x"}}, gen))
 
 	inv := usecase.NewInvalidator(cache, usecase.NewRealmMap(nil, 5*time.Second), usecase.NewRestrictedTenderSet(5*time.Second), fixtures.NoopLogger{})
 	c, err := consumer.NewMembershipConsumer(qURL, shortPollDeps(client, cache, inv), events.WithVisibilityTimeout(time.Second))

@@ -1,0 +1,87 @@
+{
+  "$comment": "Every DENY_* errorCode the iam-authz-enrichment gateway filter returns, with its HTTP status and RFC 9457 problem type/title/detail. Checked against internal/domain/decision.go and the bodies the gateway sends by TestDenyCodesJSON_MatchesDenyReasons. Pin by release tag. Adding a code that no existing deny moves to is a MINOR change; renaming or removing a code, or moving an existing cause to a different code, is MAJOR once the service is v1 (VERSIONING.md; DENY_MEMBER_SUSPENDED moved suspended members off DENY_UNRESOLVABLE_SUBJECT and shipped as MINOR only under the pre-v1 rule). 'retryable' means the code's usual cause clears if the same request is sent again unchanged. 'action' is what the client should do for that usual cause: step_up (prompt=login with max_age, then retry), retry_with_backoff, or none (show the denial; do not loop). 'meaning' lists every cause, including the less usual ones.",
+  "contentType": "application/problem+json",
+  "retryAfterHeader": false,
+  "codes": [
+    {
+      "errorCode": "DENY_MALFORMED_IDENTITY",
+      "status": 401,
+      "type": "https://errors.company.com/platform/unauthorized",
+      "title": "Unauthorized",
+      "detail": "The request has no valid identity.",
+      "retryable": false,
+      "action": "none",
+      "meaning": "The request's identity or route cannot be evaluated: no verified subject, a token whose issuer maps to no tenant, an operator token with a non-UUID subject or a bad tenant segment in an /api/v1/operator/* path, or a tender-scoped route with no tender id. A token from a tenant's new dedicated realm can also get it for a short time right after a trial-to-paid conversion, until the gateway learns the new realm; a retry a few seconds later can then succeed. Signing in again does not fix any of these (an expired or invalid token is rejected by the gateway's JWT check before this filter, with its own 401), so do not redirect to sign-in in a loop: show an error."
+    },
+    {
+      "errorCode": "DENY_UNRESOLVABLE_SUBJECT",
+      "status": 403,
+      "type": "https://errors.company.com/platform/forbidden",
+      "title": "Forbidden",
+      "detail": "The caller is not an active member of this tenant.",
+      "retryable": false,
+      "action": "none",
+      "meaning": "The caller has no membership in the token's tenant (never a member, removed, or any non-active status except suspended). While a deploy of the AE-51 version is rolling out, an older replica can also send this for a suspended member."
+    },
+    {
+      "errorCode": "DENY_MEMBER_SUSPENDED",
+      "status": 403,
+      "type": "https://errors.company.com/platform/forbidden",
+      "title": "Forbidden",
+      "detail": "The caller's membership in this tenant is suspended.",
+      "retryable": false,
+      "action": "none",
+      "meaning": "The caller's membership exists but is suspended. Not retryable for that cause. One exception: a member reactivated moments ago can still get it for up to the gateway's negative-cache TTL (AE_NEG_TTL, 5 s by default), because no event clears that cache on reactivation. A client may check once more after that window before showing a lasting 'access paused' screen."
+    },
+    {
+      "errorCode": "DENY_TENANT_READ_ONLY",
+      "status": 403,
+      "type": "https://errors.company.com/platform/forbidden",
+      "title": "Forbidden",
+      "detail": "The tenant is read-only; changes are not allowed.",
+      "retryable": false,
+      "action": "none",
+      "meaning": "A POST, PUT, PATCH or DELETE on a cancelled (read-only) tenant. Never sent on GET or HEAD."
+    },
+    {
+      "errorCode": "DENY_ROLE_INSUFFICIENT",
+      "status": 403,
+      "type": "https://errors.company.com/platform/forbidden",
+      "title": "Forbidden",
+      "detail": "The caller's role does not allow this action.",
+      "retryable": false,
+      "action": "none",
+      "meaning": "The caller's tenant roles or department levels do not allow the action. On the operator path, also sent for a platform-realm token used outside /api/v1/operator/* or without the platform_operator role."
+    },
+    {
+      "errorCode": "DENY_TENDER_ACL_INSUFFICIENT",
+      "status": 403,
+      "type": "https://errors.company.com/platform/forbidden",
+      "title": "Forbidden",
+      "detail": "The caller does not have the access level this tender requires.",
+      "retryable": false,
+      "action": "none",
+      "meaning": "The caller's access level on this tender is too low. Also sent when the tender access check is unavailable (it fails closed for that tender only), so a retry later can succeed."
+    },
+    {
+      "errorCode": "DENY_MFA_STALE",
+      "status": 403,
+      "type": "https://errors.company.com/platform/forbidden",
+      "title": "Forbidden",
+      "detail": "This action needs a recent multi-factor sign-in.",
+      "retryable": false,
+      "action": "step_up",
+      "meaning": "An approver action without a recent MFA sign-in: step up, then retry. Also sent when the MFA-freshness check itself is unavailable; if it comes back right after a fresh step-up, retry later instead of prompting again."
+    },
+    {
+      "errorCode": "DENY_SERVICE_UNAVAILABLE",
+      "status": 503,
+      "type": "https://errors.company.com/platform/service-unavailable",
+      "title": "Service Unavailable",
+      "detail": "Authorization is temporarily unavailable. Retry later.",
+      "retryable": true,
+      "action": "retry_with_backoff",
+      "meaning": "The authorization system itself is degraded. Retry with backoff."
+    }
+  ]
+}

@@ -156,7 +156,7 @@ env:
   #   MEMBERSHIP_AUTHZ_QUEUE_URL blank → role/dept/membership changes never evict ae:ctx
   #   USER_AUTHZ_QUEUE_URL        blank → user email changes and deletes never evict ae:ctx
   #   BILLING_AUTHZ_QUEUE_URL     blank → plan/subscription changes never evict ae:tenant
-  #   TENANT_AUTHZ_QUEUE_URL      blank → realm→tenant map never updated (DENY_UNRESOLVABLE_SUBJECT
+  #   TENANT_AUTHZ_QUEUE_URL      blank → realm→tenant map never updated (DENY_MALFORMED_IDENTITY
   #                                        for all dedicated-realm tenants after conversion)
   #   TENDER_AUTHZ_QUEUE_URL      blank → RestrictedTenderSet never populated (tender-ACL
   #                                        overlay silently skipped for all restricted tenders)

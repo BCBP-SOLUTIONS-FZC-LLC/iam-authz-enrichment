@@ -331,6 +331,21 @@ per-URL streak tracking above (two aliases racing to update/reset the same
 counter every poll), permanently masking a stuck consumer on that URL.
 Fix the duplicated env var to point at its own distinct queue.
 
+## Suspended member alternates between `DENY_MEMBER_SUSPENDED` and `DENY_UNRESOLVABLE_SUBJECT`
+
+Expected only while a rollout to LLD v1.51 (AE-51) is in progress. Replicas
+from before AE-51 deny a suspended member `DENY_UNRESOLVABLE_SUBJECT`, and read
+any `ae:neg` value, including the reason a new replica wrote, as a plain
+non-member. New replicas answer `DENY_MEMBER_SUSPENDED`. No action: it settles
+when every pod runs the new version.
+
+The `ae:gen` / `ae:tgen` write guards (an event can't be undone by a rebuild
+already in flight) also only work once every pod runs v1.51: old pods evict
+with a plain `DEL` and write unguarded. Until then a revoke that
+races a rebuild can leave the old roles cached for up to `AE_CTX_TTL`, as
+before the fix. If it persists after the rollout, check
+that no old ReplicaSet is still serving.
+
 ## Log line: `no tenant-resolution path configured` (warning, at startup)
 
 Neither `SHARED_REALM_ISSUER` nor `REALM_TENANT_MAP_SEED` resolve any

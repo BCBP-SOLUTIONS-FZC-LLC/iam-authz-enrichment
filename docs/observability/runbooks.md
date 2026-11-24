@@ -91,6 +91,18 @@ Common starting points:
 
 **Mitigate.** Size Valkey for the working set, or correct the TTL. A short dip after a bulk event recovers on its own.
 
+### AuthzEnrichmentCacheGuardErrors
+
+**Meaning.** `iam_authz_enrichment_cache_guard_errors_total` has been increasing for 10 minutes. Every cache write that stores a sibling's answer (`ae:ctx`, `ae:tenant`, `ae:neg`, `ae:tender_acl`) runs through a Lua script guarded by an `ae:gen` / `ae:tgen` token (LLD §16 AE-51). `op="gen_read"`: a token could not be read, so the write was skipped. `op="guarded_write"`: the guarded write itself failed. Either way the entry is not cached, so every miss reaches Org & Membership or iam-tender-acl and `AuthzEnrichmentCacheHitRatioLow` usually follows.
+
+**Triage.**
+1. Search the logs for `failed to load Valkey write-guard scripts` at pod start and `failed to read ae:gen` / `failed to write ae:` at runtime; the error text names the cause.
+2. `NOPERM` / `NOSCRIPT` / "unknown command": the Valkey ACL or a proxy refuses Lua. The service user needs `@scripting` (`EVAL`, `EVALSHA`, `SCRIPT LOAD`).
+3. `OOM command not allowed`: Valkey is at `maxmemory` with `noeviction`. Free memory or raise the limit.
+4. Timeouts only: Valkey is slow; check its latency and `VALKEY_READ_TIMEOUT` / `VALKEY_WRITE_TIMEOUT`.
+
+**Mitigate.** Grant scripting or fix the Valkey capacity problem. Decisions stay correct meanwhile; only caching is lost.
+
 ## Events
 
 ### AuthzEnrichmentDLQForwards

@@ -2,7 +2,7 @@
 
 This document describes the internal structure, dependency rules, and runtime data flows of `iam-authz-enrichment`.
 
-`iam-authz-enrichment` is a **private, stateless Go service** (`github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment`, Go 1.26.10+) deployed as a containerised microservice (5–20 replicas, HPA on RPS). It implements Envoy's `ext_authz` v3 gRPC interface — the Policy Decision Point for every authenticated request on the platform. It owns no durable database: it is a Valkey-backed read-through cache in front of the Org & Membership service, plus policy logic expressed as plain Go predicate functions (no OPA/Rego, §3).
+`iam-authz-enrichment` is a **private, stateless Go service** (`github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment`, Go 1.26.11+) deployed as a containerised microservice (5–20 replicas, HPA on RPS). It implements Envoy's `ext_authz` v3 gRPC interface — the Policy Decision Point for every authenticated request on the platform. It owns no durable database: it is a Valkey-backed read-through cache in front of the Org & Membership service, plus policy logic expressed as plain Go predicate functions (no OPA/Rego, §3).
 
 ---
 
@@ -40,7 +40,7 @@ graph TD
     end
 
     subgraph adapters_out["Outbound Adapters  —  internal/adapter/outbound/"]
-        valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
+        valkey_a["valkey/\nCache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:gen · ae:tgen · ae:processed\na single jittered-TTL envelope serves both the normal fresh-read\npath and the §7 stale-if-error fallback — no second shadow key"]
         org_a["orgmembership/\nClient — I-8 memberships + I-14 mfa-freshness against Org & Membership,\nTAC-4 tender-acl (formerly I-12) against iam-tender-acl since ADR-0007\nWave 3 Phase 4 — two base URLs/timeouts, one Go package\n(I-14 is called ONLY from the MFA gate — its result is never\npassed to anything that writes a cache key, §4.4)"]
         metrics_a["metrics/\nRecorder — Prometheus iam_authz_enrichment_* series (§10),\nbuilt via gincommon's registry-validated constructors\non an injectable Registerer for test isolation\nincl. tac4_errors_total (TAC-4 outage vs policy denial),\neviction_errors_total (best-effort SCAN failure)"]
         postgres_a["postgres/\nplatform-pgcommon DSN / PoolConfig / Zap logger /\ngincommon.NewSpanTracer / OpenPool wrapper — no live pool (HLD §5.4)"]
@@ -172,16 +172,16 @@ sequenceDiagram
                 Cache -->> Checker: Miss / Stale / connection error
 
                 alt Valkey reachable and ae:neg hit
-                    Checker -->> Server: Denied — DENY_UNRESOLVABLE_SUBJECT
+                    Checker -->> Server: Denied — the cached reason (DENY_UNRESOLVABLE_SUBJECT or DENY_MEMBER_SUSPENDED)
                     Note over Checker,Cache: §4.3 — collapses the repeat rebuild call<br/>without ever calling Org & Membership
                 else no negative-cache short-circuit
                     Checker ->> Org: GetMemberships(tenant, user)
                     Note over Checker,Org: singleflight-coalesced — concurrent callers<br/>for the same (tenant,user) share one call (§4.5),<br/>run on context.WithoutCancel so one cancelled caller<br/>can't fail the rest (bounded by ORG_MEMBERSHIP_TIMEOUT)
 
-                    alt 404 (ErrNotFound)
-                        Org -->> Checker: not found
-                        Checker ->> Cache: SetNegative (best-effort)
-                        Checker -->> Server: Denied — DENY_UNRESOLVABLE_SUBJECT
+                    alt 404 or non-active status (ErrNotFound)
+                        Org -->> Checker: not found / not active
+                        Checker ->> Cache: SetNegative(reason) (best-effort)
+                        Checker -->> Server: Denied — DENY_MEMBER_SUSPENDED if status suspended (AE-51), else DENY_UNRESOLVABLE_SUBJECT
                     else success
                         Org -->> Checker: MembershipContext + TenantContext
                         Checker ->> Cache: SetMembershipContext + SetTenantContext (best-effort)
@@ -243,7 +243,8 @@ sequenceDiagram
 
 | Step | Check | DenyReason | Status |
 |------|-------|-----------|--------|
-| 1 | Subject resolution (membership rebuild 404) | `DENY_UNRESOLVABLE_SUBJECT` | 403 |
+| 1 | Subject resolution (membership rebuild 404, or any non-active status) | `DENY_UNRESOLVABLE_SUBJECT` | 403 |
+| 1 | Subject resolution (membership `status: suspended`, LLD §8.2.1 / AE-51) | `DENY_MEMBER_SUSPENDED` | 403 |
 | 2 | Subscription read-only enforcement | `DENY_TENANT_READ_ONLY` | 403 |
 | 3 | Base role/department policy | `DENY_ROLE_INSUFFICIENT` | 403 |
 | 4 | Tender-ACL overlay (only if step 3 allows, tender flagged restricted) | `DENY_TENDER_ACL_INSUFFICIENT` | 403 |
@@ -267,7 +268,8 @@ flowchart TD
         k1["ae:ctx:{tenant}:{user} → MembershipContext (roles, departments)\nsoft TTL 60s ± 6s jitter · physical TTL = soft + 5m grace"]
         k2["ae:tenant:{tenant} → TenantContext (plan, feature_flags, subscription_status, read_only)\nsplit from ae:ctx so a tenant-wide event is ALWAYS a single-key eviction, never a SCAN\nsame soft-TTL/grace envelope as ae:ctx"]
         k3["ae:tender_acl:{tenant}:{tender}:{user} → TenderACL{has_access, access_level: *string}\nflat 15s TTL — half the sibling's own 30s TTL — no stale-if-error branch\naccess_level is *string: nil when absent (HasAccess=false), non-nil on a grant"]
-        k4["ae:neg:{tenant}:{user} → sentinel — subject rebuild returned 404\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
+        k4["ae:neg:{tenant}:{user} → deny reason — subject rebuild found no active member\n(DENY_UNRESOLVABLE_SUBJECT or DENY_MEMBER_SUSPENDED, AE-51)\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
+        k4b["ae:gen:{tenant}:{user} / ae:tgen:{tenant} → random write-guard token, 1h TTL (AE-51)\nreplaced by every eviction of ae:ctx / ae:neg / ae:tender_acl (gen) or ae:tenant (tgen)\na rebuild reads it before I-8 / TAC-4; its cache write lands only if the token is unchanged"]
         k5["ae:processed:{event_id} → SET NX sentinel, 7-day TTL\nconsumer idempotency — the SET-NX equivalent of ON CONFLICT DO NOTHING"]
         k6["mfa_freshness_seconds  →  NEVER CACHED, no key exists (§4.4)\nfetched fresh per approver-gated request from I-14 ONLY —\nfolding it into ae:ctx would delay a tightened MFA window by up to 60s"]
         k7["ae:realm:{issuer} → tenant_id, no TTL — write-once, never unmapped\nRealmMap's L1: positive entries cached forever; negative entries cached\nfor AE_REALM_NEG_TTL (default 5s) only — a transient store error is\nnever cached, only a confirmed miss\nSetRealm writes this + ae:realm-by-tenant atomically (MULTI/EXEC)"]
@@ -289,7 +291,7 @@ flowchart TD
         r1(["GetMembershipContext + GetTenantContext"]) --> r2{"both Fresh?"}
         r2 -- yes --> r3["use cached value — done"]
         r2 -- no --> r4{"Valkey reachable\nAND ae:neg hit?"}
-        r4 -- yes --> r5["Deny DENY_UNRESOLVABLE_SUBJECT\n— no sibling call at all"]
+        r4 -- yes --> r5["Deny with the cached reason\n(DENY_UNRESOLVABLE_SUBJECT or DENY_MEMBER_SUSPENDED)\n— no sibling call at all"]
         r4 -- no --> r6["singleflight-coalesced\nGetMemberships call"]
         r6 --> r7{"result?"}
         r7 -- "404" --> r8["SetNegative (best-effort) → Deny"]
@@ -405,7 +407,7 @@ The §7 failure-handling matrix is implemented as one pure function — `usecase
 flowchart TD
     start(["Sibling call (GetMemberships) attempted\nafter a non-Fresh cache read"]) --> reachable{"Sibling\nreachable?"}
 
-    reachable -- "yes — 404" --> notfound["Authoritative answer, NOT an\navailability failure:\nnegative-cache + Deny\nDENY_UNRESOLVABLE_SUBJECT"]
+    reachable -- "yes — 404 / not active" --> notfound["Authoritative answer, NOT an\navailability failure:\nnegative-cache + Deny\nDENY_UNRESOLVABLE_SUBJECT, or\nDENY_MEMBER_SUSPENDED if suspended (AE-51)"]
     reachable -- "yes — success" --> normal["OutcomeNormal\nuse the fresh result, write-through cache"]
 
     reachable -- "no (ErrUnavailable)" --> valkeyup{"Valkey\nreachable?"}

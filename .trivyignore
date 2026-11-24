@@ -15,17 +15,17 @@ DLA-4792-1 exp:2026-11-30
 
 # DLA-4845-1: ca-certificates 20250419~deb12u1 → deb12u2 (removes the
 # distrusted Comodo "AAA Certificate Services" and "emSign ECC Root CA - G3"
-# roots). gcr.io/distroless/static-debian12:nonroot still does not ship the
-# fixed package — digest sha256:afa5c872 unchanged as of 2026-11-24. The
-# exposure itself is closed: the Dockerfile's certs stage
-# (debian:bookworm-slim@sha256:e67eeead, re-pinned 2026-11-24) installs
-# ca-certificates via apt-get and replaces distroless's
-# /etc/ssl/certs/ca-certificates.crt — verified 150 → 148 certs, both
-# distrusted roots absent. Trivy still reports the finding because it reads
-# distroless's dpkg status metadata, not the actual certs file. Remove this
-# entry, the certs stage and its COPY, and re-pin the runtime digest once
+# roots). gcr.io/distroless/static-debian12:nonroot does not yet ship the
+# fixed package; the Dockerfile's pinned digest is already the latest
+# upstream (checked 2026-10-22, re-checked 2026-11-24: digest unchanged).
+# The exposure itself is closed: the
+# Dockerfile's certs stage (debian:bookworm-slim, deb12u2) replaces
+# distroless's /etc/ssl/certs/ca-certificates.crt — verified 150 → 148 certs,
+# both roots absent. Trivy still reports the finding only because it reads
+# distroless's dpkg status metadata. The expiry forces a re-check: remove this
+# entry, the certs stage and its COPY, and bump the runtime digest once
 # distroless ships deb12u2. Same fix as iam-org-membership 9bc235e.
-DLA-4845-1 exp:2027-02-28
+DLA-4845-1 exp:2026-12-31
 
 # DLA-4854-1: tzdata 2026b-0+deb12u1 → 2026e-0+deb12u1, a timezone-database
 # refresh (Trivy: UNKNOWN; the CI gate fails on UNKNOWN). Same package and

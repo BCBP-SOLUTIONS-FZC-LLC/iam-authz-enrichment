@@ -31,6 +31,23 @@ func negativeKey(tenant, user string) string {
 	return fmt.Sprintf("ae:neg:%s:%s", tenant, user)
 }
 
+// subjectGenKey is the per-(tenant,user) write guard (§4.1, §16 AE-51) for
+// ae:ctx, ae:neg and ae:tender_acl: a random token that every
+// EvictMembershipContext, EvictNegative, EvictTenderACL and
+// EvictTenderACLForUser replaces, so a rebuild that started before an
+// eviction cannot write its older answer back. A new eviction of any of
+// those keys must replace it too. The "ae:gen:" prefix keeps it out of any
+// ae:ctx / ae:neg / ae:tender_acl pattern.
+func subjectGenKey(tenant, user string) string {
+	return fmt.Sprintf("ae:gen:%s:%s", tenant, user)
+}
+
+// tenantGenKey is the same write guard for the tenant-wide ae:tenant entry,
+// replaced by every EvictTenantContext.
+func tenantGenKey(tenant string) string {
+	return fmt.Sprintf("ae:tgen:%s", tenant)
+}
+
 func processedKey(eventID string) string {
 	return fmt.Sprintf("ae:processed:%s", eventID)
 }

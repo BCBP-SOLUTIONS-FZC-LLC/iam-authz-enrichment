@@ -194,6 +194,31 @@ spec:
               event), a TTL misconfiguration, or Valkey eviction pressure.
             runbook: "docs/observability/runbooks.md#authzenrichmentcachehitratiolow"
 
+        # ── Write-guard failures (LLD §16 AE-51) ─────────────────────────────────
+        # Every cache write that stores a sibling's answer goes through a Lua
+        # script guarded by an ae:gen/ae:tgen token. If the token can't be read
+        # or the script fails, the write is skipped: caching quietly stops and
+        # every miss reaches Org & Membership / iam-tender-acl.
+        - alert: AuthzEnrichmentCacheGuardErrors
+          expr: |
+            sum by (domain, service, environment, op) (
+              rate(iam_authz_enrichment_cache_guard_errors_total{domain="iam", service="iam-authz-enrichment"}[5m])
+            ) > 0
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-authz-enrichment cache write-guard failing — cache writes skipped
+            description: >-
+              iam_authz_enrichment_cache_guard_errors_total{op="{{ "{{ $labels.op }}" }}"} has
+              been increasing for 10 minutes in {{ "{{ $labels.environment }}" }}: guarded
+              cache writes are being skipped, so misses are not cached and reach
+              Org & Membership / iam-tender-acl. Check whether Valkey refuses Lua
+              scripts (ACL without @scripting, a proxy blocking EVAL), is at
+              maxmemory with noeviction, or is slow. Rate: {{ "{{ $value | humanize }}" }}/s.
+            runbook: "docs/observability/runbooks.md#authzenrichmentcacheguarderrors"
+
     - name: iam_authz_enrichment_events
       rules:
 

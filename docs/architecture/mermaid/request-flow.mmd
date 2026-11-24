@@ -32,16 +32,16 @@ sequenceDiagram
                 Cache -->> Checker: Miss / Stale / connection error
 
                 alt Valkey reachable and ae:neg hit
-                    Checker -->> Server: Denied — DENY_UNRESOLVABLE_SUBJECT
+                    Checker -->> Server: Denied — the cached reason (DENY_UNRESOLVABLE_SUBJECT or DENY_MEMBER_SUSPENDED)
                     Note over Checker,Cache: §4.3 — collapses the repeat rebuild call<br/>without ever calling Org & Membership
                 else no negative-cache short-circuit
                     Checker ->> Org: GetMemberships(tenant, user)
                     Note over Checker,Org: singleflight-coalesced — concurrent callers<br/>for the same (tenant,user) share one call (§4.5),<br/>run on context.WithoutCancel so one cancelled caller<br/>can't fail the rest (bounded by ORG_MEMBERSHIP_TIMEOUT)
 
-                    alt 404 (ErrNotFound)
-                        Org -->> Checker: not found
-                        Checker ->> Cache: SetNegative (best-effort)
-                        Checker -->> Server: Denied — DENY_UNRESOLVABLE_SUBJECT
+                    alt 404 or non-active status (ErrNotFound)
+                        Org -->> Checker: not found / not active
+                        Checker ->> Cache: SetNegative(reason) (best-effort)
+                        Checker -->> Server: Denied — DENY_MEMBER_SUSPENDED if status suspended (AE-51), else DENY_UNRESOLVABLE_SUBJECT
                     else success
                         Org -->> Checker: MembershipContext + TenantContext
                         Checker ->> Cache: SetMembershipContext + SetTenantContext (best-effort)

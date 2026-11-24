@@ -55,7 +55,7 @@ Trace resources carry the same values as `service.name`, `service.namespace` and
 Label **values** stay inside the registry vocabulary:
 
 - `iam_authz_enrichment_decisions_total{decision}` ∈ `allow`, `deny`.
-- `iam_authz_enrichment_deny_reason_total{reason}` is the `DenyReason` **lowercased**, because the registry's `reason` pattern is snake_case (`^[a-z][a-z0-9_]{0,63}$`). The values are `deny_unresolvable_subject`, `deny_tenant_read_only`, `deny_mfa_stale`, `deny_tender_acl_insufficient`, `deny_role_insufficient`, `deny_service_unavailable` and `deny_malformed_identity`. The upper-case `DenyReason` on the wire (LLD §9) is unchanged.
+- `iam_authz_enrichment_deny_reason_total{reason}` is the `DenyReason` **lowercased**, because the registry's `reason` pattern is snake_case (`^[a-z][a-z0-9_]{0,63}$`). The values are `deny_unresolvable_subject`, `deny_member_suspended`, `deny_tenant_read_only`, `deny_mfa_stale`, `deny_tender_acl_insufficient`, `deny_role_insufficient`, `deny_service_unavailable` and `deny_malformed_identity`. The upper-case `DenyReason` on the wire (LLD §9) is unchanged.
 - `platform_grpc_server_*{grpc_method}` is limited to the registered services (`Check`, `grpc.health.v1.Health`, reflection outside `prod`) by `grpccommon.RegisterKnownMethods`; anything else is recorded as `unknown`.
 - `platform_dependency_request_seconds{outcome}` ∈ `success`, `error`.
 
