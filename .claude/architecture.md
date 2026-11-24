@@ -5,7 +5,7 @@
 ```
 iam-authz-enrichment/
 ├── api/
-│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels / 21 event types / 0 published
+│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels / 22 event types / 0 published
 │   └── embed.go                       # //go:embed asyncapi.yaml — served at GET /asyncapi (HTML viewer) and
 │                                       # GET /asyncapi.yaml (raw), gated by DocsConfig (internal/adapter/inbound/
 │                                       # http/router.go) — same convention as iam-org-membership/iam-tender-acl

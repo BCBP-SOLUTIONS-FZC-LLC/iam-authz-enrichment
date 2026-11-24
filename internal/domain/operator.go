@@ -3,10 +3,11 @@ package domain
 // Operator path (CD-52, LLD §8.9). Platform operators sign in to a dedicated
 // platform realm — never a tenant realm — and reach only /api/v1/operator/*.
 const (
-	// PlatformOperatorRole is the platform-realm role every service's
-	// operator routes check (RequireOperatorRole). It is the only operator
-	// role this service currently recognises; it is injected in
-	// x-tenant-roles, the header those checks read.
+	// PlatformOperatorRole is the platform-realm role an operator token must
+	// carry to reach /api/v1/operator/* (gate check in operatorDecision).
+	// All platform-realm roles — including pci_owner_reviewer (A-10, BL-OQ-26)
+	// — are forwarded in x-tenant-roles so downstream services can gate on
+	// them; PlatformOperatorRole just controls the entry gate here.
 	PlatformOperatorRole = "platform_operator"
 
 	// OperatorRoutePrefix is the only path prefix an operator token may

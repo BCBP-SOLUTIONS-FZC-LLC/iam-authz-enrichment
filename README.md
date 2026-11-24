@@ -132,7 +132,7 @@ Clean Architecture — dependencies point inward; outer layers never import inne
 ```
 iam-authz-enrichment/
 ├── api/
-│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels, 21 event types, 0 published
+│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — 5 consumed channels, 22 event types, 0 published
 │   └── embed.go                       # //go:embed asyncapi.yaml — served at GET /asyncapi · GET /asyncapi.yaml
 ├── cmd/server/                        # Composition root: config, logger, tracing/metrics identity, gRPC+HTTP+metrics servers, 5 SQS consumers
 │   ├── main.go                        # wiring + graceful shutdown; a fatal background failure exits non-zero (SIGTERM exits 0)
@@ -212,7 +212,7 @@ Unit tests are co-located with their source (`*_test.go` next to the file under 
 
 This service is a **pure event consumer** — it subscribes to five SQS queues and publishes **zero** events. `cmd/server` still loads platform-events SNS and outbox config (`LoadSNS` / `LoadOutbox` / `RunnerConfigFromEnv`) so operators see the same `SNS_*` / `OUTBOX_*` warnings as iam-user-profile / iam-org-membership, then skips `NewSNSPublisher`, `outbox.ApplySchema`, and `NewRunner` (HLD §5.4 / EVT-2). Every event received is a cache-invalidation trigger against this service's own Valkey cache, never a domain state mutation of its own.
 
-The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 21 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile, Realm Provisioner) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
+The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) — 22 event types across 5 channels, `receive`-only operations, per-event consumer behavior (`x-consumer-behavior`) and payload schemas, verified field-for-field against the producing services' own asyncapi.yaml where one was available (Org & Membership, User Profile, Realm Provisioner) and explicitly flagged `producer-lifecycle-status: unknown` where it wasn't (Billing Service, Tender Service). Browse it live at `GET /asyncapi` (HTML catalog) or `GET /asyncapi.yaml` (raw spec) — see [§ Environment variables](#environment-variables) for the `DOCS_ENABLED`/`DOCS_AUTH_TOKEN` gate. See [`docs/lld/iam-lld-authz-enrichment.md` §7](docs/lld/iam-lld-authz-enrichment.md) for the full narrative per-event rationale this table summarizes, and [`ARCHITECTURE.md` § Event flow](ARCHITECTURE.md#event-flow) for the dedup/DLQ sequence diagram.
 
 **Envelope shape:** `{id, type, tenant_id, time, data}` — `tenant_id` is a top-level envelope field, never duplicated inside `data`; the `billing-authz-q` events below read only that field, no `data` decode at all.
 
@@ -258,11 +258,12 @@ The full machine-readable contract is [`api/asyncapi.yaml`](api/asyncapi.yaml) �
 | `TrialExpired` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — trial expiry changes `subscription_status` and `read_only`; without eviction pre-expiry values persist for up to `AE_TENANT_TTL` (AE-RP-GAP-005) |
 | `TrialReactivated` | _(envelope `tenant_id` only)_ | Evict `ae:tenant:{tenant}` — trial extension (new `trial_ends_at`), so the next Check picks up the refreshed date (AE-RP-GAP-006) |
 
-**`tender-authz-q`** (Tender Service, 1 event type) — flips an in-process fact, not a Valkey write:
+**`tender-authz-q`** (Tender Service, 2 event types) — in-process state mutations, not Valkey writes:
 
 | Event type | Consumed field(s) | Effect |
 |---|---|---|
 | `TenderRestricted` | `tender_id` | Mark `(tenant, tender_id)` restricted in the in-process `RestrictedTenderSet` — the §3.1 step-4 tender-ACL overlay only calls out to TAC-4 for a tender this set marks restricted |
+| `TenderAccessGranted` | `tenant_id`, `tender_id`, `user_id` | Immediately evict the `ae:tender_acl:{tenant}:{tender}:{user}` Valkey entry so the newly-granted user is not denied for up to 15 s (AE-TND-G1) |
 
 ---
 
@@ -302,7 +303,7 @@ No other service calls this service directly. There is no REST or HTTP business 
 | `user-authz-q` | User Profile (`iam-user-profile`) | `UserUpdated`, `UserAvailabilityChanged`, `UserDeleted` | Evict `ae:ctx`/`ae:neg`; `UserUpdated` only evicts if `"email"` or `"status"` appears in `changed_fields` (UP-AE-GAP-001); `UserAvailabilityChanged` evicts unconditionally but is no longer load-bearing after AE-18 (delegation removed from I-8); `UserDeleted` also evicts all `ae:tender_acl` entries for the user |
 | `billing-authz-q` | Billing Service | `TenantPlanChanged`, `TenantSubscriptionCancelled`, `TenantReactivated` | Evict `ae:tenant:{tenant}` — no payload decode beyond the envelope's `tenant_id` |
 | `tenant-authz-q` | Realm Provisioner + Tenant Owner (Org & Membership) | `TenantConverted`, `TenantRealmReady`, `TenantSettingChanged`, `TenantSuspended`, `TenantReactivated` (operator), `TenantOffboarded`, `TrialExpired`, `TrialReactivated` | Update in-process realm→tenant map; `TenantConverted` also evicts `ae:tenant`; lifecycle/settings events evict `ae:tenant`; `TenantOffboarded` additionally clears no-TTL `ae:realm` + `ae:restricted` entries (AE-17) |
-| `tender-authz-q` | Tender Service | `TenderRestricted` | Mark `(tenant, tender_id)` restricted in in-process `RestrictedTenderSet`; payload validation rejects events with a missing or empty `tender_id` (AE-TAC-GAP-001 fix) — gates whether TAC-4 is called on subsequent tender-scoped `Check()` calls |
+| `tender-authz-q` | Tender Service | `TenderRestricted`, `TenderAccessGranted` | `TenderRestricted` marks `(tenant, tender_id)` restricted in in-process `RestrictedTenderSet`; payload validation rejects events with a missing or empty `tender_id` (AE-TAC-GAP-001 fix). `TenderAccessGranted` evicts `ae:tender_acl:{tenant}:{tender}:{user}` immediately on grant (AE-TND-G1) |
 
 **Events this service produces:** **None.** This service is a pure consumer. `NewSNSPublisher` / `outbox.ApplySchema` / `NewRunner` are never called (HLD §5.4 / EVT-2). The full machine-readable consumer contract is [`api/asyncapi.yaml`](api/asyncapi.yaml), also browsable live at `GET /asyncapi`.
 
@@ -649,7 +650,7 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `SHARED_REALM_ISSUER` | _(empty)_ | Keycloak issuer for the shared trial realm. **At least one of `SHARED_REALM_ISSUER` or `REALM_TENANT_MAP_SEED` must be set outside `APP_ENV=dev`** — both empty causes a startup failure (every request would silently return `DENY_MALFORMED_IDENTITY`) |
 | `REALM_TENANT_MAP_SEED` | `{}` | Startup-only JSON seed for dedicated realms; kept fresh at runtime by events, never re-read |
 | `JWT_METADATA_NAMESPACE` / `JWT_PAYLOAD_KEY` | `envoy.filters.http.jwt_authn` / `trial` | Must match the Envoy `jwt_authn` filter config |
-| `OPERATOR_REALM_ISSUER` | _(empty → operator path off)_ | CD-52 (LLD §8.9): the platform realm's issuer. Its tokens are allowed only on `/api/v1/operator/*` with the `platform_operator` realm role, and get `x-tenant-roles: platform_operator`, `x-user-id` = the operator, `x-tenant-id` = the path tenant (or the nil UUID). Must differ from `SHARED_REALM_ISSUER` and every dedicated realm — `config.Load()` fails otherwise |
+| `OPERATOR_REALM_ISSUER` | _(empty → operator path off)_ | CD-52 (LLD §8.9): the platform realm's issuer. Its tokens are allowed only on `/api/v1/operator/*` with the `platform_operator` realm role, and get `x-tenant-roles` = all platform-realm roles comma-joined (e.g. `platform_operator,pci_owner_reviewer` — the gate requires `platform_operator` but all roles are forwarded, A-10/BL-OQ-26), `x-user-id` = the operator, `x-tenant-id` = the path tenant (or the nil UUID). Must differ from `SHARED_REALM_ISSUER` and every dedicated realm — `config.Load()` fails otherwise |
 | `JWT_OPERATOR_PAYLOAD_KEY` | _(empty → same as `JWT_PAYLOAD_KEY`)_ | The operator `jwt_authn` provider's payload key, when the gateway writes it under its own key |
 | `*_AUTHZ_QUEUE_URL` (5 vars) | _(empty → idle consumer)_ | Leave blank to run without a given queue in local/partial setups (`APP_ENV=dev` only — required, and must be pairwise distinct, outside dev; `config.Load()` fails fast otherwise) |
 | `*_AUTHZ_QUEUE_CONCURRENCY` (5 vars) | `4` each | `events.WithConcurrency` per queue — messages handed to handler goroutines at once, instead of `platform-events`' library default of `1` (fully serial per queue) |
