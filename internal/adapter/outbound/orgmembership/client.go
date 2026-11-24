@@ -29,7 +29,8 @@ import (
 // ErrNotFound and ErrUnavailable are domain.ErrNotFound/domain.ErrUnavailable
 // (aliased here for readability at call sites in this file). I-8's 404 is an
 // authoritative answer from a reachable sibling — callers negative-cache it
-// and deny DENY_UNRESOLVABLE_SUBJECT, never eligible for §7's
+// and deny DENY_UNRESOLVABLE_SUBJECT (DENY_MEMBER_SUSPENDED when it is joined
+// with domain.ErrMemberSuspended, §16 AE-51), never eligible for §7's
 // stale-if-error extension. Everything else unexpected wraps ErrUnavailable,
 // the availability failure the §7 matrix reasons about.
 var (
@@ -40,6 +41,10 @@ var (
 // membershipStatusActive is the one tenant_memberships.status that grants
 // anything (Core TM-9).
 const membershipStatusActive = "active"
+
+// membershipStatusSuspended is the status a P-7 suspension sets. It gets its
+// own deny reason, DENY_MEMBER_SUSPENDED (§16 AE-51).
+const membershipStatusSuspended = "suspended"
 
 // Client calls the three sibling internal endpoints: I-8/I-14 against Org &
 // Membership, and I-12 against iam-tender-acl (ADR-0007 Wave 3 Phase 4 —
@@ -173,8 +178,9 @@ func (r membershipsResponse) TenantContext() domain.TenantContext {
 
 // GetMemberships calls I-8: GET /api/v1/internal/users/:id/memberships.
 // Returns ErrNotFound on a 404 (no membership — §3.1 step 1) and on a 200
-// whose status is not "active" (§8.2.1: a suspended member is denied
-// exactly like a non-member), or ErrUnavailable wrapping the underlying
+// whose status is not "active" (§8.2.1: a non-active member is denied like
+// a non-member; "suspended" also carries ErrMemberSuspended so the reason is
+// DENY_MEMBER_SUSPENDED, §16 AE-51), or ErrUnavailable wrapping the underlying
 // cause on any other failure.
 //
 // tenant is sent as a query parameter — the documented path
@@ -191,8 +197,16 @@ func (c *Client) GetMemberships(ctx context.Context, tenant, user string) (domai
 	}
 	// §8.2.1 / Core TM-9: only an active membership grants roles. Anything
 	// else, including a missing status, is a non-member: never cached as a
-	// positive ae:ctx entry, negative-cached and denied
-	// DENY_UNRESOLVABLE_SUBJECT by the caller, like I-8's 404.
+	// positive ae:ctx entry, negative-cached and denied by the caller, like
+	// I-8's 404. "suspended" also carries ErrMemberSuspended, so the caller
+	// denies DENY_MEMBER_SUSPENDED instead of DENY_UNRESOLVABLE_SUBJECT
+	// (§16 AE-51); every other status stays a plain non-member.
+	// Exact, case-sensitive matches, like "active" below: O&M's enum is
+	// lower case, and an unexpected spelling fails closed as a non-member.
+	if resp.Status == membershipStatusSuspended {
+		return domain.MembershipContext{}, domain.TenantContext{},
+			fmt.Errorf("%w: %w: I-8 membership status %q", ErrNotFound, domain.ErrMemberSuspended, resp.Status)
+	}
 	if resp.Status != membershipStatusActive {
 		return domain.MembershipContext{}, domain.TenantContext{},
 			fmt.Errorf("%w: I-8 membership status %q is not active", ErrNotFound, resp.Status)

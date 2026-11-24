@@ -704,6 +704,31 @@ func TestLoad_OperatorRealmIssuer_MustNotBeATenantRealm(t *testing.T) {
 	}
 }
 
+// Cache TTLs must be positive, and the stale-if-error grace not negative
+// (§16 AE-51): a guarded write floors its PX at 1ms, so 0 would silently
+// turn caching off.
+func TestLoad_CacheTTLs_MustBePositive(t *testing.T) {
+	for _, env := range []string{"AE_CTX_TTL", "AE_TENDER_ACL_TTL", "AE_NEG_TTL"} {
+		for _, v := range []string{"0s", "-1s"} {
+			clearEnv(t)
+			t.Setenv(env, v)
+			_, err := config.Load()
+			require.Error(t, err, env+"="+v)
+			assert.Contains(t, err.Error(), env)
+		}
+	}
+	clearEnv(t)
+	t.Setenv("AE_STALE_IF_ERROR_MAX_AGE", "-1s")
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AE_STALE_IF_ERROR_MAX_AGE")
+
+	clearEnv(t)
+	t.Setenv("AE_STALE_IF_ERROR_MAX_AGE", "0s")
+	_, err = config.Load()
+	require.NoError(t, err, "0 grace is allowed: stale-if-error off")
+}
+
 // AE-48: the cold-miss timeout follows a larger ORG_MEMBERSHIP_TIMEOUT by
 // default and may never be set below it.
 func TestLoad_OrgMembershipColdTimeout(t *testing.T) {

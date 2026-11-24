@@ -16,9 +16,9 @@ iam-authz-enrichment/
 │       └── receive_watchdog.go        # runReceiveErrorWatchdog() — detects a consumer whose ReceiveMessage calls fail forever; wraps each consumer's SQS client to count errors/successes, pushes to fatalErr after sustained failure
 ├── internal/
 │   ├── domain/                        # entities, value objects, DenyReason enum — no external deps
-│   │   ├── decision.go                # DenyReason (7 consts) + .HTTPStatus(), InjectedHeaders names, CacheResult enum, Decision
+│   │   ├── decision.go                # DenyReason (8 consts) + DenyReasons() + .HTTPStatus(), InjectedHeaders names, CacheResult enum, Decision
 │   │   ├── context.go                 # MembershipContext, TenantContext, TenderACL + AccessLevel consts + .Satisfies()
-│   │   ├── errors.go                  # ErrNotFound, ErrUnavailable sentinels
+│   │   ├── errors.go                  # ErrNotFound, ErrMemberSuspended (joined with ErrNotFound, AE-51), ErrUnavailable sentinels
 │   │   └── policy/
 │   │       ├── types.go               # Action consts, DepartmentLevel consts, RequestFacts + .IsMutation()/.RequiresApproverGate()/.RequiresTenderACL()
 │   │       └── policy.go              # Input, EvaluateBase(), ViolatesReadOnly(), MeetsDepartmentLevel() — §3 base policy as pure predicates
@@ -49,7 +49,7 @@ iam-authz-enrichment/
 │       │       └── handlers.go        # 5 New*Consumer builders + per-event-type switch statements → internal/usecase/invalidate.go
 │       └── outbound/
 │           ├── valkey/                # Cache port implementation (go-redis/v9)
-│           │   ├── keys.go            # ae:ctx / ae:tenant / ae:tender_acl / ae:neg / ae:processed / ae:realm / ae:realm-by-tenant / ae:restricted key builders
+│           │   ├── keys.go            # ae:ctx / ae:tenant / ae:tender_acl / ae:neg / ae:gen / ae:tgen / ae:processed / ae:realm / ae:realm-by-tenant / ae:restricted key builders
 │           │   └── cache.go           # entry[T]{Value,FetchedAt,SoftTTL} — single-envelope trick for fresh-read AND §7 stale-if-error
 │           ├── orgmembership/
 │           │   └── client.go          # I-8/I-14 HTTP client (Org & Membership) + TAC-4/I-12 HTTP client (iam-tender-acl); getJSON() classifies 404 → domain.ErrNotFound; GetTenderACL also classifies 400 → ErrNotFound (TAC-GAP-005), 5xx → ErrUnavailable; GetBatchTenderACL is TAC-5

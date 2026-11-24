@@ -66,11 +66,12 @@ Built in `internal/adapter/outbound/metrics/recorder.go`. All latency histograms
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
+| `iam_authz_enrichment_cache_guard_errors_total` | counter | `op`<br>`op` ∈ `gen_read`, `guarded_write` | Cache write-guard failures (LLD §16 AE-51), by op: gen_read (an ae:gen/ae:tgen token could not be read, so the matching cache write was skipped) or guarded_write (a guarded cache write failed). A sustained rate means caching has stopped and every miss reaches Org & Membership or iam-tender-acl. |
 | `iam_authz_enrichment_cache_hits_total` | counter | - | ae:ctx/ae:tenant lookups that were a fresh hit. |
 | `iam_authz_enrichment_cache_lookups_total` | counter | - | Total ae:ctx/ae:tenant lookups. Divide iam_authz_enrichment_cache_hits_total by this for the hit ratio. |
 | `iam_authz_enrichment_decision_latency_seconds` | histogram | - | End-to-end Check() decision latency. Design budget: 15ms p99 (LLD §11.1). |
 | `iam_authz_enrichment_decisions_total` | counter | `decision`<br>`decision` ∈ `allow`, `deny` | Total ext_authz decisions, by decision (allow/deny). Exactly one per Check call, including requests with no verified subject. |
-| `iam_authz_enrichment_deny_reason_total` | counter | `reason`<br>`reason` ∈ `deny_malformed_identity`, `deny_mfa_stale`, `deny_role_insufficient`, `deny_service_unavailable`, `deny_tenant_read_only`, `deny_tender_acl_insufficient`, `deny_unresolvable_subject` | Total deny decisions, by DenyReason, lowercased for the registry's snake_case reason vocabulary (DENY_SERVICE_UNAVAILABLE is deny_service_unavailable). |
+| `iam_authz_enrichment_deny_reason_total` | counter | `reason`<br>`reason` ∈ `deny_malformed_identity`, `deny_member_suspended`, `deny_mfa_stale`, `deny_role_insufficient`, `deny_service_unavailable`, `deny_tenant_read_only`, `deny_tender_acl_insufficient`, `deny_unresolvable_subject` | Total deny decisions, by DenyReason, lowercased for the registry's snake_case reason vocabulary (DENY_SERVICE_UNAVAILABLE is deny_service_unavailable). |
 | `iam_authz_enrichment_eviction_errors_total` | counter | `event`<br>`event` ∈ `membership_revoked`, `user_deleted` | Best-effort cache eviction failures, by event (membership_revoked, user_deleted, tenant_offboarded_restricted, tenant_offboarded_realm). A nonzero rate means evicted entries may persist until their TTL or the next pod restart. |
 | `iam_authz_enrichment_i12_call_latency_seconds` | histogram | - | iam-tender-acl TAC-4 (formerly Org & Membership's I-12) tender-ACL call latency; name kept for continuity (LLD §16 AE-19). |
 | `iam_authz_enrichment_i14_call_latency_seconds` | histogram | - | Org & Membership MFA-freshness (I-14) call latency. |

@@ -6,6 +6,7 @@ package fixtures
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -32,7 +33,9 @@ type FakeCache struct {
 	ctx        map[string]ctxEntry
 	tenant     map[string]tenantEntry
 	tender     map[string]domain.TenderACL
-	neg        map[string]bool
+	neg        map[string]domain.DenyReason
+	gen        map[string]string
+	genSeq     int
 	proc       map[string]bool
 	realm      map[string]string
 	restricted map[string]bool
@@ -44,6 +47,8 @@ type FakeCache struct {
 	CtxErr            error
 	TenantErr         error
 	NegErr            error
+	GenErr            error
+	TenantGenErr      error
 	MarkProcessedErr  error
 	EvictProcessedErr error
 
@@ -76,7 +81,8 @@ func NewFakeCache() *FakeCache {
 		ctx:        map[string]ctxEntry{},
 		tenant:     map[string]tenantEntry{},
 		tender:     map[string]domain.TenderACL{},
-		neg:        map[string]bool{},
+		neg:        map[string]domain.DenyReason{},
+		gen:        map[string]string{},
 		proc:       map[string]bool{},
 		realm:      map[string]string{},
 		restricted: map[string]bool{},
@@ -115,11 +121,17 @@ func (f *FakeCache) SeedTenantContext(tenant string, v domain.TenantContext, res
 	f.tenant[tenant] = tenantEntry{v: v, result: result}
 }
 
-// SeedNegative presets the ae:neg sentinel for (tenant,user).
+// SeedNegative presets the ae:neg sentinel for (tenant,user) as a non-member
+// (DENY_UNRESOLVABLE_SUBJECT).
 func (f *FakeCache) SeedNegative(tenant, user string) {
+	f.SeedNegativeReason(tenant, user, domain.DenyUnresolvableSubject)
+}
+
+// SeedNegativeReason presets the ae:neg sentinel for (tenant,user) holding reason.
+func (f *FakeCache) SeedNegativeReason(tenant, user string, reason domain.DenyReason) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.neg[ctxKey(tenant, user)] = true
+	f.neg[ctxKey(tenant, user)] = reason
 }
 
 func (f *FakeCache) GetMembershipContext(_ context.Context, tenant, user string) (domain.MembershipContext, domain.CacheResult, error) {
@@ -136,12 +148,18 @@ func (f *FakeCache) GetMembershipContext(_ context.Context, tenant, user string)
 	return e.v, e.result, nil
 }
 
-func (f *FakeCache) SetMembershipContext(_ context.Context, tenant, user string, v domain.MembershipContext) error {
+// SetMembershipContext writes only while the token still equals gen, like
+// the valkey script; a skipped write is recorded as "SetMembershipContextSkipped:".
+func (f *FakeCache) SetMembershipContext(_ context.Context, tenant, user string, v domain.MembershipContext, gen string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("SetMembershipContext:" + ctxKey(tenant, user))
 	if f.SetCtxErr != nil {
 		return f.SetCtxErr
+	}
+	if !f.guardOK(tenant, user, gen) {
+		f.record("SetMembershipContextSkipped:" + ctxKey(tenant, user))
+		return nil
 	}
 	f.ctx[ctxKey(tenant, user)] = ctxEntry{v: v, result: domain.CacheFresh}
 	return nil
@@ -155,6 +173,7 @@ func (f *FakeCache) EvictMembershipContext(_ context.Context, tenant, user strin
 		return f.EvictCtxErr
 	}
 	delete(f.ctx, ctxKey(tenant, user))
+	f.bumpGen(tenant, user)
 	return nil
 }
 
@@ -174,12 +193,31 @@ func (f *FakeCache) GetTenantContext(_ context.Context, tenant string) (domain.T
 	return tc, e.result, nil
 }
 
-func (f *FakeCache) SetTenantContext(_ context.Context, tenant string, v domain.TenantContext) error {
+// GetTenantGen returns the tenant write-guard token, creating one if none.
+func (f *FakeCache) GetTenantGen(_ context.Context, tenant string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("GetTenantGen:" + tenant)
+	if f.TenantGenErr != nil {
+		return "", f.TenantGenErr
+	}
+	if f.gen[tenantGenKey(tenant)] == "" {
+		f.replaceGen(tenantGenKey(tenant))
+	}
+	return f.gen[tenantGenKey(tenant)], nil
+}
+
+// SetTenantContext writes only while the tenant token still equals gen.
+func (f *FakeCache) SetTenantContext(_ context.Context, tenant string, v domain.TenantContext, gen string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("SetTenantContext:" + tenant)
 	if f.SetTenantErr != nil {
 		return f.SetTenantErr
+	}
+	if gen == "" || f.gen[tenantGenKey(tenant)] != gen {
+		f.record("SetTenantContextSkipped:" + tenant)
+		return nil
 	}
 	f.tenant[tenant] = tenantEntry{v: v, result: domain.CacheFresh}
 	return nil
@@ -193,6 +231,7 @@ func (f *FakeCache) EvictTenantContext(_ context.Context, tenant string) error {
 		return f.EvictTenantErr
 	}
 	delete(f.tenant, tenant)
+	f.replaceGen(tenantGenKey(tenant))
 	return nil
 }
 
@@ -207,12 +246,17 @@ func (f *FakeCache) GetTenderACL(_ context.Context, tenant, tender, user string)
 	return v, ok, nil
 }
 
-func (f *FakeCache) SetTenderACL(_ context.Context, tenant, tender, user string, v domain.TenderACL) error {
+// SetTenderACL writes only while the (tenant,user) token still equals gen.
+func (f *FakeCache) SetTenderACL(_ context.Context, tenant, tender, user string, v domain.TenderACL, gen string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("SetTenderACL:" + tenderKey(tenant, tender, user))
 	if f.SetTenderACLErr != nil {
 		return f.SetTenderACLErr
+	}
+	if !f.guardOK(tenant, user, gen) {
+		f.record("SetTenderACLSkipped:" + tenderKey(tenant, tender, user))
+		return nil
 	}
 	f.tender[tenderKey(tenant, tender, user)] = v
 	return nil
@@ -226,6 +270,7 @@ func (f *FakeCache) EvictTenderACL(_ context.Context, tenant, tender, user strin
 		return f.EvictTACLSingleErr
 	}
 	delete(f.tender, tenderKey(tenant, tender, user))
+	f.bumpGen(tenant, user)
 	return nil
 }
 
@@ -236,6 +281,7 @@ func (f *FakeCache) EvictTenderACLForUser(_ context.Context, tenant, user string
 	if f.EvictTACLScanErr != nil {
 		return f.EvictTACLScanErr
 	}
+	f.bumpGen(tenant, user)
 	for k := range f.tender {
 		parts := strings.Split(k, ":")
 		if len(parts) == 3 && parts[0] == tenant && parts[2] == user {
@@ -245,24 +291,70 @@ func (f *FakeCache) EvictTenderACLForUser(_ context.Context, tenant, user string
 	return nil
 }
 
-func (f *FakeCache) GetNegative(_ context.Context, tenant, user string) (bool, error) {
+func (f *FakeCache) GetNegative(_ context.Context, tenant, user string) (domain.DenyReason, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("GetNegative:" + ctxKey(tenant, user))
 	if f.NegErr != nil {
-		return false, f.NegErr
+		return "", f.NegErr
 	}
-	return f.neg[ctxKey(tenant, user)], nil
+	v, ok := f.neg[ctxKey(tenant, user)]
+	if !ok {
+		return "", nil
+	}
+	// Same normalisation as valkey.Cache, so a present entry is always a hit.
+	return domain.NegativeCacheReason(string(v)), nil
 }
 
-func (f *FakeCache) SetNegative(_ context.Context, tenant, user string) error {
+// GetSubjectGen returns the write-guard token, creating one if there is
+// none (never ""), like valkey.Cache.
+func (f *FakeCache) GetSubjectGen(_ context.Context, tenant, user string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("GetSubjectGen:" + ctxKey(tenant, user))
+	if f.GenErr != nil {
+		return "", f.GenErr
+	}
+	if f.gen[ctxKey(tenant, user)] == "" {
+		f.bumpGen(tenant, user)
+	}
+	return f.gen[ctxKey(tenant, user)], nil
+}
+
+// guardOK mirrors the valkey script: the token must be non-empty and match.
+func (f *FakeCache) guardOK(tenant, user, gen string) bool {
+	return gen != "" && f.gen[ctxKey(tenant, user)] == gen
+}
+
+// bumpGen replaces the (tenant,user) token, like valkey.Cache's evictions.
+// Caller holds mu.
+func (f *FakeCache) bumpGen(tenant, user string) {
+	f.replaceGen(ctxKey(tenant, user))
+}
+
+// replaceGen sets a never-repeating token at key. Caller holds mu.
+func (f *FakeCache) replaceGen(key string) {
+	f.genSeq++
+	f.gen[key] = "tok" + strconv.Itoa(f.genSeq)
+}
+
+// tenantGenKey keys the tenant token apart from every ctxKey(tenant,user).
+func tenantGenKey(tenant string) string { return "tenant-gen|" + tenant }
+
+// SetNegative writes only while the generation still equals gen, like the
+// valkey script; a skipped write is recorded as "SetNegativeSkipped:".
+func (f *FakeCache) SetNegative(_ context.Context, tenant, user string, reason domain.DenyReason, gen string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("SetNegative:" + ctxKey(tenant, user))
 	if f.SetNegErr != nil {
 		return f.SetNegErr
 	}
-	f.neg[ctxKey(tenant, user)] = true
+	if !f.guardOK(tenant, user, gen) {
+		f.record("SetNegativeSkipped:" + ctxKey(tenant, user))
+		return nil
+	}
+	f.neg[ctxKey(tenant, user)] = reason
 	return nil
 }
 
@@ -274,6 +366,7 @@ func (f *FakeCache) EvictNegative(_ context.Context, tenant, user string) error 
 		return f.EvictNegErr
 	}
 	delete(f.neg, ctxKey(tenant, user))
+	f.bumpGen(tenant, user)
 	return nil
 }
 

@@ -133,6 +133,7 @@ func TestDeniedResponse_ProblemJSONBody(t *testing.T) {
 	}{
 		{domain.DenyMalformedIdentity, 401, "https://errors.company.com/platform/unauthorized", "Unauthorized"},
 		{domain.DenyUnresolvableSubject, 403, "https://errors.company.com/platform/forbidden", "Forbidden"},
+		{domain.DenyMemberSuspended, 403, "https://errors.company.com/platform/forbidden", "Forbidden"},
 		{domain.DenyTenantReadOnly, 403, "https://errors.company.com/platform/forbidden", "Forbidden"},
 		{domain.DenyMFAStale, 403, "https://errors.company.com/platform/forbidden", "Forbidden"},
 		{domain.DenyTenderACLInsufficient, 403, "https://errors.company.com/platform/forbidden", "Forbidden"},

@@ -8,7 +8,12 @@ package domain
 type DenyReason string
 
 const (
-	DenyUnresolvableSubject   DenyReason = "DENY_UNRESOLVABLE_SUBJECT"
+	DenyUnresolvableSubject DenyReason = "DENY_UNRESOLVABLE_SUBJECT"
+	// DenyMemberSuspended is step 1's deny for a caller whose membership row
+	// exists but is suspended (I-8 200, status "suspended"; LLD §8.2.1,
+	// §16 AE-51). Distinct from DenyUnresolvableSubject so the frontend can
+	// tell "access paused" from "not a member" (web-shell AZ-2).
+	DenyMemberSuspended       DenyReason = "DENY_MEMBER_SUSPENDED"
 	DenyTenantReadOnly        DenyReason = "DENY_TENANT_READ_ONLY"
 	DenyMFAStale              DenyReason = "DENY_MFA_STALE"
 	DenyTenderACLInsufficient DenyReason = "DENY_TENDER_ACL_INSUFFICIENT"
@@ -16,6 +21,37 @@ const (
 	DenyServiceUnavailable    DenyReason = "DENY_SERVICE_UNAVAILABLE"
 	DenyMalformedIdentity     DenyReason = "DENY_MALFORMED_IDENTITY"
 )
+
+// DenyReasons returns every DenyReason, in §3.1 precedence order (identity,
+// subject resolution, read-only, role, tender ACL, MFA, then the 503 that can
+// short-circuit anywhere). A new reason must be added here and to
+// api/deny-codes.json in the same position: TestDenyCodesJSON_MatchesDenyReasons
+// compares the two by position, and TestDenyReasons_CoversEveryConst fails
+// if a DenyReason const is missing here.
+func DenyReasons() []DenyReason {
+	return []DenyReason{
+		DenyMalformedIdentity,
+		DenyUnresolvableSubject,
+		DenyMemberSuspended,
+		DenyTenantReadOnly,
+		DenyRoleInsufficient,
+		DenyTenderACLInsufficient,
+		DenyMFAStale,
+		DenyServiceUnavailable,
+	}
+}
+
+// NegativeCacheReason turns a stored ae:neg value back into its deny reason.
+// Only the two subject-resolution reasons can be negative-cached (§4.3,
+// §16 AE-51): DENY_MEMBER_SUSPENDED is kept, and anything else — the "1"
+// written before AE-51, an empty value, or any other DenyReason — reads as
+// DENY_UNRESOLVABLE_SUBJECT, so a bad entry can never turn into a 401 or 503.
+func NegativeCacheReason(v string) DenyReason {
+	if DenyReason(v) == DenyMemberSuspended {
+		return DenyMemberSuspended
+	}
+	return DenyUnresolvableSubject
+}
 
 // HTTPStatus maps a DenyReason to the status Envoy should surface to the
 // caller (§9 table). DENY_SERVICE_UNAVAILABLE is the one 5xx-class reason —
@@ -27,7 +63,7 @@ func (r DenyReason) HTTPStatus() int {
 		return 401
 	case DenyServiceUnavailable:
 		return 503
-	case DenyUnresolvableSubject, DenyTenantReadOnly, DenyMFAStale, DenyTenderACLInsufficient, DenyRoleInsufficient:
+	case DenyUnresolvableSubject, DenyMemberSuspended, DenyTenantReadOnly, DenyMFAStale, DenyTenderACLInsufficient, DenyRoleInsufficient:
 		return 403
 	default:
 		return 403

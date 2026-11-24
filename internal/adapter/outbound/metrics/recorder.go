@@ -76,6 +76,7 @@ type Recorder struct {
 	residencyUnknownTotal gincommon.Counter
 	tac4ErrorsTotal       gincommon.Counter
 	evictionErrors        *gincommon.CounterVec
+	cacheGuardErrors      *gincommon.CounterVec
 }
 
 // latencyBuckets is 0.5ms .. ~16s (16 exponential buckets, factor 2) —
@@ -139,6 +140,8 @@ func New(reg gincommon.Registerer) (*Recorder, error) {
 			"GetTenderACL (TAC-4) errors — iam-tender-acl dependency failures that made the tender-ACL overlay fail closed. Distinct from legitimate DENY_TENDER_ACL_INSUFFICIENT policy denials."),
 		evictionErrors: b.counterVec("iam_authz_enrichment_eviction_errors_total",
 			"Best-effort cache eviction failures, by event (membership_revoked, user_deleted, tenant_offboarded_restricted, tenant_offboarded_realm). A nonzero rate means evicted entries may persist until their TTL or the next pod restart.", "event"),
+		cacheGuardErrors: b.counterVec("iam_authz_enrichment_cache_guard_errors_total",
+			"Cache write-guard failures (LLD §16 AE-51), by op: gen_read (an ae:gen/ae:tgen token could not be read, so the matching cache write was skipped) or guarded_write (a guarded cache write failed). A sustained rate means caching has stopped and every miss reaches Org & Membership or iam-tender-acl.", "op"),
 	}
 	if err := errors.Join(b.errs...); err != nil {
 		return nil, fmt.Errorf("register iam_authz_enrichment metrics: %w", err)
@@ -209,6 +212,10 @@ func (r *Recorder) ObserveNegativeCacheHit(hit bool) {
 func (r *Recorder) ObserveStaleIfErrorServed()    { r.staleServedTotal.Inc() }
 func (r *Recorder) ObserveSingleflightCoalesced() { r.sfCoalescedTotal.Inc() }
 func (r *Recorder) ObserveTACDependencyError()    { r.tac4ErrorsTotal.Inc() }
+
+func (r *Recorder) ObserveCacheGuardError(op string) {
+	r.cacheGuardErrors.WithLabelValues(op).Inc()
+}
 
 func (r *Recorder) ObserveEvictionError(event string) {
 	r.evictionErrors.WithLabelValues(event).Inc()

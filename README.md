@@ -148,7 +148,7 @@ iam-authz-enrichment/
 │   │   │   ├── http/                  # /healthz · /readyz · /asyncapi · /asyncapi.yaml — no business logic; /metrics has its own dedicated listener (see cmd/server)
 │   │   │   └── consumer/              # 5 SQS consumers, one per §5 queue — LoadPlatform (SQS/SNS/outbox config), skipDuplicate/ackUnknown
 │   │   └── outbound/
-│   │       ├── valkey/                # Cache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:processed
+│   │       ├── valkey/                # Cache — ae:ctx · ae:tenant · ae:tender_acl · ae:neg · ae:gen · ae:tgen · ae:processed
 │   │       ├── orgmembership/         # HTTP client — I-8 memberships (Org & Membership), TAC-4/I-12 tender-acl (iam-tender-acl), I-14 mfa-freshness (Org & Membership)
 │   │       ├── postgres/              # platform-pgcommon DSN/pool config, Zap logger adapter, gincommon.NewSpanTracer — no live pool (HLD §5.4)
 │   │       └── metrics/               # Prometheus iam_authz_enrichment_* series (§10), via gincommon's registry-validated constructors
@@ -310,7 +310,7 @@ No other service calls this service directly. There is no REST or HTTP business 
 
 | System | Role |
 |---|---|
-| **Valkey** (Redis-compatible) | The only persistent-ish state this service touches — `ae:ctx`, `ae:tenant`, `ae:tender_acl`, `ae:neg`, `ae:processed` cache keys; no database, no ORM, no migrations |
+| **Valkey** (Redis-compatible) | The only persistent-ish state this service touches — `ae:ctx`, `ae:tenant`, `ae:tender_acl`, `ae:neg`, `ae:processed` cache keys, plus the `ae:gen` / `ae:tgen` write-guard tokens (AE-51); no database, no ORM, no migrations |
 | **AWS SQS** (5 queues + 5 DLQs) | `membership-authz-q`, `user-authz-q`, `billing-authz-q`, `tenant-authz-q`, `tender-authz-q`; DLQ via SQS-native `maxReceiveCount=5` redrive — no application-layer DLQ code; a DLQ'd message degrades to a stale cache entry until its TTL expires, not a correctness failure |
 | **Envoy** (inbound only) | The API gateway / service mesh proxy — the sole caller of `Authorization.Check`. `jwt_authn` validates JWTs upstream; this service reads only Envoy-injected `MetadataContext`, never raw headers |
 
@@ -403,6 +403,7 @@ To get past `DENY_SERVICE_UNAVAILABLE` to a real `Allow`, `GetMemberships` needs
 mkdir -p mockorg/api/v1/internal/users/alice
 cat > mockorg/api/v1/internal/users/alice/memberships <<'EOF'
 {
+  "status": "active",
   "roles": ["tenant_admin"],
   "departments": [{"department_id": "fd72f513-45f0-46ca-a1ed-9183be72484c", "role_level": "reviewer"}],
   "plan": "pro",
@@ -429,6 +430,7 @@ Re-running the same `grpcurl`/`grpcui` `Check` call from above (`sub: "alice"`, 
 
 From there, edit the JSON file (or the request) to exercise other branches of §3.1 without touching any code:
 - A `sub` with no matching file → 404 → `DENY_UNRESOLVABLE_SUBJECT`.
+- `"status": "suspended"` in the mock file → `DENY_MEMBER_SUSPENDED`.
 - `"read_only": true` in the mock file + `"method": "POST"` in the request → `DENY_TENANT_READ_ONLY`.
 - Add `"context_extensions": {"policy_action": "manage_department_memberships"}` under `attributes` with a mock user that has no `tenant_admin`/`tenant_owner` role → `DENY_ROLE_INSUFFICIENT`.
 
@@ -636,8 +638,8 @@ See [`.env-example`](.env-example) for the full annotated list. Key ones:
 | `VALKEY_DIAL_TIMEOUT` / `VALKEY_READ_TIMEOUT` / `VALKEY_WRITE_TIMEOUT` | `20ms` / `10ms` / `10ms` | Request-path Valkey client — sized for the 15ms p99 decision budget (§11.1) |
 | `VALKEY_EVENT_TIMEOUT` | `500ms` | Dial/read/write timeout of the separate Valkey client SQS event processing uses (evictions, `ae:restricted`/`ae:realm` writes, the `ae:processed` ledger). The request path keeps `VALKEY_*_TIMEOUT` (10ms); an eviction has no latency budget, and failing one delays it a whole visibility timeout. Must be positive |
 | `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | `false` / _(empty)_ | Opt-in switch for `/asyncapi`/`/asyncapi.yaml` in production (always on outside `APP_ENV=prod`); `DOCS_AUTH_TOKEN` optionally bearer-token-gates them once enabled; startup warns when `DOCS_ENABLED=true` in prod without `DOCS_AUTH_TOKEN` |
-| `AE_CTX_TTL` / `AE_CTX_JITTER` | `60s` / `6s` | §4.1 — desyncs expiry across replicas |
-| `AE_TENDER_ACL_TTL` / `AE_NEG_TTL` | `15s` / `5s` | Half the sibling's own TTL / negative-cache storm collapse |
+| `AE_CTX_TTL` / `AE_CTX_JITTER` | `60s` / `6s` | §4.1 — desyncs expiry across replicas. `AE_CTX_TTL`, `AE_TENDER_ACL_TTL` and `AE_NEG_TTL` must be positive (startup fails otherwise) |
+| `AE_TENDER_ACL_TTL` / `AE_NEG_TTL` | `15s` / `5s` | Half the sibling's own TTL / negative-cache storm collapse. |
 | `AE_RESTRICTED_NEG_TTL` / `AE_REALM_NEG_TTL` | `5s` each | L1 negative-cache TTLs for `RestrictedTenderSet`/`RealmMap` — separate from `AE_NEG_TTL` since each bounds a distinct security-propagation delay (how fast a replica notices another replica's write), not a shared performance knob |
 | `AE_PROCESSED_EVENT_TTL` | `192h` (8 days) | PE-1: must be strictly > 7-day SQS message lifetime to guarantee redelivered messages are still recognized as processed |
 | `AE_STALE_IF_ERROR_MAX_AGE` | `5m` | Hard-capped at 5m regardless of configured value (§7) |
