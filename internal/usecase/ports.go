@@ -15,22 +15,39 @@ import (
 // Cache is the port this layer needs from the Valkey outbound adapter.
 type Cache interface {
 	GetMembershipContext(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.CacheResult, error)
-	SetMembershipContext(ctx context.Context, tenant, user string, v domain.MembershipContext) error
+	// Write guard (§16 AE-51): every Set* that caches a sibling's answer
+	// writes only if a generation token still equals gen, read before the
+	// sibling call. Every matching Evict* replaces the token, so an eviction
+	// that lands while I-8 / TAC-4 is answering always wins.
+	//   - (tenant,user) token, GetSubjectGen: SetMembershipContext,
+	//     SetNegative, SetTenderACL; replaced by EvictMembershipContext,
+	//     EvictNegative, EvictTenderACL, EvictTenderACLForUser.
+	//   - tenant token, GetTenantGen: SetTenantContext; replaced by
+	//     EvictTenantContext.
+	// Tokens are never empty; a token that cannot be read means no write.
+	SetMembershipContext(ctx context.Context, tenant, user string, v domain.MembershipContext, gen string) error
 	EvictMembershipContext(ctx context.Context, tenant, user string) error
 
 	GetTenantContext(ctx context.Context, tenant string) (domain.TenantContext, domain.CacheResult, error)
-	SetTenantContext(ctx context.Context, tenant string, v domain.TenantContext) error
+	GetTenantGen(ctx context.Context, tenant string) (string, error)
+	SetTenantContext(ctx context.Context, tenant string, v domain.TenantContext, gen string) error
 	EvictTenantContext(ctx context.Context, tenant string) error
 
 	GetTenderACL(ctx context.Context, tenant, tender, user string) (domain.TenderACL, bool, error)
-	SetTenderACL(ctx context.Context, tenant, tender, user string, v domain.TenderACL) error
+	SetTenderACL(ctx context.Context, tenant, tender, user string, v domain.TenderACL, gen string) error
 	// EvictTenderACL deletes the single ae:tender_acl:{tenant}:{tender}:{user}
 	// entry when all three key components are known (TenderAccessGranted, §16 AE-TND-G1).
 	EvictTenderACL(ctx context.Context, tenant, tender, user string) error
 	EvictTenderACLForUser(ctx context.Context, tenant, user string) error
 
-	GetNegative(ctx context.Context, tenant, user string) (bool, error)
-	SetNegative(ctx context.Context, tenant, user string) error
+	// GetNegative returns the deny reason cached in ae:neg:{tenant}:{user},
+	// or "" when there is none. SetNegative caches reason for the fixed
+	// negative TTL (§4.3): DenyUnresolvableSubject or DenyMemberSuspended.
+	// Any other stored value reads back as DenyUnresolvableSubject
+	// (domain.NegativeCacheReason).
+	GetNegative(ctx context.Context, tenant, user string) (domain.DenyReason, error)
+	GetSubjectGen(ctx context.Context, tenant, user string) (string, error)
+	SetNegative(ctx context.Context, tenant, user string, reason domain.DenyReason, gen string) error
 	EvictNegative(ctx context.Context, tenant, user string) error
 
 	// Shared per-replica facts: competing SQS consumers deliver each
@@ -99,6 +116,12 @@ type Recorder interface {
 	// for the named event (e.g. "membership_revoked", "user_deleted") when
 	// EvictTenderACLForUser errors, making systematic SCAN failures alertable.
 	ObserveEvictionError(event string)
+	// ObserveCacheGuardError counts write-guard failures (§16 AE-51): op is
+	// "gen_read" (a token could not be read, so the matching cache write was
+	// skipped) or "guarded_write" (a guarded cache write failed). A sustained
+	// rate means caching has quietly stopped and every miss reaches the
+	// sibling — e.g. a Valkey ACL or proxy that refuses Lua scripts.
+	ObserveCacheGuardError(op string)
 }
 
 // NoopRecorder implements Recorder with no side effects.
@@ -116,6 +139,7 @@ func (NoopRecorder) ObserveDecisionLatency(time.Duration)    {}
 func (NoopRecorder) ObserveResidencyUnknown()                {}
 func (NoopRecorder) ObserveTACDependencyError()              {}
 func (NoopRecorder) ObserveEvictionError(string)             {}
+func (NoopRecorder) ObserveCacheGuardError(string)           {}
 
 // Logger mirrors platform-gincommon's port.Logger method set structurally —
 // that type lives in an internal package we cannot import directly, so every

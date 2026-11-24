@@ -123,6 +123,30 @@ tests:
               runbook: "docs/observability/runbooks.md#authzenrichmentcachehitratiolow"
               summary: "iam-authz-enrichment ae:ctx cache hit ratio below 50%"
 
+  # Write-guard failures (AE-51): sustained for 10m fires, per op; a 5m blip doesn't.
+  - interval: 1m
+    input_series:
+      - series: 'iam_authz_enrichment_cache_guard_errors_total{domain="iam",service="iam-authz-enrichment",environment="prod",op="gen_read"}'
+        values: '0+6x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AuthzEnrichmentCacheGuardErrors
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: AuthzEnrichmentCacheGuardErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: platform
+              domain: iam
+              service: iam-authz-enrichment
+              environment: prod
+              op: gen_read
+            exp_annotations:
+              description: "iam_authz_enrichment_cache_guard_errors_total{op=\"gen_read\"} has been increasing for 10 minutes in prod: guarded cache writes are being skipped, so misses are not cached and reach Org & Membership / iam-tender-acl. Check whether Valkey refuses Lua scripts (ACL without @scripting, a proxy blocking EVAL), is at maxmemory with noeviction, or is slow. Rate: 100m/s."
+              runbook: "docs/observability/runbooks.md#authzenrichmentcacheguarderrors"
+              summary: "iam-authz-enrichment cache write-guard failing — cache writes skipped"
+
   # No healthy target → down, with the static identity labels.
   - interval: 1m
     input_series:

@@ -4,10 +4,11 @@ package valkey
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
+	mrand "math/rand"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -89,19 +90,20 @@ func jitteredTTL(base, jitter time.Duration) time.Duration {
 	if jitter <= 0 {
 		return base
 	}
-	delta := time.Duration(rand.Int63n(int64(2*jitter+1))) - jitter
+	delta := time.Duration(mrand.Int63n(int64(2*jitter+1))) - jitter
 	return base + delta
 }
 
-func (c *Cache) setJittered(ctx context.Context, key string, value any, base, jitter, grace time.Duration) error {
+// setJittered writes a jittered-TTL envelope through setIfGen: only while the
+// guard's token is unchanged (§16 AE-51).
+func (c *Cache) setJittered(ctx context.Context, key string, value any, base, jitter, grace time.Duration, guard genGuard) error {
 	soft := jitteredTTL(base, jitter)
 	e := entry[any]{Value: value, FetchedAt: time.Now(), SoftTTL: soft}
 	b, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("marshal cache entry: %w", err)
 	}
-	physicalTTL := soft + grace
-	return c.client.Set(ctx, key, b, physicalTTL).Err()
+	return c.setIfGen(ctx, key, guard.key, b, soft+grace, guard.token)
 }
 
 func getJittered[T any](ctx context.Context, c *Cache, key string) (T, domain.CacheResult, error) {
@@ -114,8 +116,15 @@ func getJittered[T any](ctx context.Context, c *Cache, key string) (T, domain.Ca
 		return zero, domain.CacheMiss, err
 	}
 	var e entry[T]
-	if err := json.Unmarshal(raw, &e); err != nil {
-		return zero, domain.CacheMiss, fmt.Errorf("unmarshal cache entry %s: %w", key, err)
+	if json.Unmarshal(raw, &e) != nil {
+		// An entry that cannot be decoded (an old or foreign envelope) is
+		// dropped and read as a miss. Returning an error instead would mark
+		// Valkey unreachable on every request for this key, so the entry
+		// would never be overwritten and every request would reach I-8
+		// until its physical TTL ran out (§16 AE-51). The DEL is best
+		// effort: if it fails, the next guarded write replaces the entry.
+		_ = c.client.Del(ctx, key).Err()
+		return zero, domain.CacheMiss, nil //nolint:nilerr // a decode failure is a miss by design (see above)
 	}
 	if time.Since(e.FetchedAt) <= e.SoftTTL {
 		return e.Value, domain.CacheFresh, nil
@@ -130,14 +139,20 @@ func (c *Cache) GetMembershipContext(ctx context.Context, tenant, user string) (
 
 // SetMembershipContext writes ae:ctx:{tenant}:{user} — never includes
 // mfa_freshness_seconds; MembershipContext's type has no field for it (§4.4).
-func (c *Cache) SetMembershipContext(ctx context.Context, tenant, user string, v domain.MembershipContext) error {
-	return c.setJittered(ctx, ctxKey(tenant, user), v, c.ctxTTL, c.ctxJitter, c.staleIfErrorMaxAge)
+// The write happens only if the ae:gen token still equals gen — no
+// EvictMembershipContext / EvictNegative ran since the caller read it before
+// the I-8 call — so an in-flight rebuild cannot undo a membership event
+// (§16 AE-51). A skipped write is not an error.
+func (c *Cache) SetMembershipContext(ctx context.Context, tenant, user string, v domain.MembershipContext, gen string) error {
+	return c.setJittered(ctx, ctxKey(tenant, user), v, c.ctxTTL, c.ctxJitter, c.staleIfErrorMaxAge,
+		genGuard{key: subjectGenKey(tenant, user), token: gen})
 }
 
 // EvictMembershipContext deletes ae:ctx:{tenant}:{user} — the single-key
-// eviction used by every §5 membership/user event.
+// eviction used by every §5 membership/user event — and replaces the ae:gen
+// token in the same MULTI/EXEC (§16 AE-51).
 func (c *Cache) EvictMembershipContext(ctx context.Context, tenant, user string) error {
-	return c.client.Del(ctx, ctxKey(tenant, user)).Err()
+	return c.delAndReplaceGen(ctx, ctxKey(tenant, user), subjectGenKey(tenant, user))
 }
 
 // GetTenantContext reads ae:tenant:{tenant} and normalises ResidencyMode so
@@ -151,16 +166,21 @@ func (c *Cache) GetTenantContext(ctx context.Context, tenant string) (domain.Ten
 	return tc, result, err
 }
 
-// SetTenantContext writes ae:tenant:{tenant}.
-func (c *Cache) SetTenantContext(ctx context.Context, tenant string, v domain.TenantContext) error {
-	return c.setJittered(ctx, tenantKey(tenant), v, c.ctxTTL, c.ctxJitter, c.staleIfErrorMaxAge)
+// SetTenantContext writes ae:tenant:{tenant}, only while the tenant's
+// ae:tgen token still equals gen (read with GetTenantGen before the I-8
+// call), so a tenant event that evicts while I-8 is answering — a
+// cancellation turning on read_only, say — is never undone (§16 AE-51).
+func (c *Cache) SetTenantContext(ctx context.Context, tenant string, v domain.TenantContext, gen string) error {
+	return c.setJittered(ctx, tenantKey(tenant), v, c.ctxTTL, c.ctxJitter, c.staleIfErrorMaxAge,
+		genGuard{key: tenantGenKey(tenant), token: gen})
 }
 
 // EvictTenantContext deletes ae:tenant:{tenant} — the single-key eviction
 // used by every §5 billing/tenant-conversion event. This is exactly the
-// eviction §4.1 requires tenant-wide events to use instead of a SCAN.
+// eviction §4.1 requires tenant-wide events to use instead of a SCAN. It
+// replaces the ae:tgen token in the same MULTI/EXEC.
 func (c *Cache) EvictTenantContext(ctx context.Context, tenant string) error {
-	return c.client.Del(ctx, tenantKey(tenant)).Err()
+	return c.delAndReplaceGen(ctx, tenantKey(tenant), tenantGenKey(tenant))
 }
 
 // GetTenderACL reads ae:tender_acl:{tenant}:{tender}:{user}. No staleness
@@ -182,31 +202,38 @@ func (c *Cache) GetTenderACL(ctx context.Context, tenant, tender, user string) (
 }
 
 // SetTenderACL writes ae:tender_acl:{tenant}:{tender}:{user} with the fixed
-// 15s TTL (§4.1 — half the sibling service's own 30s TTL on the same data).
-func (c *Cache) SetTenderACL(ctx context.Context, tenant, tender, user string, v domain.TenderACL) error {
+// 15s TTL (§4.1 — half the sibling service's own 30s TTL on the same data),
+// only while the (tenant,user) ae:gen token still equals gen (read before
+// the TAC-4 call), so a tender-access event is never undone (§16 AE-51).
+func (c *Cache) SetTenderACL(ctx context.Context, tenant, tender, user string, v domain.TenderACL, gen string) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	return c.client.Set(ctx, tenderACLKey(tenant, tender, user), b, c.tenderACLTTL).Err()
+	return c.setIfGen(ctx, tenderACLKey(tenant, tender, user), subjectGenKey(tenant, user), b, c.tenderACLTTL, gen)
 }
 
 // EvictTenderACL deletes the single ae:tender_acl:{tenant}:{tender}:{user}
 // entry when all three key components are known (TenderAccessGranted — §16
-// AE-TND-G1). A plain DEL, not SCAN — fast and non-blocking.
+// AE-TND-G1), replacing the (tenant,user) ae:gen token in the same
+// MULTI/EXEC. A plain DEL, not SCAN — fast and non-blocking.
 func (c *Cache) EvictTenderACL(ctx context.Context, tenant, tender, user string) error {
-	return c.client.Del(ctx, tenderACLKey(tenant, tender, user)).Err()
+	return c.delAndReplaceGen(ctx, tenderACLKey(tenant, tender, user), subjectGenKey(tenant, user))
 }
 
 // EvictTenderACLForUser best-effort-deletes every ae:tender_acl entry for
 // (tenant, user) across all tenders (§5 UserDeleted). SCAN, not KEYS, to
 // avoid blocking Valkey — this is explicitly a best-effort path, so a partial
 // failure mid-scan is logged by the caller, not retried here.
+//
+// The (tenant,user) ae:gen token is replaced first, before any DEL: a TAC-4
+// rebuild that read the old token then cannot write back an entry the scan
+// has already deleted (§16 AE-51).
 func (c *Cache) EvictTenderACLForUser(ctx context.Context, tenant, user string) error {
 	pattern := tenderACLUserPattern(tenant, user)
 	var cursor uint64
 	for {
-		keys, next, err := c.client.Scan(ctx, cursor, pattern, 100).Result()
+		keys, next, err := c.scanTenderACL(ctx, tenant, user, pattern, cursor)
 		if err != nil {
 			return err
 		}
@@ -220,6 +247,22 @@ func (c *Cache) EvictTenderACLForUser(ctx context.Context, tenant, user string) 
 			return nil
 		}
 	}
+}
+
+// scanTenderACL runs one SCAN page for EvictTenderACLForUser, with the
+// (tenant,user) token SET ahead of it in the same pipeline, so the token is
+// replaced before anything is deleted. Replacing it again on later pages is
+// harmless: a rebuild that reads a newer token started after the event.
+func (c *Cache) scanTenderACL(ctx context.Context, tenant, user, pattern string, cursor uint64) ([]string, uint64, error) {
+	var scan *redis.ScanCmd
+	if _, err := c.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.Set(ctx, subjectGenKey(tenant, user), rand.Text(), subjectGenTTL)
+		scan = pipe.Scan(ctx, cursor, pattern, 100)
+		return nil
+	}); err != nil {
+		return nil, 0, err
+	}
+	return scan.Result()
 }
 
 // EvictRestrictedByTenant best-effort-deletes every ae:restricted entry for a
@@ -267,27 +310,118 @@ func (c *Cache) EvictRealmsByTenant(ctx context.Context, tenant string) error {
 }
 
 // GetNegative checks ae:neg:{tenant}:{user} — a cached "subject rebuild
-// returned 404" sentinel (§4.3).
-func (c *Cache) GetNegative(ctx context.Context, tenant, user string) (bool, error) {
-	err := c.client.Get(ctx, negativeKey(tenant, user)).Err()
+// found no active member" sentinel (§4.3) — and returns the deny reason it
+// holds, or "" when there is no entry. The value is the reason itself,
+// read back through domain.NegativeCacheReason: DENY_MEMBER_SUSPENDED for a
+// suspended member (§16 AE-51), DENY_UNRESOLVABLE_SUBJECT for anything else.
+func (c *Cache) GetNegative(ctx context.Context, tenant, user string) (domain.DenyReason, error) {
+	v, err := c.client.Get(ctx, negativeKey(tenant, user)).Result()
 	if errors.Is(err, redis.Nil) {
-		return false, nil
+		return "", nil
 	}
 	if err != nil {
-		return false, err
+		return "", err
 	}
-	return true, nil
+	return domain.NegativeCacheReason(v), nil
 }
 
-// SetNegative writes the ae:neg sentinel with its fixed 5s TTL.
-func (c *Cache) SetNegative(ctx context.Context, tenant, user string) error {
-	return c.client.Set(ctx, negativeKey(tenant, user), "1", c.negativeTTL).Err()
+// LoadScripts loads the write-guard Lua scripts into Valkey. Call it at
+// startup: a Valkey that refuses scripts (an ACL without @scripting, a proxy
+// that blocks EVAL) would otherwise only show up as every guarded cache write
+// being skipped (§16 AE-51).
+func (c *Cache) LoadScripts(ctx context.Context) error {
+	for _, s := range []*redis.Script{setIfGenScript, getOrCreateGenScript} {
+		if err := s.Load(ctx, c.client).Err(); err != nil {
+			return fmt.Errorf("load write-guard script: %w", err)
+		}
+	}
+	return nil
+}
+
+// subjectGenTTL is how long an ae:gen token lives. A write is guarded by
+// the token the rebuild read, which is never empty (GetSubjectGen creates
+// one if needed), and tokens never repeat. So a token that expires, is
+// replaced by an eviction, or is lost (maxmemory eviction, a failover) can
+// only make a guarded write skip — never let a stale one through.
+const subjectGenTTL = time.Hour
+
+// genGuard names the ae:gen token a guarded write must still match.
+type genGuard struct {
+	key, token string
+}
+
+// setIfGenScript writes KEYS[1] = ARGV[1] with PX ARGV[2] only while the
+// ae:gen token (KEYS[2]) exists and equals ARGV[3]. An empty ARGV[3] never
+// writes.
+var setIfGenScript = redis.NewScript(`
+if ARGV[3] == '' then return 0 end
+if redis.call('GET', KEYS[2]) ~= ARGV[3] then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+return 1`)
+
+func (c *Cache) setIfGen(ctx context.Context, key, genKey string, value any, ttl time.Duration, gen string) error {
+	return setIfGenScript.Run(ctx, c.client, []string{key, genKey}, value, max(ttl.Milliseconds(), 1), gen).Err()
+}
+
+// getOrCreateGenScript returns the ae:gen token (KEYS[1]), first setting it
+// to ARGV[1] with PX ARGV[2] if there is none.
+var getOrCreateGenScript = redis.NewScript(`
+local v = redis.call('GET', KEYS[1])
+if v then return v end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+return ARGV[1]`)
+
+// delAndReplaceGen deletes key and replaces the genKey token with a new
+// random one, atomically.
+func (c *Cache) delAndReplaceGen(ctx context.Context, key, genKey string) error {
+	_, err := c.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.Del(ctx, key)
+		pipe.Set(ctx, genKey, rand.Text(), subjectGenTTL)
+		return nil
+	})
+	return err
+}
+
+// getGen returns the token at genKey, never empty: a plain GET, and only
+// when there is no token the create script (a write). So a subject that
+// keeps missing — a non-member in a retry loop — costs one GET per request
+// once its token exists.
+func (c *Cache) getGen(ctx context.Context, genKey string) (string, error) {
+	v, err := c.client.Get(ctx, genKey).Result()
+	if err == nil {
+		return v, nil
+	}
+	if !errors.Is(err, redis.Nil) {
+		return "", err
+	}
+	return getOrCreateGenScript.Run(ctx, c.client, []string{genKey}, rand.Text(), subjectGenTTL.Milliseconds()).Text()
+}
+
+// GetSubjectGen returns the (tenant, user) ae:gen token, never empty. The
+// checker reads it before an I-8 or TAC-4 call and hands it to the guarded
+// SetMembershipContext / SetNegative / SetTenderACL (§16 AE-51).
+func (c *Cache) GetSubjectGen(ctx context.Context, tenant, user string) (string, error) {
+	return c.getGen(ctx, subjectGenKey(tenant, user))
+}
+
+// GetTenantGen returns the tenant's ae:tgen token, never empty, for the
+// guarded SetTenantContext.
+func (c *Cache) GetTenantGen(ctx context.Context, tenant string) (string, error) {
+	return c.getGen(ctx, tenantGenKey(tenant))
+}
+
+// SetNegative writes the ae:neg sentinel, holding reason, with its fixed 5s
+// TTL — but only if the ae:gen token still equals gen (see
+// SetMembershipContext). The check and the write are one atomic script.
+func (c *Cache) SetNegative(ctx context.Context, tenant, user string, reason domain.DenyReason, gen string) error {
+	return c.setIfGen(ctx, negativeKey(tenant, user), subjectGenKey(tenant, user), string(reason), c.negativeTTL, gen)
 }
 
 // EvictNegative deletes ae:neg:{tenant}:{user} — wired into every grant event
-// so a freshly-granted user is never held to the full 5s negative TTL (§4.3).
+// so a freshly-granted user is never held to the full 5s negative TTL (§4.3)
+// — and replaces the ae:gen token in the same MULTI/EXEC (§16 AE-51).
 func (c *Cache) EvictNegative(ctx context.Context, tenant, user string) error {
-	return c.client.Del(ctx, negativeKey(tenant, user)).Err()
+	return c.delAndReplaceGen(ctx, negativeKey(tenant, user), subjectGenKey(tenant, user))
 }
 
 // MarkProcessed implements the platform-events processed_events contract

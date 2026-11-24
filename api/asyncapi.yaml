@@ -178,7 +178,8 @@ info:
         TenantConverted in the filter, HandleTenantRealmReady is never
         invoked, and any future RP path that emits TenantRealmReady without
         TenantConverted would leave the realm map un-updated, causing
-        DENY_UNRESOLVABLE_SUBJECT for all users in that realm. The note in
+        DENY_MALFORMED_IDENTITY (issuer maps to no tenant) for all users in
+        that realm. The note in
         an earlier revision of this spec that said "direct-paid signup fires
         only TenantRealmReady" was incorrect — RP-2 has always emitted both.
     TenantSuspended:

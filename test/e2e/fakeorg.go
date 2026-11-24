@@ -91,6 +91,13 @@ func (m *fakeOrg) setMembership(tenant, user string, f membershipFixture) {
 	m.memberships[tenant+"/"+user] = f
 }
 
+// deleteMembership makes I-8 answer 404 for (tenant, user) from now on.
+func (m *fakeOrg) deleteMembership(tenant, user string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.memberships, tenant+"/"+user)
+}
+
 func (m *fakeOrg) setMFAFreshness(tenant string, seconds int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

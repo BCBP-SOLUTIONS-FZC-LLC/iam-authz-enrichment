@@ -86,11 +86,7 @@ func TestStandard_ProductionRegistrationOrder(t *testing.T) {
 // (an unsampled vec has no series, and its values would go unchecked).
 func exerciseEveryCollector(r *Recorder) {
 	r.ObserveDecision("", true)
-	for _, reason := range []domain.DenyReason{
-		domain.DenyUnresolvableSubject, domain.DenyTenantReadOnly, domain.DenyMFAStale,
-		domain.DenyTenderACLInsufficient, domain.DenyRoleInsufficient,
-		domain.DenyServiceUnavailable, domain.DenyMalformedIdentity,
-	} {
+	for _, reason := range domain.DenyReasons() {
 		r.ObserveDecision(reason, false)
 	}
 	r.ObserveCacheHit(true)
@@ -105,6 +101,8 @@ func exerciseEveryCollector(r *Recorder) {
 	r.ObserveTACDependencyError()
 	r.ObserveEvictionError("membership_revoked")
 	r.ObserveEvictionError("user_deleted")
+	r.ObserveCacheGuardError("gen_read")
+	r.ObserveCacheGuardError("guarded_write")
 }
 
 // exerciseGRPCInterceptors runs one Check call through the production gRPC

@@ -107,6 +107,7 @@ func grpcCode(status int) codes.Code {
 var denyDetails = map[domain.DenyReason]string{
 	domain.DenyMalformedIdentity:     "The request has no valid identity.",
 	domain.DenyUnresolvableSubject:   "The caller is not an active member of this tenant.",
+	domain.DenyMemberSuspended:       "The caller's membership in this tenant is suspended.",
 	domain.DenyTenantReadOnly:        "The tenant is read-only; changes are not allowed.",
 	domain.DenyMFAStale:              "This action needs a recent multi-factor sign-in.",
 	domain.DenyTenderACLInsufficient: "The caller does not have the access level this tender requires.",

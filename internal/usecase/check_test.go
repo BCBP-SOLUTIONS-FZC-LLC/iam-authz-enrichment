@@ -3,6 +3,7 @@ package usecase_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -141,6 +142,210 @@ func TestCheck_NegativeCacheHit_ShortCircuits_NoSiblingCall(t *testing.T) {
 	assert.Zero(t, org.MembershipCalls, "§4.3: a negative-cache hit must collapse the repeat rebuild call")
 }
 
+// §16 AE-51: a suspended member (I-8 200, status "suspended") is denied
+// DENY_MEMBER_SUSPENDED, not DENY_UNRESOLVABLE_SUBJECT, and the reason is
+// negative-cached so the next requests in the 5s window agree.
+func TestCheck_SubjectResolution_Suspended_DeniesMemberSuspended(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.MembershipContext{Roles: []string{"tenant_admin"}}, domain.CacheStale)
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error) {
+			return domain.MembershipContext{}, domain.TenantContext{}, fmt.Errorf("%w: %w", domain.ErrNotFound, domain.ErrMemberSuspended)
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.False(t, decision.Allow)
+	assert.Equal(t, domain.DenyMemberSuspended, decision.Reason)
+	assert.Empty(t, decision.Headers)
+	assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:"+tenant+":"+user,
+		"a suspended member's stale ae:ctx must go, as for a non-member (AE-47)")
+
+	// The next request hits ae:neg and keeps the suspended reason.
+	decision = checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+	assert.Equal(t, domain.DenyMemberSuspended, decision.Reason)
+	assert.Equal(t, int64(1), org.MembershipCalls, "the second request must be served from ae:neg")
+}
+
+// An adapter that returns ErrMemberSuspended without ErrNotFound must still
+// be denied as suspended, never treated as an outage that serves stale roles.
+func TestCheck_SubjectResolution_SuspendedAlone_NeverServesStale(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.MembershipContext{Roles: []string{"tenant_admin"}}, domain.CacheStale)
+	cache.SeedTenantContext(tenant, domain.TenantContext{Plan: "pro", ResidencyMode: "standard"}, domain.CacheStale)
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error) {
+			return domain.MembershipContext{}, domain.TenantContext{}, domain.ErrMemberSuspended
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.False(t, decision.Allow, "a suspended member must never be allowed from a stale entry")
+	assert.Equal(t, domain.DenyMemberSuspended, decision.Reason)
+}
+
+// §16 AE-51: a membership event that evicts ae:neg while I-8 is answering
+// must win — the older answer is not written back.
+func TestCheck_SubjectResolution_EvictionDuringI8_SkipsNegativeWrite(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tn, u string) (domain.MembershipContext, domain.TenantContext, error) {
+			require.NoError(t, cache.EvictNegative(ctx, tn, u)) // e.g. TenantRoleGranted consumed now
+			return domain.MembershipContext{}, domain.TenantContext{}, fmt.Errorf("%w: %w", domain.ErrNotFound, domain.ErrMemberSuspended)
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.Equal(t, domain.DenyMemberSuspended, decision.Reason, "this request still gets I-8's answer")
+	assert.Contains(t, cache.SortedCalls(), "SetNegativeSkipped:"+tenant+":"+user)
+	neg, err := cache.GetNegative(context.Background(), tenant, user)
+	require.NoError(t, err)
+	assert.Empty(t, neg, "the pre-event answer must not be cached")
+}
+
+// If the write-guard token cannot be read, neither ae:neg nor ae:ctx is
+// written (the write could not be guarded), but the decision is unchanged.
+func TestCheck_SubjectResolution_GenReadFails_NoNegativeWrite(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.GenErr = errors.New("valkey blip")
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error) {
+			return domain.MembershipContext{}, domain.TenantContext{}, domain.ErrNotFound
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.Equal(t, domain.DenyUnresolvableSubject, decision.Reason)
+	assert.NotContains(t, cache.SortedCalls(), "SetNegative:"+tenant+":"+user)
+}
+
+func TestCheck_Allow_GenReadFails_DoesNotCacheCtx(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.GenErr = errors.New("valkey blip")
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error) {
+			return domain.MembershipContext{Roles: []string{"tenant_admin"}}, domain.TenantContext{Plan: "pro", ResidencyMode: "standard"}, nil
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.True(t, decision.Allow)
+	assert.NotContains(t, cache.SortedCalls(), "SetMembershipContext:"+tenant+":"+user)
+}
+
+// §16 AE-51: a revoke event that evicts ae:ctx while I-8 is answering must
+// win — the pre-revoke roles are not written back.
+func TestCheck_Allow_EvictionDuringI8_SkipsCtxWrite(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tn, u string) (domain.MembershipContext, domain.TenantContext, error) {
+			require.NoError(t, cache.EvictMembershipContext(ctx, tn, u)) // TenantRoleRevoked consumed now
+			return domain.MembershipContext{Roles: []string{"tenant_admin"}}, domain.TenantContext{Plan: "pro", ResidencyMode: "standard"}, nil
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.True(t, decision.Allow, "this request still gets I-8's answer")
+	assert.Contains(t, cache.SortedCalls(), "SetMembershipContextSkipped:"+tenant+":"+user)
+	_, res, err := cache.GetMembershipContext(context.Background(), tenant, user)
+	require.NoError(t, err)
+	assert.Equal(t, domain.CacheMiss, res, "the pre-revoke roles must not be cached")
+}
+
+// Only the ae:ctx read failed (a timeout): no blind DEL is sent, so a
+// retrying non-member does not cost a Valkey write per request (AE-51). An
+// undecodable entry never gets here: the cache deletes it and reads a miss.
+func TestCheck_SubjectResolution_CtxReadFailed_NoBlindEvict(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.CtxErr = errors.New("ae:ctx read timed out")
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error) {
+			return domain.MembershipContext{}, domain.TenantContext{}, domain.ErrNotFound
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.Equal(t, domain.DenyUnresolvableSubject, decision.Reason)
+	assert.NotContains(t, cache.SortedCalls(), "EvictMembershipContext:"+tenant+":"+user)
+}
+
+// Both reads failed (Valkey down): no eviction attempt, which would only add
+// a timeout and a Warn per deny.
+func TestCheck_SubjectResolution_ValkeyDown_NoEvictAttempt(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.CtxErr = errors.New("valkey down")
+	cache.TenantErr = errors.New("valkey down")
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error) {
+			return domain.MembershipContext{}, domain.TenantContext{}, domain.ErrNotFound
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.Equal(t, domain.DenyUnresolvableSubject, decision.Reason)
+	assert.NotContains(t, cache.SortedCalls(), "EvictMembershipContext:"+tenant+":"+user)
+}
+
+// §16 AE-51: when a cache read failed, a suspended answer still tries to
+// evict ae:ctx, so a later I-8 outage cannot serve the old roles.
+func TestCheck_SubjectResolution_ReadFailed_StillEvictsCtx(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.MembershipContext{Roles: []string{"tenant_admin"}}, domain.CacheStale)
+	cache.TenantErr = errors.New("ae:tenant read timed out")
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error) {
+			return domain.MembershipContext{}, domain.TenantContext{}, fmt.Errorf("%w: %w", domain.ErrNotFound, domain.ErrMemberSuspended)
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.Equal(t, domain.DenyMemberSuspended, decision.Reason)
+	assert.Contains(t, cache.SortedCalls(), "EvictMembershipContext:"+tenant+":"+user,
+		"the stale roles must go even though a read failed")
+	assert.NotContains(t, cache.SortedCalls(), "SetNegative:"+tenant+":"+user,
+		"no guarded write is possible when Valkey looked unreachable")
+}
+
+func TestCheck_NegativeCacheHit_Suspended_KeepsReason(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedNegativeReason(tenant, user, domain.DenyMemberSuspended)
+	org := &fixtures.FakeOrgMembershipClient{}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.Equal(t, domain.DenyMemberSuspended, decision.Reason)
+	assert.Zero(t, org.MembershipCalls)
+}
+
 func TestCheck_FreshCacheHit_Allows_NoSiblingCall(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()
@@ -276,7 +481,9 @@ func TestCheck_TenderACL_CacheHit_SkipsSiblingCall(t *testing.T) {
 	cache := fixtures.NewFakeCache()
 	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
 	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
-	require.NoError(t, cache.SetTenderACL(context.Background(), tenant, "tender-1", user, domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}))
+	gen, err := cache.GetSubjectGen(context.Background(), tenant, user)
+	require.NoError(t, err)
+	require.NoError(t, cache.SetTenderACL(context.Background(), tenant, "tender-1", user, domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}, gen))
 	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
 	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
 	org := &fixtures.FakeOrgMembershipClient{}
@@ -336,6 +543,91 @@ func TestCheck_TenderACL_GetCacheErrors_FallsThroughToSibling(t *testing.T) {
 
 	assert.True(t, decision.Allow)
 	assert.Equal(t, int64(1), org.TenderACLCalls)
+}
+
+// tenderRaceChecker returns a checker whose TAC-4 call runs during(cache)
+// before answering with a grant, plus the request facts that reach it.
+func tenderRaceChecker(t *testing.T, cache *fixtures.FakeCache, during func()) (*usecase.Checker, policy.RequestFacts) {
+	t.Helper()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.NewTenantContext(), domain.CacheFresh)
+	restricted := usecase.NewRestrictedTenderSet(5 * time.Second)
+	require.NoError(t, restricted.MarkRestricted(context.Background(), tenant, "tender-1"))
+	org := &fixtures.FakeOrgMembershipClient{
+		GetTenderACLFunc: func(ctx context.Context, tenant, tenderID, user string) (domain.TenderACL, error) {
+			during()
+			return domain.TenderACL{HasAccess: true, AccessLevel: strPtr(domain.AccessLevelApprove)}, nil
+		},
+	}
+	return newTestChecker(cache, org, restricted), policy.RequestFacts{
+		Method: "GET", TenderID: "tender-1", RequiredAccessLevel: domain.AccessLevelView,
+	}
+}
+
+// §16 AE-51: a tender-access event that evicts while TAC-4 is answering wins.
+func TestCheck_TenderACL_EvictionDuringTAC4_SkipsWrite(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	checker, req := tenderRaceChecker(t, cache, func() {
+		require.NoError(t, cache.EvictTenderACLForUser(context.Background(), tenant, user))
+	})
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims(), Request: req})
+
+	assert.True(t, decision.Allow, "this request still gets TAC-4's answer")
+	assert.Contains(t, cache.SortedCalls(), "SetTenderACLSkipped:"+tenant+":tender-1:"+user)
+}
+
+func TestCheck_TenderACL_GenReadFails_NoWrite(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.GenErr = errors.New("valkey blip")
+	checker, req := tenderRaceChecker(t, cache, func() {})
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims(), Request: req})
+
+	assert.True(t, decision.Allow)
+	assert.NotContains(t, cache.SortedCalls(), "SetTenderACL:"+tenant+":tender-1:"+user)
+}
+
+// §16 AE-51: a tenant event (e.g. a cancellation turning on read_only) that
+// evicts ae:tenant while I-8 is answering is not undone.
+func TestCheck_Allow_TenantEvictionDuringI8_SkipsTenantWrite(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tn, u string) (domain.MembershipContext, domain.TenantContext, error) {
+			require.NoError(t, cache.EvictTenantContext(ctx, tn))
+			return domain.MembershipContext{Roles: []string{"tenant_admin"}}, domain.TenantContext{Plan: "pro", ResidencyMode: "standard"}, nil
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.True(t, decision.Allow)
+	assert.Contains(t, cache.SortedCalls(), "SetTenantContextSkipped:"+tenant)
+	assert.Contains(t, cache.SortedCalls(), "SetMembershipContext:"+tenant+":"+user)
+	assert.NotContains(t, cache.SortedCalls(), "SetMembershipContextSkipped:"+tenant+":"+user,
+		"a tenant eviction does not touch the user token")
+}
+
+func TestCheck_Allow_TenantGenReadFails_NoTenantWrite(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.TenantGenErr = errors.New("valkey blip")
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, tenant, user string) (domain.MembershipContext, domain.TenantContext, error) {
+			return domain.MembershipContext{Roles: []string{"tenant_admin"}}, domain.TenantContext{Plan: "pro", ResidencyMode: "standard"}, nil
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+
+	assert.True(t, decision.Allow)
+	assert.NotContains(t, cache.SortedCalls(), "SetTenantContext:"+tenant)
+	assert.Contains(t, cache.SortedCalls(), "SetMembershipContext:"+tenant+":"+user)
 }
 
 func TestCheck_TenderACL_Allow_WhenSufficientGrant(t *testing.T) {
@@ -794,6 +1086,43 @@ func TestCheck_Singleflight_FirstCallerCancelled_OthersUnaffected(t *testing.T) 
 	assert.Equal(t, int64(1), atomic.LoadInt64(&org.MembershipCalls), "still one coalesced I-8 call")
 }
 
+// §16 AE-51: a request that starts after a revocation evicted ae:ctx must
+// not join an I-8 call that started before it — that call may return the
+// revoked roles. The write-guard token is part of the singleflight key, so B
+// (which read the new token) makes its own call and gets the fresh answer.
+func TestCheck_Singleflight_EvictionBetweenCallers_DoesNotShare(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls int64
+	cache := fixtures.NewFakeCache()
+	org := &fixtures.FakeOrgMembershipClient{
+		GetMembershipsFunc: func(ctx context.Context, _, _ string) (domain.MembershipContext, domain.TenantContext, error) {
+			tc := domain.TenantContext{Plan: "pro", ResidencyMode: "standard"}
+			if atomic.AddInt64(&calls, 1) == 1 {
+				started <- struct{}{}
+				<-release
+				return domain.MembershipContext{Roles: []string{"tenant_admin"}}, tc, nil // pre-revoke
+			}
+			return domain.MembershipContext{Roles: []string{"member"}}, tc, nil // post-revoke
+		},
+	}
+	checker := newTestChecker(cache, org, nil)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()}) }()
+	<-started
+	require.NoError(t, cache.EvictMembershipContext(context.Background(), tenant, user)) // TenantRoleRevoked
+
+	decB := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims()})
+	close(release)
+	wg.Wait()
+
+	require.True(t, decB.Allow)
+	assert.Equal(t, "member", decB.Headers[domain.HeaderTenantRoles], "B must not get the pre-revoke roles")
+	assert.Equal(t, int64(2), atomic.LoadInt64(&calls), "B made its own I-8 call")
+}
+
 // ─── read_only in x-feature-flags (§4.6 gap-closure contract) ───────────────
 
 // A cancelled-grace-period tenant: reads are allowed and x-feature-flags must
@@ -1047,6 +1376,7 @@ func TestDenyCodes_Pinned(t *testing.T) {
 		status int
 	}{
 		{domain.DenyUnresolvableSubject, "DENY_UNRESOLVABLE_SUBJECT", 403},
+		{domain.DenyMemberSuspended, "DENY_MEMBER_SUSPENDED", 403},
 		{domain.DenyTenantReadOnly, "DENY_TENANT_READ_ONLY", 403},
 		{domain.DenyMFAStale, "DENY_MFA_STALE", 403},
 		{domain.DenyTenderACLInsufficient, "DENY_TENDER_ACL_INSUFFICIENT", 403},

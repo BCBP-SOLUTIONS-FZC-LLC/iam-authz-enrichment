@@ -3,7 +3,8 @@ flowchart TD
         k1["ae:ctx:{tenant}:{user} → MembershipContext (roles, departments)\nsoft TTL 60s ± 6s jitter · physical TTL = soft + 5m grace"]
         k2["ae:tenant:{tenant} → TenantContext (plan, feature_flags, subscription_status, read_only)\nsplit from ae:ctx so a tenant-wide event is ALWAYS a single-key eviction, never a SCAN\nsame soft-TTL/grace envelope as ae:ctx"]
         k3["ae:tender_acl:{tenant}:{tender}:{user} → TenderACL{has_access, access_level}\nflat 15s TTL — half the sibling's own 30s TTL — no stale-if-error branch"]
-        k4["ae:neg:{tenant}:{user} → sentinel — subject rebuild returned 404\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
+        k4["ae:neg:{tenant}:{user} → deny reason — subject rebuild found no active member\n(DENY_UNRESOLVABLE_SUBJECT or DENY_MEMBER_SUSPENDED, AE-51)\nflat 5s TTL — collapses a retry storm to 1 rebuild call / 5s / offending pair"]
+        k4b["ae:gen:{tenant}:{user} / ae:tgen:{tenant} → random write-guard token, 1h TTL (AE-51)\nreplaced by every eviction of ae:ctx / ae:neg / ae:tender_acl (gen) or ae:tenant (tgen)\na rebuild reads it before I-8 / TAC-4; its cache write lands only if the token is unchanged"]
         k5["ae:processed:{event_id} → SET NX sentinel, 7-day TTL\nconsumer idempotency — the SET-NX equivalent of ON CONFLICT DO NOTHING"]
         k6["mfa_freshness_seconds  →  NEVER CACHED, no key exists (§4.4)\nfetched fresh per approver-gated request from I-14 ONLY —\nfolding it into ae:ctx would delay a tightened MFA window by up to 60s"]
         k7["ae:realm:{issuer} → tenant_id, no TTL — write-once, never unmapped\nRealmMap's L1: positive entries cached forever; negative entries cached\nfor AE_REALM_NEG_TTL (default 5s) only — a transient store error is\nnever cached, only a confirmed miss"]
@@ -24,7 +25,7 @@ flowchart TD
         r1(["GetMembershipContext + GetTenantContext"]) --> r2{"both Fresh?"}
         r2 -- yes --> r3["use cached value — done"]
         r2 -- no --> r4{"Valkey reachable\nAND ae:neg hit?"}
-        r4 -- yes --> r5["Deny DENY_UNRESOLVABLE_SUBJECT\n— no sibling call at all"]
+        r4 -- yes --> r5["Deny with the cached reason\n(DENY_UNRESOLVABLE_SUBJECT or DENY_MEMBER_SUSPENDED)\n— no sibling call at all"]
         r4 -- no --> r6["singleflight-coalesced\nGetMemberships call"]
         r6 --> r7{"result?"}
         r7 -- "404" --> r8["SetNegative (best-effort) → Deny"]

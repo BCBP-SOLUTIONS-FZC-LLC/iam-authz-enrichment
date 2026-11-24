@@ -114,7 +114,8 @@ func TestUnresolvableSubject_Deny(t *testing.T) {
 
 // TestSuspendedMember_Deny proves §8.2.1: I-8 answers 200 for a suspended
 // member, with status "suspended" and their (untouched) role grants; this
-// service must still deny them like a non-member, never inject their roles.
+// service must deny them, never inject their roles, and say so with its own
+// reason, DENY_MEMBER_SUSPENDED (§16 AE-51), not the non-member one.
 func TestSuspendedMember_Deny(t *testing.T) {
 	tenant, user := id("tenant-e2e-suspended"), "suspended-user"
 	org.setMembership(tenant, user, membershipFixture{
@@ -127,7 +128,13 @@ func TestSuspendedMember_Deny(t *testing.T) {
 	resp := doCheck(t, buildCheckRequest(t, user, tenant, 0, "GET", "/api/v1/tenders", nil))
 
 	require.Nil(t, resp.GetOkResponse(), "a suspended member must not be allowed")
-	require.Equal(t, "DENY_UNRESOLVABLE_SUBJECT", denyReason(resp))
+	require.Equal(t, "DENY_MEMBER_SUSPENDED", denyReason(resp))
+
+	// I-8 now answers 404, so only an ae:neg hit (5s TTL) can still say
+	// "suspended": the second request proves the reason survives real Valkey.
+	org.deleteMembership(tenant, user)
+	resp = doCheck(t, buildCheckRequest(t, user, tenant, 0, "GET", "/api/v1/tenders", nil))
+	require.Equal(t, "DENY_MEMBER_SUSPENDED", denyReason(resp), "must be served from ae:neg, not a fresh I-8 call")
 }
 
 // TestReadOnlyTenant_DeniesWrite proves policy 6 — a blanket tenant-level
