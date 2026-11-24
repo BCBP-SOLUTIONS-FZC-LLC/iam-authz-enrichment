@@ -8,32 +8,28 @@
 #                       └────────────────┤──► push       (push events only, needs quality too)
 #   validate-quality ───────────────────┘
 #
-# validate-test: unit + integration + e2e (real compiled binary over real gRPC
-# against real Valkey/LocalStack) with race detector + 100% coverage gate.
-# All three tiers run in a single job (same service containers, one checkout) —
-# the same pattern iam-tender-acl uses. validate-quality: fmt/vet/lint/arch-lint/
-# observability-lint/database-lint/events-lint/image-pin-lint/metrics-check/mod-verify/vuln-check.
-# Both live in validate-test.yml/validate-quality.yml
-# (reusable workflows) so release.yml can call the exact same gate rather
-# than duplicating it — this split wasn't earning its keep before
-# release.yml existed as a second caller (see that file's header comment).
-# build-image: Dockerfile lint + build-to-cache (no local load — trivy/smoke
-# each restore their own copy from the GHA cache).
+# build-image lints the Dockerfile (Hadolint + .dockerignore check) as its
+# first steps, before the expensive build — a lint failure never starts the
+# build, and there's no separate lint-dockerfile job to pay a job-minute for.
+# validate-test runs the race+coverage gate and gates trivy/smoke (correctness).
+# validate-quality gates push/release only (style + lint + Helm chart validation).
+# pr-summary posts a status table on pull_request events (always() so a failure
+# summary is still posted when upstream jobs fail).
 #
-# pr-summary posts a single status comment on pull_request events. push
-# publishes to GHCR on push to main, with SBOM/provenance attestations and
-# Cosign keyless signing — no long-lived signing key, no secret beyond the
-# default GITHUB_TOKEN. Requires repo Settings → Actions → Workflow
-# permissions set to "Read and write", or the GHCR login/push step fails.
+# paths-ignore skips this entire (expensive) pipeline for commits that only
+# touch Markdown docs or the mermaid diagrams — those can't affect test/build
+# outcomes. A commit that touches both docs and code still runs normally
+# (paths-ignore only skips when EVERY changed file matches).
+#
 name: CI
 
 "on":
   push:
     branches: [main, master]
-    paths-ignore: ["**.md", "docs/architecture/**"]
+    paths-ignore: ['**.md', 'docs/architecture/**']
   pull_request:
     branches: [main, master]
-    paths-ignore: ["**.md", "docs/architecture/**"]
+    paths-ignore: ['**.md', 'docs/architecture/**']
   workflow_dispatch:
 
 permissions:
