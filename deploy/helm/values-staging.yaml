@@ -1,0 +1,15 @@
+# Staging environment overrides for iam-authz-enrichment.
+# Merge with base values.yaml: helm upgrade ... -f values.yaml -f values-staging.yaml
+#
+# Only keys that differ from values.yaml appear here.
+
+env:
+  APP_ENV: "staging"
+  LOG_LEVEL: "info"
+  OTEL_TRACES_SAMPLER_RATIO: "0.5"
+  # CD-52 / OP-G3: platform realm issuer (OP-G1 merged; OP-G2 gateway
+  # provider still pending — no platform-realm JWTs reach this service until
+  # OP-G2 is deployed, so this value is safe to set now). Must differ from
+  # SHARED_REALM_ISSUER and every dedicated realm (startup check in
+  # config.Load). Startup emits "operator path enabled" once set.
+  OPERATOR_REALM_ISSUER: "https://auth.bcbpsolutions.com/realms/bcbp-platform"

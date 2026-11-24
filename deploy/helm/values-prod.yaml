@@ -1,0 +1,21 @@
+# Prod environment overrides for iam-authz-enrichment.
+# Merge with base values.yaml: helm upgrade ... -f values.yaml -f values-prod.yaml
+#
+# Only keys that differ from values.yaml appear here.
+
+env:
+  APP_ENV: "prod"
+  LOG_LEVEL: "info"
+  OTEL_TRACES_SAMPLER_RATIO: "0.1"
+  # CD-52 / OP-G3: platform realm issuer (OP-G1 merged; OP-G2 gateway
+  # provider still pending — no platform-realm JWTs reach this service until
+  # OP-G2 is deployed, so this value is safe to set now). Must differ from
+  # SHARED_REALM_ISSUER and every dedicated realm (startup check in
+  # config.Load). Startup emits "operator path enabled" once set.
+  OPERATOR_REALM_ISSUER: "https://auth.bcbpsolutions.com/realms/bcbp-platform"
+
+# Required when APP_ENV=prod and grpcTLS.enabled=false: confirms a service
+# mesh or CNI layer provides mTLS to this pod. The chart fails to render
+# without this (deploy/helm/templates/deployment.yaml line 1).
+grpcTLS:
+  meshProvidesMTLS: true

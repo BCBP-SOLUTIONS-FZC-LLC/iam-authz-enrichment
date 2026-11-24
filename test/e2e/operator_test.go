@@ -60,6 +60,53 @@ func TestOperator_NonTenantRoute_GetsNilTenant(t *testing.T) {
 	require.Equal(t, "00000000-0000-0000-0000-000000000000", headerMap(resp)["x-tenant-id"])
 }
 
+// A-10 (a) BL-OQ-26: all platform-realm roles forwarded in x-tenant-roles so
+// Billing can gate on pci_owner_reviewer without AuthZ knowing the role name.
+func TestOperator_MultiRoleForwarded(t *testing.T) {
+	const certID = "d3e5f7a9-2b4c-6d8e-0f1a-3b5c7d9e1f2a"
+	resp := doCheck(t, buildOperatorRequest(t, "POST",
+		"/api/v1/operator/billing/provider-certifications/"+certID+"/review",
+		"platform_operator", "pci_owner_reviewer"))
+
+	require.NotNil(t, resp.GetOkResponse(), "expected Allow, got %q", denyReason(resp))
+	require.Equal(t, "platform_operator,pci_owner_reviewer", headerMap(resp)["x-tenant-roles"])
+	require.Equal(t, "00000000-0000-0000-0000-000000000000", headerMap(resp)["x-tenant-id"])
+}
+
+// A-10 (b) BL-OQ-26 / B-O17: POST /api/v1/operator/billing/provider-certifications/:id/review
+// No tenant UUID in path → x-tenant-id = nil UUID; Billing gates on pci_owner_reviewer itself.
+func TestOperator_ProviderCertificationReview_AllowAndDeny(t *testing.T) {
+	const certID = "d3e5f7a9-2b4c-6d8e-0f1a-3b5c7d9e1f2a"
+	path := "/api/v1/operator/billing/provider-certifications/" + certID + "/review"
+
+	resp := doCheck(t, buildOperatorRequest(t, "POST", path, "platform_operator", "pci_owner_reviewer"))
+	require.NotNil(t, resp.GetOkResponse(), "expected Allow, got %q", denyReason(resp))
+	require.Equal(t, "00000000-0000-0000-0000-000000000000", headerMap(resp)["x-tenant-id"])
+
+	resp = doCheck(t, buildOperatorRequest(t, "POST", path))
+	require.Nil(t, resp.GetOkResponse(), "no platform_operator must be denied")
+	require.Equal(t, "DENY_ROLE_INSUFFICIENT", denyReason(resp))
+}
+
+// A-9 (a) BL-OQ-25 / B-O16: POST /api/v1/operator/tenants/:id/invoices/:invoice_id/disposition
+func TestOperator_InvoiceDisposition_AllowAndDeny(t *testing.T) {
+	const invoiceID = "c2d4e6f8-1a3b-4c5d-9e0f-2a4b6c8d0e1f"
+	path := "/api/v1/operator/tenants/" + e2eOperatorTenant + "/invoices/" + invoiceID + "/disposition"
+
+	resp := doCheck(t, buildOperatorRequest(t, "POST", path, "platform_operator"))
+	require.NotNil(t, resp.GetOkResponse(), "expected Allow, got %q", denyReason(resp))
+	require.Equal(t, e2eOperatorTenant, headerMap(resp)["x-tenant-id"])
+
+	resp = doCheck(t, buildOperatorRequest(t, "POST", path))
+	require.Nil(t, resp.GetOkResponse(), "no platform_operator role must be denied")
+	require.Equal(t, "DENY_ROLE_INSUFFICIENT", denyReason(resp))
+
+	resp = doCheck(t, buildOperatorRequest(t, "POST",
+		"/api/v1/operator/tenants/not-a-uuid/invoices/"+invoiceID+"/disposition", "platform_operator"))
+	require.Nil(t, resp.GetOkResponse(), "malformed tenant UUID must be denied")
+	require.Equal(t, "DENY_MALFORMED_IDENTITY", denyReason(resp))
+}
+
 func TestOperator_Denials(t *testing.T) {
 	cases := map[string]struct {
 		req    *authv3.CheckRequest

@@ -42,6 +42,14 @@ Does NOT read a metric back from the Gatherer — platform-events' former per-qu
 
 The e2e harness pins `SQS_WAIT_SECONDS=1` / `SQS_VISIBILITY_TIMEOUT=5s` for isolation — don't remove them.
 
+## internal/usecase/operator.go
+
+**Gate vs. forwarding distinction (A-10, BL-OQ-26):** `operatorDecision` gates entry on `PlatformOperatorRole` (`platform_operator`) — a token without it is denied `DENY_ROLE_INSUFFICIENT` before `operatorDecision` is called — but injects `x-tenant-roles: strings.Join(claims.Roles, ",")` (the full set of platform-realm roles). These are intentionally different: the gate is a single hard rule owned by AuthZ; what roles downstream services act on is their own concern. Never revert `HeaderTenantRoles` to `domain.PlatformOperatorRole` — that would silently break Billing's `pci_owner_reviewer` gate (B-O17).
+
+**`operatorTenantFromPath` depth-agnostic (A-9):** cuts everything after `tenants/`, validates the next path segment as a UUID, and ignores everything after the UUID. This correctly handles both shallow (`/api/v1/operator/tenants/:id/entitlement-overrides/:key`) and deep paths (`/api/v1/operator/tenants/:id/invoices/:invoice_id/disposition`) without any per-route enumeration. If a new deep route is added, it already works.
+
+**Non-tenant operator routes → nil UUID:** any `/api/v1/operator/` path that does not contain `tenants/` returns `NilTenantID` ("00000000-0000-0000-0000-000000000000") as `x-tenant-id`. This is a protocol constant used by all IAM services for cross-tenant operations (IAM HLD §7.2). Downstream can use it as "no specific tenant targeted".
+
 ## internal/usecase/failure.go
 
 `DecideDependencyOutcome()` is the §7 table as a pure package-level function (not scattered in adapter code) so the test suite can exercise every row directly. The tender-ACL overlay's fail-closed rule is independent of this table — checked separately in `check.go`.

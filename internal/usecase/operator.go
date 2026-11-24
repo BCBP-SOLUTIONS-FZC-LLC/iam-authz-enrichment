@@ -32,9 +32,11 @@ func (c *Checker) isOperatorToken(claims Claims) bool {
 //
 // No membership or tenant context is resolved — an operator is not a tenant
 // member — so x-departments, x-plan, x-feature-flags and x-residency-mode are
-// sent empty, overwriting any client copy. Every operator decision is logged
-// with the operator's subject and the target tenant (the operator audit
-// trail, LLD §10).
+// sent empty. All platform-realm roles are forwarded in x-tenant-roles
+// (A-10, BL-OQ-26) so downstream services (e.g. Billing) can gate on roles
+// like pci_owner_reviewer without AuthZ needing to know them. Every operator
+// decision is logged with the operator's subject and the target tenant (the
+// operator audit trail, LLD §10).
 func (c *Checker) checkOperator(in CheckInput) domain.Decision {
 	path := in.Request.Path
 	if i := strings.IndexByte(path, '?'); i >= 0 {
@@ -73,7 +75,7 @@ func (c *Checker) operatorDecision(claims Claims, path string) domain.Decision {
 	headers := map[string]string{
 		domain.HeaderTenantID:      tenant,
 		domain.HeaderUserID:        claims.Subject,
-		domain.HeaderTenantRoles:   domain.PlatformOperatorRole,
+		domain.HeaderTenantRoles:   strings.Join(claims.Roles, ","),
 		domain.HeaderDepartments:   "",
 		domain.HeaderPlan:          "",
 		domain.HeaderFeatureFlags:  "",
