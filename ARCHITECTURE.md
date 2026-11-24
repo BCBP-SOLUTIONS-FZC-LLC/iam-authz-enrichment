@@ -231,7 +231,7 @@ sequenceDiagram
                             Checker -->> Server: Denied — DENY_MFA_STALE
                         end
                     end
-                    Checker -->> Server: Allowed + 6 trust-boundary headers
+                    Checker -->> Server: Allowed + 7 trust-boundary headers
                 end
             end
         end
@@ -311,7 +311,7 @@ flowchart TD
         i6["TenantConverted → DEL ae:tenant + refresh realm map"]
         i7["TenantRealmReady → refresh realm map ONLY, no eviction"]
         i8["TenantSuspended / *Reactivated(op) / *Offboarded / TrialExpired / TrialReactivated → DEL ae:tenant ONLY"]
-        i9["TenderRestricted → flips an in-memory fact, NOT a cache eviction"]
+        i9["TenderRestricted → flips an in-memory fact, NOT a cache eviction<br/>TenderAccessGranted → evicts ae:tender_acl for the granted user (AE-TND-G1)"]
     end
 ```
 
@@ -391,6 +391,7 @@ sequenceDiagram
 | `tenant-authz-q` | `TenantSuspended`, `TenantReactivated` (operator-sourced), `TrialExpired`, `TrialReactivated` (§16 AE-45) | Evict `ae:tenant:{tenant}` — all route through `HandleTenantLifecycleEvent`, no payload decode |
 | `tenant-authz-q` | `TenantOffboarded` (§16 AE-17) | Evict `ae:tenant` + best-effort SCAN+DEL `ae:restricted:{tenant}:*` + O(k) DEL of `ae:realm` entries via `ae:realm-by-tenant` reverse index + L1 ClearByTenant/DeleteByTenant; failures logged as WARN, `ObserveEvictionError("tenant_offboarded_*")` |
 | `tender-authz-q` | `TenderRestricted` | Flip the in-memory restricted-tender fact + L2 `ae:restricted` key (MULTI/EXEC not needed — monotonic write); payload validation rejects empty `tender_id` (AE-TAC-GAP-001) |
+| `tender-authz-q` | `TenderAccessGranted` | Evict `ae:tender_acl:{tenant}:{tender}:{user}` immediately on grant so the newly-granted user is not denied for up to 15 s (AE-TND-G1) |
 
 **Why both `TenantConverted` and `TenantRealmReady` matter:** a tenant converting from shared-trial to dedicated fires `TenantConverted`. A tenant that signs up directly for a paid plan and gets a dedicated realm from day one fires *only* `TenantRealmReady`. Subscribing to just one leaves a real gap in the realm→tenant map.
 
