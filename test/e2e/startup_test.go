@@ -66,8 +66,8 @@ func runUntilExit(t *testing.T, timeout time.Duration, env []string) (string, er
 		return out.String(), err
 	case <-time.After(timeout):
 		_ = cmd.Process.Kill()
-		<-done
-		t.Fatalf("binary kept running for %s — expected a fail-fast exit. Output:\n%s", timeout, out.String())
+		killErr := <-done
+		t.Fatalf("binary kept running for %s — expected a fail-fast exit (killed: %v). Output:\n%s", timeout, killErr, out.String())
 		return "", nil
 	}
 }
