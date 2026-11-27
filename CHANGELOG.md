@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (2026-11-28 — dependency updates)
+
+- **Direct dependencies to latest:** platform-gincommon v2.6.0 → v2.7.0 (registry only: adds the `commercial` domain value; nothing changes here), aws-sdk-go-v2 v1.47.5 → v1.48.1 (config v1.33.22, credentials v1.21.4, service/sqs v1.53.1), go-redis/v9 v9.23.0 → v9.24.1, pgx/v5 v5.12.0 → v5.13.0, miniredis/v2 v2.40.0 → v2.41.0 (tests), genproto/googleapis/rpc to 2026-11-23. platform-events v2.3.0 and platform-pgcommon v2.0.2 were already the latest. No behaviour change. `docs/observability/metric-registry.md` regenerated (`make metrics-inventory`).
+- **golangci-lint v2.13.2 → v2.15.0** (`go.mod` tool). Its errcheck v1.30 flags a discarded `error` received from a channel. The consumer tests now assert that `Start` returns nil after a clean cancel; the e2e `stopServer` waits on a plain done signal, and `runUntilExit` puts the kill's exit error in its failure message.
+
 ## [0.2.0] - 2026-11-24
 ### Added (2026-11-24 — `DENY_MEMBER_SUSPENDED` and `api/deny-codes.json`, AE-51, LLD rev 1.51; web-shell asks AZ-2, AZ-3)
 - **New deny reason `DENY_MEMBER_SUSPENDED` (403)** for an I-8 membership with `status: "suspended"`. It was `DENY_UNRESOLVABLE_SUBJECT`, the same code as a non-member, so the frontend could not show A8's "access paused" text. Other non-active statuses are unchanged. The suspended case still evicts the stale `ae:ctx` and writes `ae:neg`; `ae:neg` now holds the deny reason (a pre-upgrade `"1"` reads as `DENY_UNRESOLVABLE_SUBJECT`, so no cache flush is needed on rollout). **Contract:** suspended members now get a different code than before, which VERSIONING.md would class as breaking for a client that branches on `DENY_UNRESOLVABLE_SUBJECT`. It ships as a MINOR bump only because the service is pre-`v1.0.0` (SemVer §4, VERSIONING.md "Pre-v1.0.0"); after `v1` the same change would be MAJOR. Clients should treat both codes as "no access" (web-shell already does; AZ-2).

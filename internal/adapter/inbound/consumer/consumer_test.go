@@ -79,7 +79,7 @@ func TestBuildConsumer_RealQueueURL_RunsAndStops(t *testing.T) {
 
 	cancel()
 	assert.NoError(t, c.Stop())
-	<-done
+	assert.NoError(t, <-done, "Start returns nil after a clean cancel")
 }
 
 // TestNewXConsumer_IdleAndReal exercises every exported consumer-builder's
@@ -278,7 +278,7 @@ func TestBuildConsumer_WithDLQ_ForwardsMalformedBody(t *testing.T) {
 
 	cancel()
 	assert.NoError(t, c.Stop())
-	<-done
+	assert.NoError(t, <-done, "Start returns nil after a clean cancel")
 }
 
 func TestQueueName(t *testing.T) {
