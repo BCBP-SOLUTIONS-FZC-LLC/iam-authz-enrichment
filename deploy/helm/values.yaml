@@ -126,7 +126,8 @@ env:
 
   # Operator path (CD-52, LLD §8.9). OPERATOR_REALM_ISSUER is the platform
   # realm's issuer: its tokens are allowed only on /api/v1/operator/* with the
-  # platform_operator realm role, and get x-tenant-roles=platform_operator.
+  # platform_operator realm role, and get x-tenant-roles = every platform-realm
+  # role the token carries, comma-joined (AE-50).
   # Empty disables the path (operator tokens denied, as before). Must differ
   # from SHARED_REALM_ISSUER and every dedicated realm (startup check).
   # JWT_OPERATOR_PAYLOAD_KEY: the operator jwt_authn provider's payload key,

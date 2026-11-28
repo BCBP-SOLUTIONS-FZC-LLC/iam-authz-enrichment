@@ -21,7 +21,7 @@ iam-authz-enrichment/
 │   │   ├── errors.go                  # ErrNotFound, ErrMemberSuspended (joined with ErrNotFound, AE-51), ErrUnavailable sentinels
 │   │   └── policy/
 │   │       ├── types.go               # Action consts, DepartmentLevel consts, RequestFacts + .IsMutation()/.RequiresApproverGate()/.RequiresTenderACL()
-│   │       └── policy.go              # Input, EvaluateBase(), ViolatesReadOnly(), MeetsDepartmentLevel() — §3 base policy as pure predicates
+│   │       └── policy.go              # Input, EvaluateBase(), ViolatesReadOnly(), ReadOnlyExempt() (B-P14, AE-52), MeetsDepartmentLevel() — §3 base policy as pure predicates
 │   ├── usecase/                       # orchestration — the layer inbound adapters call into
 │   │   ├── ports.go                   # Cache, OrgMembershipClient, BatchTenderACLClient (TAC-5 only), Recorder(+NoopRecorder), Logger interfaces
 │   │   ├── check.go                   # Checker.check() — the full §3.1 precedence chain, OTel spans, resolveContext/resolveTenderACL/checkMFAFreshness

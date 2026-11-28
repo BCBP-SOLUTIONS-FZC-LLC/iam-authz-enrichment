@@ -54,7 +54,7 @@ Check each item. Report only real breaches you can point at.
    - `config.Load()` still rejects an operator issuer equal to a tenant issuer.
 6. **Members and tenants (§8.2.1, §8.7, §8.8, AE-40, AE-47, AE-51):**
    - an I-8 `status` other than `active` (missing included) → `ErrNotFound`, negative-cached; `suspended` → `DENY_MEMBER_SUSPENDED`; their roles never reach `ae:ctx` or a header;
-   - a cancelled-grace tenant is read-only and gets the server-appended `read_only` flag; a suspended tenant is denied;
+   - a cancelled-grace tenant is read-only (every mutation but Billing's B-P14 reactivate, AE-52) and gets the server-appended `read_only` flag; a suspended tenant is not denied here: its realm is disabled upstream, and an already-issued token is accepted for up to its remaining lifetime (§8.8, AE-8);
    - `x-residency-mode` is always server-computed; an unknown value → `strict`.
 7. **Cache keys and write guards (`AE-CACHE-1..5`, AE-51):**
    - every key is tenant-prefixed or keyed on the tenant: no cross-tenant collision;

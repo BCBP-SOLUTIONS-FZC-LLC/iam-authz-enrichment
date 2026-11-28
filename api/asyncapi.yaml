@@ -32,10 +32,10 @@ info:
     `iam-tender-acl`'s own asyncapi.yaml already established for its two
     consumed event types). Where the producer's own published asyncapi.yaml
     was directly available (Org & Membership's `membership-authz-q` events,
-    User Profile's `user-authz-q` events), the schemas below were verified
-    against it field-for-field. Where it was not (Billing Service, Realm
-    Provisioner, Tender Service — no asyncapi.yaml available in this
-    workspace), the schemas below reflect only what this service's own code
+    User Profile's `user-authz-q` events, Realm Provisioner's
+    `tenant-authz-q` events, Billing Service's `billing-authz-q` events),
+    the schemas below were verified against it. Where it was not (Tender
+    Service), the schemas below reflect only what this service's own code
     actually reads, explicitly flagged per-message below.
 
     Idempotency: unlike every other IAM service, this service has **no
@@ -895,16 +895,16 @@ components:
             time: "2026-08-26T03:24:00Z"
             data: {}
       x-consumer-schema-dependency:
-        # No published asyncapi.yaml was available for the producer
-        # (Billing Service) in this workspace to verify against. This
+        # Producer schema published by Billing (commercial-billing-service
+        # api/asyncapi.yaml and internal/adapters/eventbus/schemas/, checked
+        # at Billing main 70cf626, 2026-11-28, hand-off AZ-3d). This
         # service's own handler (billingHandler, internal/adapter/inbound/
         # consumer/handlers.go) decodes NO payload fields at all for this
         # event type — only the envelope's own tenant_id drives the
-        # eviction (ae:tenant:{tenant}) — so there is nothing to get wrong
-        # here regardless of the producer's actual payload shape.
+        # eviction (ae:tenant:{tenant}) — so no schema is needed here.
         depends-on-shape:
           note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
-        producer-lifecycle-status: unknown
+        producer-lifecycle-status: verified
 
     TenantSubscriptionCancelled:
       name: TenantSubscriptionCancelled
@@ -927,7 +927,7 @@ components:
       x-consumer-schema-dependency:
         depends-on-shape:
           note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
-        producer-lifecycle-status: unknown
+        producer-lifecycle-status: verified
 
     TenantReactivated:
       name: TenantReactivated
@@ -950,7 +950,7 @@ components:
       x-consumer-schema-dependency:
         depends-on-shape:
           note: "This service reads only the envelope-level tenant_id; the data/payload body is not decoded."
-        producer-lifecycle-status: unknown
+        producer-lifecycle-status: verified
 
     TenantSuspended:
       name: TenantSuspended

@@ -201,7 +201,7 @@ sequenceDiagram
 
             Note over Checker,Policy: §3.1 precedence — first failing check wins
             Checker ->> Policy: ViolatesReadOnly(tenant.ReadOnly, mutation)
-            alt read-only tenant + mutation method
+            alt read-only tenant + mutation method (not B-P14 reactivate, AE-52)
                 Checker -->> Server: Denied — DENY_TENANT_READ_ONLY
             else
                 Checker ->> Policy: EvaluateBase(subject, membership, request)
@@ -245,7 +245,7 @@ sequenceDiagram
 |------|-------|-----------|--------|
 | 1 | Subject resolution (membership rebuild 404, or any non-active status) | `DENY_UNRESOLVABLE_SUBJECT` | 403 |
 | 1 | Subject resolution (membership `status: suspended`, LLD §8.2.1 / AE-51) | `DENY_MEMBER_SUSPENDED` | 403 |
-| 2 | Subscription read-only enforcement | `DENY_TENANT_READ_ONLY` | 403 |
+| 2 | Subscription read-only enforcement (every mutation but Billing's B-P14 reactivation — AE-52) | `DENY_TENANT_READ_ONLY` | 403 |
 | 3 | Base role/department policy | `DENY_ROLE_INSUFFICIENT` | 403 |
 | 4 | Tender-ACL overlay (only if step 3 allows, tender flagged restricted) | `DENY_TENDER_ACL_INSUFFICIENT` | 403 |
 | 5 | MFA freshness gate (only if steps 1–4 allow, approver-gated) | `DENY_MFA_STALE` | 403 |

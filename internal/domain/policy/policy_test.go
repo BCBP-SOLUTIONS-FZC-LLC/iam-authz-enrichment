@@ -1,6 +1,7 @@
 package policy_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -107,6 +108,37 @@ func TestViolatesReadOnly(t *testing.T) {
 	assert.False(t, policy.ViolatesReadOnly(true, false), "read methods are never affected")
 	assert.False(t, policy.ViolatesReadOnly(false, true), "non-read-only tenant is never affected")
 	assert.False(t, policy.ViolatesReadOnly(false, false))
+}
+
+// AE-52 / Billing hand-off AZ-1: only B-P14, on the token's own tenant, is
+// exempt from the read-only gate; every near miss fails closed.
+func TestReadOnlyExempt(t *testing.T) {
+	t.Parallel()
+	const tenant = "11111111-1111-1111-1111-111111111111"
+	const other = "22222222-2222-2222-2222-222222222222"
+	reactivate := "/api/v1/tenants/" + tenant + "/subscription/reactivate"
+	cases := []struct {
+		name, method, path, tenant string
+		want                       bool
+	}{
+		{"B-P14 on own tenant", "POST", reactivate, tenant, true},
+		{"query string ignored", "POST", reactivate + "?x=1", tenant, true},
+		{"another tenant's path", "POST", "/api/v1/tenants/" + other + "/subscription/reactivate", tenant, false},
+		{"PUT not exempt", "PUT", reactivate, tenant, false},
+		{"DELETE not exempt", "DELETE", reactivate, tenant, false},
+		{"trailing slash", "POST", reactivate + "/", tenant, false},
+		{"deeper path", "POST", reactivate + "/extra", tenant, false},
+		{"upper-case tenant", "POST", "/api/v1/tenants/" + strings.ToUpper("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") + "/subscription/reactivate", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", false},
+		{"other subscription route", "POST", "/api/v1/tenants/" + tenant + "/subscription", tenant, false},
+		{"billing-contact not exempt (HLD owner decides)", "PUT", "/api/v1/tenants/" + tenant + "/billing-contact", tenant, false},
+		{"empty tenant", "POST", "/api/v1/tenants//subscription/reactivate", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, policy.ReadOnlyExempt(tc.method, tc.path, tc.tenant))
+		})
+	}
 }
 
 func TestRequestFacts_IsMutation(t *testing.T) {

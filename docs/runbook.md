@@ -43,13 +43,14 @@ explicitly signed off, before production traffic.
 
 **Operator path — CD-52 (LLD §8.9.1, AE-46). Phase 1 go-live gate:**
 
-Until these are done, `OPERATOR_REALM_ISSUER` stays empty, and no operator route works through the gateway — IAM's or Commercial's.
+`OPERATOR_REALM_ISSUER` and `JWT_OPERATOR_PAYLOAD_KEY` are already set in the staging and prod values, but no operator route works through the gateway — IAM's or Commercial's — until OP-G2 is deployed and the items below are done.
 
 - [ ] **OP-G1** Keycloak platform realm with the `platform_operator` role, MFA
       required, short sessions, and operator users provisioned. Note its issuer URL.
 - [ ] **OP-G2** Gateway `jwt_authn` provider for the platform realm, accepted
-      on `/api/v1/operator/*` only (platform edge). If it uses its own payload
-      key, set `JWT_OPERATOR_PAYLOAD_KEY`.
+      on `/api/v1/operator/*` only (platform edge), named `platform`:
+      `JWT_OPERATOR_PAYLOAD_KEY: "platform"` is already set in staging/prod
+      values (AZ-2). Every service's operator routes must use this provider.
 - [ ] **OP-G3** `OPERATOR_REALM_ISSUER` set in each environment's values, and this
       service redeployed. Startup fails if it equals a tenant issuer. **To
       confirm it took effect:** grep startup logs for

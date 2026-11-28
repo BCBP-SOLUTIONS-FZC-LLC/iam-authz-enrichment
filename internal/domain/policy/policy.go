@@ -1,6 +1,10 @@
 package policy
 
-import "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
+import (
+	"strings"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-authz-enrichment/internal/domain"
+)
 
 // Input is everything a base policy predicate needs to decide. It carries no
 // behavior of its own — construction and population happen in the usecase
@@ -78,4 +82,34 @@ func EvaluateBase(in Input) bool {
 // callers must not call this for GET/HEAD (RequestFacts.IsMutation() gates it).
 func ViolatesReadOnly(readOnly bool, mutation bool) bool {
 	return readOnly && mutation
+}
+
+// Reactivate route (Billing B-P14), split around the tenant segment.
+const (
+	reactivatePathPrefix = "/api/v1/tenants/"
+	reactivatePathSuffix = "/subscription/reactivate"
+)
+
+// ReadOnlyExempt reports whether a mutation is exempt from the read-only gate
+// (§3.1 step 2, LLD §8.7, AE-52). Exactly one request is: paying to leave the
+// read-only state, Billing's B-P14
+// `POST /api/v1/tenants/{tenant}/subscription/reactivate`. Without it a
+// cancelled tenant could only come back through support (Billing hand-off
+// AZ-1, BL-OQ-30).
+//
+// The match is exact and fails closed: method POST, the path with any query
+// removed, and the path tenant equal to the token's resolved tenant — so a
+// read-only tenant can never use the exemption on another tenant's path, and
+// a trailing slash, a different case or an encoded variant is not exempt.
+// Only the read-only gate is skipped; every later check still runs, and
+// Billing still checks its own `subscription.manage` permission, which is what
+// limits the route to the owner: AuthZ admits any active member of the tenant.
+func ReadOnlyExempt(method, path, tenant string) bool {
+	if method != "POST" || tenant == "" {
+		return false
+	}
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	return path == reactivatePathPrefix+tenant+reactivatePathSuffix
 }
