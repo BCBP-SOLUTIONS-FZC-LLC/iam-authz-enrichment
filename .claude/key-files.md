@@ -32,6 +32,8 @@ Does NOT read a metric back from the Gatherer — platform-events' former per-qu
 
 **Singleflight-coalesced I-8 call runs on `context.WithoutCancel(ctx)`** (LLD rev 1.32): under the first caller's context, Envoy cancelling one request failed every request waiting on the same key (`TestCheck_Singleflight_FirstCallerCancelled_OthersUnaffected`). Don't pass the request `ctx` into `sf.Do`.
 
+**Read-only exemption (AE-52, Billing hand-off AZ-1):** step 2 skips the read-only deny only when `policy.ReadOnlyExempt(method, path, tenant)` holds — `POST`, path (query removed) exactly `/api/v1/tenants/{resolved tenant}/subscription/reactivate`. Keep it exact and tied to the resolved tenant: no prefix match, no route-level `context_extensions` flag (a gateway route could widen it), and never skip any later step. B-P26 `billing-contact` is deliberately not exempt until the Commercial HLD owner decides.
+
 **Security invariant — future `auth_time` (LLD §16 AE-38):** `checkMFAFreshness()` guards `authTime.After(c.now())` before the duration comparison — a future auth_time produces a negative duration that would silently pass the MFA gate without this guard.
 
 **Security invariant — empty TenderID (AE-39):** if `reqFacts.RequiredAccessLevel != ""` but `reqFacts.TenderID == ""` (e.g. trailing-slash `/tenders/` or route misconfiguration), `check()` returns `DenyMalformedIdentity` immediately rather than silently skipping the tender-ACL overlay. TAC-4 call failures fail closed to `DenyTenderACLInsufficient` (§7 row 4) and call `ObserveTACDependencyError()`.

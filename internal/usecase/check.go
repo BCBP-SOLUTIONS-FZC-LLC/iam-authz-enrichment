@@ -130,8 +130,10 @@ func (c *Checker) check(ctx context.Context, in CheckInput) domain.Decision {
 	defer policySpan.End()
 
 	// §3.1 step 2: subscription read-only enforcement. Blanket tenant-level
-	// gate; read methods are never affected.
-	if policy.ViolatesReadOnly(tenantCtx.ReadOnly, reqFacts.IsMutation()) {
+	// gate; read methods are never affected. The one exempt mutation is the
+	// owner's reactivation (Billing B-P14, AE-52): it only skips this gate.
+	if policy.ViolatesReadOnly(tenantCtx.ReadOnly, reqFacts.IsMutation()) &&
+		!policy.ReadOnlyExempt(reqFacts.Method, reqFacts.Path, tenant) {
 		return domain.Denied(domain.DenyTenantReadOnly)
 	}
 
@@ -196,8 +198,9 @@ func buildHeaders(tenant, subject string, m domain.MembershipContext, t domain.T
 	// addition: when the tenant is in read-only (cancelled-grace) mode the
 	// "read_only" flag is appended so downstream services can adapt their UI
 	// (hide write actions, show an upgrade banner) without a separate API call.
-	// Mutations are already denied at §3.1 step 2, so this header is only ever
-	// seen on allowed read requests — consistent with the gap-closure contract
+	// Mutations are denied at §3.1 step 2 except Billing's B-P14 reactivation
+	// (AE-52), so this header is seen on allowed reads and on that one exempt
+	// POST — consistent with the gap-closure contract
 	// (IAM-to-Commercial-Gap-Closure-Summary §4.6).
 	// Only copy the slice when ReadOnly=true to avoid a per-request heap
 	// allocation on the common (active tenant, non-read-only) path.

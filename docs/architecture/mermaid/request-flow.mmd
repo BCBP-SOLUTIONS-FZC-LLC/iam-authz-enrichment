@@ -61,7 +61,7 @@ sequenceDiagram
 
             Note over Checker,Policy: §3.1 precedence — first failing check wins
             Checker ->> Policy: ViolatesReadOnly(tenant.ReadOnly, mutation)
-            alt read-only tenant + mutation method
+            alt read-only tenant + mutation method (not B-P14 reactivate, AE-52)
                 Checker -->> Server: Denied — DENY_TENANT_READ_ONLY
             else
                 Checker ->> Policy: EvaluateBase(subject, membership, request)

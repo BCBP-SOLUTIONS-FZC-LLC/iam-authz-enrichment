@@ -41,7 +41,7 @@
       "detail": "The tenant is read-only; changes are not allowed.",
       "retryable": false,
       "action": "none",
-      "meaning": "A POST, PUT, PATCH or DELETE on a cancelled (read-only) tenant. Never sent on GET or HEAD."
+      "meaning": "A POST, PUT, PATCH or DELETE on a cancelled (read-only) tenant. Never sent on GET or HEAD, nor on the owner's reactivation (Billing B-P14, POST /api/v1/tenants/{id}/subscription/reactivate), which is exempt so a cancelled tenant can pay to come back."
     },
     {
       "errorCode": "DENY_ROLE_INSUFFICIENT",

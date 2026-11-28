@@ -387,6 +387,61 @@ func TestCheck_ReadOnlyGate_DeniesMutation_AllowsRead(t *testing.T) {
 	assert.True(t, read.Allow, "read methods are never affected by the read-only gate")
 }
 
+// AE-52 / Billing hand-off AZ-1: a cancelled (read-only) tenant's owner can
+// still reach B-P14 to pay and come back, with the normal headers; every
+// other mutation of that tenant is still denied.
+func TestCheck_ReadOnlyGate_ReactivateExempt(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	membership := domain.NewMembershipContext()
+	membership.Roles = []string{"tenant_owner"}
+	cache.SeedMembershipContext(tenant, user, membership, domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.TenantContext{ReadOnly: true, FeatureFlags: []string{}}, domain.CacheFresh)
+	checker := newTestChecker(cache, &fixtures.FakeOrgMembershipClient{}, nil)
+	reactivate := "/api/v1/tenants/" + tenant + "/subscription/reactivate"
+
+	allowed := checker.Check(context.Background(), usecase.CheckInput{
+		Claims:  baseClaims(),
+		Request: policy.RequestFacts{Method: "POST", Path: reactivate},
+	})
+	require.True(t, allowed.Allow, "B-P14 must pass the read-only gate")
+	assert.Equal(t, tenant, allowed.Headers[domain.HeaderTenantID])
+	assert.Equal(t, user, allowed.Headers[domain.HeaderUserID])
+	assert.Equal(t, "tenant_owner", allowed.Headers[domain.HeaderTenantRoles])
+	assert.Equal(t, "read_only", allowed.Headers[domain.HeaderFeatureFlags], "the tenant is still read-only; the sentinel stays")
+
+	for _, req := range []policy.RequestFacts{
+		{Method: "POST", Path: "/api/v1/tenants/" + tenant + "/subscription"},
+		{Method: "PUT", Path: "/api/v1/tenants/" + tenant + "/billing-contact"},
+		{Method: "PUT", Path: reactivate},
+		{Method: "POST", Path: "/api/v1/tenants/22222222-2222-2222-2222-222222222222/subscription/reactivate"},
+	} {
+		denied := checker.Check(context.Background(), usecase.CheckInput{Claims: baseClaims(), Request: req})
+		assert.False(t, denied.Allow, "%s %s", req.Method, req.Path)
+		assert.Equal(t, domain.DenyTenantReadOnly, denied.Reason, "%s %s", req.Method, req.Path)
+	}
+}
+
+// The exemption skips only the read-only gate: a later check still denies.
+func TestCheck_ReadOnlyGate_ReactivateExempt_LaterChecksStillRun(t *testing.T) {
+	t.Parallel()
+	cache := fixtures.NewFakeCache()
+	cache.SeedMembershipContext(tenant, user, domain.NewMembershipContext(), domain.CacheFresh)
+	cache.SeedTenantContext(tenant, domain.TenantContext{ReadOnly: true, FeatureFlags: []string{}}, domain.CacheFresh)
+	checker := newTestChecker(cache, &fixtures.FakeOrgMembershipClient{}, nil)
+
+	decision := checker.Check(context.Background(), usecase.CheckInput{
+		Claims: baseClaims(),
+		Request: policy.RequestFacts{
+			Method: "POST",
+			Path:   "/api/v1/tenants/" + tenant + "/subscription/reactivate",
+			Action: policy.ActionManageDepartmentMemberships,
+		},
+	})
+	assert.False(t, decision.Allow)
+	assert.Equal(t, domain.DenyRoleInsufficient, decision.Reason)
+}
+
 func TestCheck_BaseRoleInsufficient(t *testing.T) {
 	t.Parallel()
 	cache := fixtures.NewFakeCache()

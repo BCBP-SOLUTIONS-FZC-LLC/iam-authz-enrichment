@@ -152,6 +152,31 @@ func TestReadOnlyTenant_DeniesWrite(t *testing.T) {
 	require.Equal(t, "DENY_TENANT_READ_ONLY", denyReason(resp))
 }
 
+// TestReadOnlyTenant_ReactivateAllowed proves the one exemption from policy 6
+// (§8.7, §16 AE-52, Billing hand-off AZ-1): the owner of a cancelled tenant
+// can reach Billing's B-P14 to pay and come back, through the real binary,
+// while any other write of that tenant is still denied.
+func TestReadOnlyTenant_ReactivateAllowed(t *testing.T) {
+	tenant, user := id("tenant-e2e-reactivate"), "reactivate-owner"
+	org.setMembership(tenant, user, membershipFixture{
+		Roles:              []string{"tenant_owner"},
+		SubscriptionStatus: "cancelled",
+		ReadOnly:           true,
+	})
+
+	path := "/api/v1/tenants/" + tenant + "/subscription/reactivate?return=billing"
+	resp := doCheck(t, buildCheckRequest(t, user, tenant, 0, "POST", path, nil))
+	require.NotNil(t, resp.GetOkResponse(), "expected Allow, got deny reason %q", denyReason(resp))
+	headers := headerMap(resp)
+	require.Equal(t, tenant, headers["x-tenant-id"])
+	require.Equal(t, user, headers["x-user-id"])
+	require.Equal(t, "tenant_owner", headers["x-tenant-roles"])
+	require.Contains(t, headers["x-feature-flags"], "read_only")
+
+	resp = doCheck(t, buildCheckRequest(t, user, tenant, 0, "PUT", "/api/v1/tenants/"+tenant+"/billing-contact", nil))
+	require.Equal(t, "DENY_TENANT_READ_ONLY", denyReason(resp))
+}
+
 // TestRoleInsufficient_ThenEventDrivenGrant_Allows proves both policy 3
 // (base role check) and the event-driven cache-invalidation loop end to
 // end: a real DepartmentMembershipGranted message, delivered over real
